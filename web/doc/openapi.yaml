@@ -1,42 +1,181 @@
 openapi: 3.0.3
 info:
-  title: R-Clash API
-  description: API for the modern Clash client web interface.
-  version: 1.2.0
+  title: R-Clash API Specification
+  description: Foundation API for the modern R-Clash client. Adheres to Action-oriented and Smart Merge principles.
+  version: 1.5.0
 servers:
   - url: /api
+    description: Mock or Production API Server
+
 paths:
   /configs:
     get:
-      summary: 获取核心配置状态
+      summary: 获取核心基础设施配置
+      description: 获取包含 DNS、运行参数、外部控制及性能调优在内的全量底层配置。
+      responses:
+        '200':
+          description: 返回当前核心状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemConfig'
+    patch:
+      summary: 永久更新核心配置
+      description: 应用并持久化配置更改至内核配置文件。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SystemConfig'
+      responses:
+        '200':
+          description: 配置已成功同步至内核
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemConfig'
+
+  /proxies:
+    get:
+      summary: 获取代理拓扑结构
+      description: 返回所有代理组（Groups）及其包含的节点（Nodes）详情。
       responses:
         '200':
           description: OK
-    patch:
-      summary: 更新核心配置
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  groups:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProxyGroup'
+                  nodes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProxyNode'
+  
+  /proxies/{group}:
+    put:
+      summary: 切换代理组选中的出口
+      parameters:
+        - name: group
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, description: "选中的节点名称" }
       responses:
         '200':
-          description: Updated
+          description: 切换成功
+
   /subscriptions:
     get:
-      summary: 获取所有订阅及资源详情
+      summary: 列出所有资源提供者 (订阅)
       responses:
         '200':
           description: OK
-  /rules:
-    get:
-      summary: 获取所有分流规则
-      responses:
-        '200':
-          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Subscription'
     post:
-      summary: 新增分流规则
+      summary: 添加新的资源提供者
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, url]
+              properties:
+                name: { type: string }
+                url: { type: string }
       responses:
         '201':
           description: Created
+
+  /subscriptions/{id}:
+    patch:
+      summary: 更新订阅元数据
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Updated
+    delete:
+      summary: 移除资源提供者
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Deleted
+
+  /rules:
+    get:
+      summary: 获取当前路由逻辑表
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Rule'
+    post:
+      summary: 部署新的路由规则
+      description: 对应“快捷规则实验室”中的部署功能。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Rule'
+      responses:
+        '201':
+          description: 规则已部署
+
+  /rules/{id}:
+    put:
+      summary: 修改现有规则
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+    delete:
+      summary: 移除规则
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Deleted
+
   /rules/test:
     post:
-      summary: 规则沙盒测试
+      summary: 规则分流沙盒测试
       requestBody:
         content:
           application/json:
@@ -46,23 +185,163 @@ paths:
                 target: { type: string, description: "测试域名或IP" }
       responses:
         '200':
+          description: 测试成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hitRule: { $ref: '#/components/schemas/Rule' }
+                  finalProxy: { type: string }
+
+  /rule-sets:
+    get:
+      summary: 获取规则集清单
+    post:
+      summary: 导入外部规则集
+
+  /dns/flush:
+    post:
+      summary: 立即清空解析缓存
+      responses:
+        '204':
+          description: DNS Cache Flushed
+
+  /logs:
+    get:
+      summary: 获取运行诊断日志流
+      description: 用于“运行日志”页面的实时监控。
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/LogEntry'
+
+  /traffic:
+    get:
+      summary: 获取实时流量吞吐
+      responses:
+        '200':
           description: OK
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  hitRule: { type: object }
-                  finalProxy: { type: string }
-  /proxies:
+                  up: { type: integer, description: "上传速度 (Bps)" }
+                  down: { type: integer, description: "下载速度 (Bps)" }
+
+  /connections:
     get:
-      summary: 获取所有代理组及节点
+      summary: 获取活跃网络连接概览
       responses:
         '200':
           description: OK
-  /dns/flush:
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Connection'
+
+  /nodes/test:
     post:
-      summary: 清理 DNS 缓存
+      summary: 对特定节点执行延迟测试
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
       responses:
-        '204':
-          description: Success
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string }
+                  delay: { type: integer }
+
+components:
+  schemas:
+    SystemConfig:
+      type: object
+      properties:
+        allow_lan: { type: boolean, description: "允许局域网连接" }
+        ipv6: { type: boolean, description: "IPv6 支持" }
+        log_level: { type: string, enum: [info, warning, error, debug, silent] }
+        mixed_port: { type: integer, example: 7890 }
+        external_controller: { type: string, example: "127.0.0.1:9090" }
+        external_controller_enabled: { type: boolean }
+        secret: { type: string, description: "API 访问密钥" }
+        dns_enabled: { type: boolean }
+        dns_mode: { type: string, enum: [fake-ip, redir-host] }
+        store_selected: { type: boolean, description: "持久化节点选择" }
+        unified_delay: { type: boolean, description: "统一体感延迟" }
+        tcp_concurrent: { type: boolean, description: "TCP 并发增强" }
+
+    ProxyGroup:
+      type: object
+      properties:
+        name: { type: string }
+        type: { type: string }
+        now: { type: string, description: "当前选中的节点名称" }
+        delay: { type: integer }
+        all:
+          type: array
+          items: { type: string }
+
+    ProxyNode:
+      type: object
+      properties:
+        name: { type: string }
+        type: { type: string }
+        latency: { type: integer }
+        country: { type: string, example: "HK" }
+
+    Subscription:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        url: { type: string }
+        nodes: { type: integer }
+        status: { type: string, enum: [online, offline, updating] }
+        lastUpdate: { type: string }
+        traffic:
+          type: object
+          properties:
+            used: { type: integer }
+            total: { type: integer }
+
+    Rule:
+      type: object
+      properties:
+        id: { type: string }
+        type: { type: string, enum: [DOMAIN-SUFFIX, DOMAIN, DOMAIN-KEYWORD, IP-CIDR, GEOIP, MATCH] }
+        value: { type: string }
+        policy: { type: string, description: "目标代理组或预设策略" }
+        desc: { type: string }
+
+    LogEntry:
+      type: object
+      properties:
+        time: { type: string, format: "date-time" }
+        level: { type: string, enum: [info, warning, error, debug] }
+        payload: { type: string, description: "原始日志内容" }
+
+    Connection:
+      type: object
+      properties:
+        id: { type: string }
+        domain: { type: string }
+        rule: { type: string }
+        policy: { type: string }
+        speed: { type: string }

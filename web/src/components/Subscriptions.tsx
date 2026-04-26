@@ -4,19 +4,18 @@ import {
   Trash2, 
   Shield, 
   X,
-  Copy,
   Loader2,
   CheckCircle2,
-  Filter,
   ChevronDown,
   Activity,
   Layers,
-  ShieldAlert,
-  ShieldCheck,
   Info,
-  ChevronRight,
+  ZapOff,
+  ShieldCheck,
+  ShieldAlert,
   Link,
-  ZapOff
+  ChevronRight,
+  Filter
 } from 'lucide-react';
 import { Button } from "@/components/ui/button";
 import { useToast } from './Toast';

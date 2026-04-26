@@ -9,7 +9,6 @@ import {
   Zap,
   ArrowUpRight,
   ArrowDownLeft,
-  Search,
   Menu,
   X
 } from 'lucide-react';
@@ -59,7 +58,7 @@ export const Layout = ({ children }: LayoutProps) => {
   const menuItems = [
     { id: 'dashboard', label: '总览', icon: LayoutDashboard, to: '/' },
     { id: 'subscriptions', label: '订阅管理', icon: Rss, to: '/subscriptions' },
-    { id: 'proxies', label: '代理策略', icon: Globe, to: '/proxies' },
+    { id: 'proxies', label: '分组管理', icon: Globe, to: '/proxies' },
     { id: 'rules', label: '路由管理', icon: ShieldCheck, to: '/rules' },
     { id: 'logs', label: '运行日志', icon: Activity, to: '/logs' },
     { id: 'settings', label: '系统设置', icon: Settings, to: '/settings' },
