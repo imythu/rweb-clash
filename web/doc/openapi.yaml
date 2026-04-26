@@ -1,0 +1,68 @@
+openapi: 3.0.3
+info:
+  title: R-Clash API
+  description: API for the modern Clash client web interface.
+  version: 1.2.0
+servers:
+  - url: /api
+paths:
+  /configs:
+    get:
+      summary: 获取核心配置状态
+      responses:
+        '200':
+          description: OK
+    patch:
+      summary: 更新核心配置
+      responses:
+        '200':
+          description: Updated
+  /subscriptions:
+    get:
+      summary: 获取所有订阅及资源详情
+      responses:
+        '200':
+          description: OK
+  /rules:
+    get:
+      summary: 获取所有分流规则
+      responses:
+        '200':
+          description: OK
+    post:
+      summary: 新增分流规则
+      responses:
+        '201':
+          description: Created
+  /rules/test:
+    post:
+      summary: 规则沙盒测试
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                target: { type: string, description: "测试域名或IP" }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hitRule: { type: object }
+                  finalProxy: { type: string }
+  /proxies:
+    get:
+      summary: 获取所有代理组及节点
+      responses:
+        '200':
+          description: OK
+  /dns/flush:
+    post:
+      summary: 清理 DNS 缓存
+      responses:
+        '204':
+          description: Success
