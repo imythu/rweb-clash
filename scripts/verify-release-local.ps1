@@ -24,6 +24,7 @@ Invoke-Step "Check PowerShell script syntax" {
   $scripts = @(
     "scripts/package-core.ps1",
     "scripts/package-rule-sets.ps1",
+    "scripts/package-runtime-assets.ps1",
     "scripts/package-local.ps1",
     "scripts/prepare-tauri-resources.ps1",
     "scripts/verify-tauri-resources.ps1",
@@ -63,11 +64,13 @@ Invoke-Step "Check release version synchronization" {
 
     Invoke-Native {
       powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sync-release-version.ps1 `
-        -Version "v9.8.7-rc.1" `
+        -Version "2026.717.234" `
+        -MacosBundleVersion "202607170234" `
+        -WindowsBundleVersion "26.7.17.234" `
         -Root $tempRoot
     }
 
-    $expectedVersion = "9.8.7-rc.1"
+    $expectedVersion = "2026.717.234"
     $workspaceCargo = Get-Content -LiteralPath (Join-Path $tempRoot "Cargo.toml") -Raw
     $desktopCargo = Get-Content -LiteralPath (Join-Path $tempRoot "apps/desktop/src-tauri/Cargo.toml") -Raw
     $tauriConfig = Get-Content -LiteralPath (Join-Path $tempRoot "apps/desktop/src-tauri/tauri.conf.json") -Raw | ConvertFrom-Json
@@ -80,6 +83,10 @@ Invoke-Step "Check release version synchronization" {
     }
     if ($tauriConfig.version -ne $expectedVersion -or $desktopPackage.version -ne $expectedVersion) {
       throw "Desktop JSON versions were not synchronized."
+    }
+    if ($tauriConfig.bundle.macOS.bundleVersion -ne "202607170234" -or
+        $tauriConfig.bundle.windows.wix.version -ne "26.7.17.234") {
+      throw "Platform bundle versions were not synchronized."
     }
 
     $previousErrorPreference = $ErrorActionPreference
@@ -154,12 +161,30 @@ Invoke-Step "Build Tauri web assets" {
   Invoke-Native { corepack pnpm --dir web build:tauri }
 }
 
-Invoke-Step "Build embedded Linux/backend binary path" {
-  Invoke-Native { cargo build -p rweb-clash-bin --features embedded-assets }
-}
+$verificationTarget = Join-Path $repoRoot ("target/release-verification-" + [guid]::NewGuid().ToString("N"))
+$previousCargoTarget = $env:CARGO_TARGET_DIR
+try {
+  $env:CARGO_TARGET_DIR = $verificationTarget
+  Invoke-Step "Build isolated embedded backend binary" {
+    Invoke-Native { cargo build -p rweb-clash-bin --features embedded-assets }
+  }
 
-Invoke-Step "Run release smoke" {
-  Invoke-Native { powershell -ExecutionPolicy Bypass -File scripts/release-smoke.ps1 }
+  Invoke-Step "Run embedded asset and Mihomo smoke" {
+    $binaryName = if ($env:OS -eq "Windows_NT") { "rweb-clash-bin.exe" } else { "rweb-clash-bin" }
+    $binary = Join-Path $verificationTarget "debug/$binaryName"
+    Invoke-Native {
+      powershell -ExecutionPolicy Bypass -File scripts/release-smoke.ps1 `
+        -Binary $binary `
+        -VerifyEmbeddedAssets
+    }
+  }
+} finally {
+  if ($null -eq $previousCargoTarget) {
+    Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+  } else {
+    $env:CARGO_TARGET_DIR = $previousCargoTarget
+  }
+  Remove-Item -LiteralPath $verificationTarget -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host ""

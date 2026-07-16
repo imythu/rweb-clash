@@ -65,6 +65,7 @@ function New-LinuxArchive {
 
 & (Join-Path $PSScriptRoot "package-core.ps1") -Target $Target -Version $Version
 & (Join-Path $PSScriptRoot "package-rule-sets.ps1")
+& (Join-Path $PSScriptRoot "package-runtime-assets.ps1")
 Invoke-Native { pnpm --dir (Join-Path $repoRoot "web") build }
 
 switch ($Target) {
@@ -81,13 +82,8 @@ switch ($Target) {
     break
   }
   { $_ -in @("windows-amd64", "windows-x86_64", "macos-arm64", "macos-aarch64", "macos-x86_64") } {
-    $resources = Join-Path $repoRoot "apps/desktop/src-tauri/resources"
-    if (Test-Path -LiteralPath $resources) { Remove-Item -LiteralPath $resources -Recurse -Force }
-    New-Item -ItemType Directory -Force -Path (Join-Path $resources "core") | Out-Null
-    New-Item -ItemType Directory -Force -Path (Join-Path $resources "rule-sets") | Out-Null
-    Copy-Item -Path (Join-Path $repoRoot "packaging/cache/cores/$Target/*") -Destination (Join-Path $resources "core") -Force
-    Copy-Item -Path (Join-Path $repoRoot "packaging/cache/rule-sets/*.list") -Destination (Join-Path $resources "rule-sets") -Force
-    Copy-Item -LiteralPath (Join-Path $repoRoot "packaging/cache/rule-sets/manifest.json") -Destination (Join-Path $resources "rule-sets") -Force
+    & (Join-Path $PSScriptRoot "prepare-tauri-resources.ps1") -Target $Target
+    & (Join-Path $PSScriptRoot "verify-tauri-resources.ps1") -Target $Target
     Invoke-Native { pnpm --dir (Join-Path $repoRoot "apps/desktop") tauri build }
     break
   }

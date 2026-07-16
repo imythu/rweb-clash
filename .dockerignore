@@ -6,7 +6,11 @@ web/*_view.png
 apps/desktop/src-tauri/target
 apps/desktop/src-tauri/resources
 apps/desktop/src-tauri/gen/schemas
-packaging/cache
+packaging/cache/*
+!packaging/cache/rule-sets/
+!packaging/cache/rule-sets/**
+!packaging/cache/runtime/
+!packaging/cache/runtime/**
 data
 cache-core
 .git

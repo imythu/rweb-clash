@@ -6,10 +6,11 @@ Linux 目标是后端 + 前端一起打包的单二进制发布，并发布 Dock
 
 1. 构建 `web/dist`。
 2. 下载并校验 Linux amd64 或 Linux arm64 的 Mihomo core。
-3. 下载并校验默认规则集。
-4. 构建 `rweb-clash-bin`，把前端、core 和默认规则集作为内置资源。
-5. 首次启动时释放资源到运行时 root dir。
-6. Axum 同时提供 API、静态前端和 SPA fallback。
+3. 从上游最新 Release 下载并校验 `geoip.metadb`。
+4. 从各规则源的 `@release` 分支下载并校验 13 个默认规则集。
+5. 构建 `rweb-clash-bin`，把前端、core、GeoIP 和默认规则集作为内置资源。
+6. 首次启动时释放资源到运行时 root dir；已有的有效 GeoIP 和规则缓存会保留。
+7. Axum 同时提供 API、静态前端和 SPA fallback。
 
 ## Docker
 
@@ -66,6 +67,7 @@ RWEB_CLASH_LOG=info
 RWEB_CLASH_API_TOKEN=<至少 16 字符；非回环监听必填>
 RWEB_CLASH_ALLOWED_ORIGINS=<额外允许的跨域 Origin，逗号分隔>
 RWEB_CLASH_ALLOW_PRIVATE_SOURCES=0
+RWEB_CLASH_MIHOMO_VALIDATION_TIMEOUT_SECS=120
 ```
 
 Linux 单二进制也支持 CLI 参数：
@@ -74,10 +76,10 @@ Linux 单二进制也支持 CLI 参数：
 rweb-clash --listen 127.0.0.1:31990 --data-dir ~/.local/share/rweb-clash --log-level info
 ```
 
-发布包内包含 smoke test 脚本，可在解压目录中验证二进制能启动 API：
+发布包内包含 smoke test 脚本。发布验收时加上 `--verify-embedded-assets`，会在断言 core、GeoIP 和 13 个规则文件均已释放后实际启动并停止 Mihomo：
 
 ```text
-./release-smoke.sh --binary ./rweb-clash --listen 127.0.0.1:32990
+./release-smoke.sh --verify-embedded-assets --binary ./rweb-clash --listen 127.0.0.1:32990
 ```
 
 ## 快速安装

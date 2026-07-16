@@ -24,20 +24,26 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 resource_root="$repo_root/apps/desktop/src-tauri/resources"
 core_source="$repo_root/packaging/cache/cores/$target"
 rule_set_source="$repo_root/packaging/cache/rule-sets"
+runtime_source="$repo_root/packaging/cache/runtime"
 core_dest="$resource_root/core"
 rule_set_dest="$resource_root/rule-sets"
+runtime_dest="$resource_root/runtime"
 
 if [[ ! -d "$core_source" ]]; then
   echo "core cache not found: $core_source" >&2
   exit 1
 fi
-if [[ ! -d "$rule_set_source" ]]; then
-  echo "rule-set cache not found: $rule_set_source" >&2
+if [[ ! -d "$rule_set_source" || ! -s "$rule_set_source/manifest.json" ]]; then
+  echo "rule-set cache or manifest not found: $rule_set_source" >&2
+  exit 1
+fi
+if [[ ! -s "$runtime_source/geoip.metadb" || ! -s "$runtime_source/manifest.json" ]]; then
+  echo "verified runtime asset cache not found: $runtime_source" >&2
   exit 1
 fi
 
 rm -rf "$resource_root"
-mkdir -p "$core_dest" "$rule_set_dest"
+mkdir -p "$core_dest" "$rule_set_dest" "$runtime_dest"
 
 if [[ -f "$core_source/mihomo" ]]; then
   cp "$core_source/mihomo" "$core_dest/"
@@ -55,8 +61,7 @@ if [[ "${#rule_files[@]}" -eq 0 ]]; then
   exit 1
 fi
 cp "${rule_files[@]}" "$rule_set_dest/"
-if [[ -f "$rule_set_source/manifest.json" ]]; then
-  cp "$rule_set_source/manifest.json" "$rule_set_dest/"
-fi
+cp "$rule_set_source/manifest.json" "$rule_set_dest/"
+cp "$runtime_source/geoip.metadb" "$runtime_source/manifest.json" "$runtime_dest/"
 
 echo "Prepared Tauri resources for $target at $resource_root"

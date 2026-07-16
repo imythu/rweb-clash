@@ -41,7 +41,8 @@
     ],
     "resources": [
       "resources/core/*",
-      "resources/rule-sets/*"
+      "resources/rule-sets/*",
+      "resources/runtime/*"
     ]
   }
 }

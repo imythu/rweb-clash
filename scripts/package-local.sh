@@ -54,6 +54,7 @@ package_linux_archive() {
 
 "$repo_root/scripts/package-core.sh" --target "$target" --version "$version"
 "$repo_root/scripts/package-rule-sets.sh"
+"$repo_root/scripts/package-runtime-assets.sh"
 pnpm --dir "$repo_root/web" build
 
 case "$target" in
@@ -68,11 +69,8 @@ case "$target" in
     package_linux_archive "rweb-clash-linux-arm64" "$rust_target"
     ;;
   windows-amd64|windows-x86_64|macos-arm64|macos-aarch64|macos-x86_64)
-    rm -rf "$repo_root/apps/desktop/src-tauri/resources"
-    mkdir -p "$repo_root/apps/desktop/src-tauri/resources/core" "$repo_root/apps/desktop/src-tauri/resources/rule-sets"
-    cp "$repo_root/packaging/cache/cores/$target/"* "$repo_root/apps/desktop/src-tauri/resources/core/"
-    cp "$repo_root/packaging/cache/rule-sets/"*.list "$repo_root/apps/desktop/src-tauri/resources/rule-sets/"
-    cp "$repo_root/packaging/cache/rule-sets/manifest.json" "$repo_root/apps/desktop/src-tauri/resources/rule-sets/"
+    "$repo_root/scripts/prepare-tauri-resources.sh" --target "$target"
+    "$repo_root/scripts/verify-tauri-resources.sh" --target "$target"
     pnpm --dir "$repo_root/apps/desktop" tauri build
     ;;
   *)

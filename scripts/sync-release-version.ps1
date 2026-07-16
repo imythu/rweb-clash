@@ -2,6 +2,8 @@
 param(
   [Parameter(Mandatory = $true)]
   [string]$Version,
+  [string]$MacosBundleVersion,
+  [string]$WindowsBundleVersion,
   [string]$Root
 )
 
@@ -18,6 +20,21 @@ $preReleaseIdentifier = "(?:$numericIdentifier|$nonNumericIdentifier)"
 $semVerPattern = "^$numericIdentifier\.$numericIdentifier\.$numericIdentifier(?:-$preReleaseIdentifier(?:\.$preReleaseIdentifier)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 if ($candidate -notmatch $semVerPattern) {
   throw "Release version must be SemVer with an optional lowercase v prefix: $Version"
+}
+if ($MacosBundleVersion -and $MacosBundleVersion -notmatch '^[0-9]{12}$') {
+  throw "macOS bundle version must be a 12-digit YYYYMMDDHHmm value: $MacosBundleVersion"
+}
+if ($WindowsBundleVersion) {
+  $windowsParts = @($WindowsBundleVersion -split '\.')
+  $invalidWindowsParts = @($windowsParts | Where-Object { $_ -notmatch '^(0|[1-9][0-9]*)$' })
+  if ($windowsParts.Count -ne 4 -or $invalidWindowsParts.Count -gt 0) {
+    throw "Windows bundle version must contain four numeric components: $WindowsBundleVersion"
+  }
+  $windowsNumbers = @($windowsParts | ForEach-Object { [uint64]$_ })
+  if ($windowsNumbers[0] -gt 255 -or $windowsNumbers[1] -gt 255 -or
+      $windowsNumbers[2] -gt 65535 -or $windowsNumbers[3] -gt 65535) {
+    throw "Windows bundle version exceeds MSI component limits: $WindowsBundleVersion"
+  }
 }
 
 $repoRoot = if ([string]::IsNullOrWhiteSpace($Root)) {
@@ -84,6 +101,51 @@ function Set-JsonVersion {
   return (($document | ConvertTo-Json -Depth 100) + [Environment]::NewLine)
 }
 
+function Set-TauriJsonVersion {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Content,
+    [Parameter(Mandatory = $true)]
+    [string]$ReleaseVersion,
+    [string]$MacBundleVersion,
+    [string]$WindowsInstallerVersion
+  )
+
+  $document = $Content | ConvertFrom-Json
+  if ($null -eq $document.PSObject.Properties['version'] -or
+      $null -eq $document.PSObject.Properties['bundle']) {
+    throw "Tauri JSON must contain top-level version and bundle properties."
+  }
+  $document.version = $ReleaseVersion
+
+  if ($MacBundleVersion) {
+    if ($null -eq $document.bundle.PSObject.Properties['macOS']) {
+      $document.bundle | Add-Member -MemberType NoteProperty -Name 'macOS' -Value ([pscustomobject]@{})
+    }
+    if ($null -eq $document.bundle.macOS.PSObject.Properties['bundleVersion']) {
+      $document.bundle.macOS | Add-Member -MemberType NoteProperty -Name 'bundleVersion' -Value $MacBundleVersion
+    } else {
+      $document.bundle.macOS.bundleVersion = $MacBundleVersion
+    }
+  }
+
+  if ($WindowsInstallerVersion) {
+    if ($null -eq $document.bundle.PSObject.Properties['windows']) {
+      $document.bundle | Add-Member -MemberType NoteProperty -Name 'windows' -Value ([pscustomobject]@{})
+    }
+    if ($null -eq $document.bundle.windows.PSObject.Properties['wix']) {
+      $document.bundle.windows | Add-Member -MemberType NoteProperty -Name 'wix' -Value ([pscustomobject]@{})
+    }
+    if ($null -eq $document.bundle.windows.wix.PSObject.Properties['version']) {
+      $document.bundle.windows.wix | Add-Member -MemberType NoteProperty -Name 'version' -Value $WindowsInstallerVersion
+    } else {
+      $document.bundle.windows.wix.version = $WindowsInstallerVersion
+    }
+  }
+
+  return (($document | ConvertTo-Json -Depth 100) + [Environment]::NewLine)
+}
+
 $workspaceCargo = Set-TomlSectionVersion `
   -Content ([System.IO.File]::ReadAllText($workspaceCargoPath)) `
   -Section "workspace.package" `
@@ -92,9 +154,11 @@ $desktopCargo = Set-TomlSectionVersion `
   -Content ([System.IO.File]::ReadAllText($desktopCargoPath)) `
   -Section "package" `
   -ReleaseVersion $candidate
-$tauriConfig = Set-JsonVersion `
+$tauriConfig = Set-TauriJsonVersion `
   -Content ([System.IO.File]::ReadAllText($tauriConfigPath)) `
-  -ReleaseVersion $candidate
+  -ReleaseVersion $candidate `
+  -MacBundleVersion $MacosBundleVersion `
+  -WindowsInstallerVersion $WindowsBundleVersion
 $desktopPackage = Set-JsonVersion `
   -Content ([System.IO.File]::ReadAllText($desktopPackagePath)) `
   -ReleaseVersion $candidate

@@ -1122,7 +1122,8 @@ WHERE interval_seconds > 0
   AND status != 'syncing'
   AND (
     last_update_at IS NULL
-    OR strftime('%s', last_update_at) + interval_seconds <= strftime('%s', 'now')
+    OR CAST(strftime('%s', last_update_at) AS INTEGER) + interval_seconds
+       <= CAST(strftime('%s', 'now') AS INTEGER)
   )
 "#,
         )
@@ -1142,7 +1143,8 @@ WHERE interval_seconds > 0
   AND (
     status = 'syncing'
     OR last_update_at IS NULL
-    OR strftime('%s', last_update_at) + interval_seconds <= strftime('%s', 'now')
+    OR CAST(strftime('%s', last_update_at) AS INTEGER) + interval_seconds
+       <= CAST(strftime('%s', 'now') AS INTEGER)
   )
 "#,
         )
@@ -1910,7 +1912,8 @@ FROM rule_sets
 WHERE interval_seconds > 0
   AND (
     last_update_at IS NULL
-    OR strftime('%s', last_update_at) + interval_seconds <= strftime('%s', 'now')
+    OR CAST(strftime('%s', last_update_at) AS INTEGER) + interval_seconds
+       <= CAST(strftime('%s', 'now') AS INTEGER)
   )
 "#,
         )
@@ -3224,6 +3227,74 @@ mod tests {
             .delete_rule_set("rs_test_referenced")
             .await
             .expect("delete unreferenced custom rule set");
+    }
+
+    #[tokio::test]
+    async fn freshly_updated_remote_resources_are_not_immediately_due() {
+        let temp = TestDir::new("fresh-resource-due-state");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        let subscription_id = "sub_fresh_due_test";
+        storage
+            .create_subscription(
+                subscription_id,
+                "Fresh Provider",
+                "https://example.com/profile.yaml",
+                86_400,
+                true,
+                &[],
+            )
+            .await
+            .expect("create subscription");
+        storage
+            .replace_subscription_assets(subscription_id, &[], &[], test_sync_commit())
+            .await
+            .expect("mark subscription refreshed");
+
+        assert!(!storage
+            .due_subscription_ids()
+            .await
+            .expect("query due subscriptions")
+            .iter()
+            .any(|id| id == subscription_id));
+        assert!(!storage
+            .startup_subscription_ids()
+            .await
+            .expect("query startup subscriptions")
+            .iter()
+            .any(|id| id == subscription_id));
+
+        let rule_set_id = "rs_fresh_due_test";
+        storage
+            .create_rule_set(
+                rule_set_id,
+                "fresh-due-test",
+                "https://example.com/rules.txt",
+                86_400,
+                Some("domain"),
+                "text",
+            )
+            .await
+            .expect("create rule set");
+        storage
+            .update_rule_set_refresh(
+                rule_set_id,
+                "data/profiles/rule-sets/rs_fresh_due_test.list",
+                12,
+                1,
+                "fresh-hash",
+                "text",
+                None,
+            )
+            .await
+            .expect("mark rule set refreshed");
+        assert!(!storage
+            .due_rule_set_ids()
+            .await
+            .expect("query due rule sets")
+            .iter()
+            .any(|id| id == rule_set_id));
     }
 
     fn test_proxy_item(

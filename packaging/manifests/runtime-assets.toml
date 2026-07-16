@@ -1,0 +1,9 @@
+[runtime_asset]
+id = "geoip"
+file = "geoip.metadb"
+logical_path = "runtime/geoip.metadb"
+repository = "MetaCubeX/meta-rules-dat"
+latest_release_api = "https://api.github.com/repos/MetaCubeX/meta-rules-dat/releases/latest"
+asset_name = "geoip.metadb"
+minimum_bytes = 1048576
+maximum_bytes = 67108864

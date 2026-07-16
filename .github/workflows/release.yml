@@ -7,25 +7,148 @@ on:
         description: "Mihomo release tag, or latest"
         default: "latest"
         required: true
+      sign_desktop:
+        description: "Sign and notarize desktop packages using configured secrets"
+        type: boolean
+        default: false
+        required: true
   push:
-    tags:
-      - "v*"
+    branches:
+      - master
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  group: release-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
-  MIHOMO_VERSION: ${{ github.event.inputs.mihomo_version || 'latest' }}
 
 jobs:
+  metadata:
+    name: Prepare release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      channel: ${{ steps.version.outputs.channel }}
+      display_version: ${{ steps.version.outputs.display_version }}
+      macos_bundle_version: ${{ steps.version.outputs.macos_bundle_version }}
+      mihomo_version: ${{ steps.mihomo.outputs.version }}
+      package_version: ${{ steps.version.outputs.package_version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      windows_bundle_version: ${{ steps.version.outputs.windows_bundle_version }}
+    steps:
+      - name: Generate Beijing-time version
+        id: version
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$GIT_REF" != "refs/heads/master" ]; then
+            echo "Stable releases must be dispatched from master; got $GIT_REF" >&2
+            exit 1
+          fi
+          IFS='|' read -r compact year year_short month day clock display \
+            <<< "$(TZ=Asia/Shanghai date '+%Y%m%d-%H%M|%Y|%y|%-m|%-d|%H%M|%Y-%m-%d %H:%M CST')"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            channel="stable"
+            release_tag="v$compact"
+          else
+            channel="snapshot"
+            release_tag="snapshot-$compact"
+          fi
+          month_day="$((10#$month * 100 + 10#$day))"
+          clock_number="$((10#$clock))"
+          package_version="$((10#$year)).$month_day.$clock_number"
+          macos_bundle_version="${compact/-/}"
+          windows_bundle_version="$((10#$year_short)).$month.$day.$clock_number"
+          {
+            echo "channel=$channel"
+            echo "display_version=$display"
+            echo "macos_bundle_version=$macos_bundle_version"
+            echo "package_version=$package_version"
+            echo "release_tag=$release_tag"
+            echo "windows_bundle_version=$windows_bundle_version"
+          } >> "$GITHUB_OUTPUT"
+          printf 'channel=%s\nrelease_tag=%s\npackage_version=%s\nmacos_bundle_version=%s\nwindows_bundle_version=%s\n' \
+            "$channel" "$release_tag" "$package_version" "$macos_bundle_version" "$windows_bundle_version"
+      - name: Reject an existing timestamp tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        run: |
+          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          case "$status" in
+            404) ;;
+            200)
+              echo "Release tag already exists: $RELEASE_TAG. Wait for the next Beijing-time minute." >&2
+              exit 1
+              ;;
+            *)
+              echo "Unable to check release tag $RELEASE_TAG (HTTP $status)." >&2
+              exit 1
+              ;;
+          esac
+      - name: Resolve Mihomo release tag
+        id: mihomo
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED_VERSION: ${{ github.event.inputs.mihomo_version || 'latest' }}
+        run: |
+          version="$REQUESTED_VERSION"
+          if [ "$version" = "latest" ]; then
+            version="$(curl --fail --silent --show-error --location \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r '.tag_name')"
+          fi
+          if [[ ! "$version" =~ ^[0-9A-Za-z._-]+$ ]]; then
+            echo "Invalid Mihomo release tag: $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved Mihomo release: $version"
+
+  runtime-assets:
+    name: Prepare shared runtime assets
+    runs-on: ubuntu-24.04
+    needs: metadata
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Download verified rules and GeoIP
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/package-rule-sets.sh
+          bash scripts/package-runtime-assets.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: shared-runtime-assets
+          if-no-files-found: error
+          retention-days: 1
+          path: |
+            packaging/cache/rule-sets
+            packaging/cache/runtime
+
   linux-binaries:
     name: Linux ${{ matrix.name }} binary
     runs-on: ubuntu-24.04
+    needs:
+      - metadata
+      - runtime-assets
+    env:
+      MIHOMO_VERSION: ${{ needs.metadata.outputs.mihomo_version }}
     strategy:
       fail-fast: false
       matrix:
@@ -45,12 +168,17 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - name: Sync release version from tag
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: shared-runtime-assets
+          path: packaging/cache
+      - name: Sync package version
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: pwsh -NoProfile -File scripts/sync-release-version.ps1 -Version $env:RELEASE_TAG
+          MACOS_BUNDLE_VERSION: ${{ needs.metadata.outputs.macos_bundle_version }}
+          PACKAGE_VERSION: ${{ needs.metadata.outputs.package_version }}
+          WINDOWS_BUNDLE_VERSION: ${{ needs.metadata.outputs.windows_bundle_version }}
+        run: pwsh -NoProfile -File scripts/sync-release-version.ps1 -Version $env:PACKAGE_VERSION -MacosBundleVersion $env:MACOS_BUNDLE_VERSION -WindowsBundleVersion $env:WINDOWS_BUNDLE_VERSION
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: 10.24.0
@@ -69,13 +197,14 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm --dir web install --frozen-lockfile
       - name: Check packaging scripts
-        run: bash -n scripts/package-core.sh scripts/package-rule-sets.sh scripts/package-local.sh scripts/prepare-tauri-resources.sh scripts/verify-tauri-resources.sh scripts/release-smoke.sh scripts/configure-macos-signing.sh scripts/verify-docker-manifest.sh scripts/verify-linux-archive.sh packaging/linux/install.sh
+        run: bash -n scripts/package-core.sh scripts/package-rule-sets.sh scripts/package-runtime-assets.sh scripts/package-local.sh scripts/prepare-tauri-resources.sh scripts/verify-tauri-resources.sh scripts/release-smoke.sh scripts/configure-macos-signing.sh scripts/verify-docker-manifest.sh scripts/verify-linux-archive.sh packaging/linux/install.sh
       - name: Check PowerShell packaging scripts
         shell: pwsh
         run: |
           $scripts = @(
             "scripts/package-core.ps1",
             "scripts/package-rule-sets.ps1",
+            "scripts/package-runtime-assets.ps1",
             "scripts/package-local.ps1",
             "scripts/prepare-tauri-resources.ps1",
             "scripts/verify-tauri-resources.ps1",
@@ -98,9 +227,10 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/verify-release-workflow.ps1
       - name: Prepare embedded assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           bash scripts/package-core.sh --target "${{ matrix.package_target }}" --version "$MIHOMO_VERSION"
-          bash scripts/package-rule-sets.sh
           pnpm --dir web build
       - name: Build binary
         env:
@@ -110,10 +240,10 @@ jobs:
         run: cargo build -p rweb-clash-bin --features embedded-assets --release --target "${{ matrix.rust_target }}"
       - name: Smoke test Linux amd64 binary
         if: matrix.name == 'amd64'
-        run: bash scripts/release-smoke.sh --binary target/${{ matrix.rust_target }}/release/rweb-clash-bin --listen 127.0.0.1:32990
+        run: bash scripts/release-smoke.sh --verify-embedded-assets --binary target/${{ matrix.rust_target }}/release/rweb-clash-bin --listen 127.0.0.1:32990
       - name: Smoke test Linux arm64 binary with QEMU
         if: matrix.name == 'arm64'
-        run: bash scripts/release-smoke.sh --runner "qemu-aarch64 -L /usr/aarch64-linux-gnu" --binary target/${{ matrix.rust_target }}/release/rweb-clash-bin --listen 127.0.0.1:32990
+        run: bash scripts/release-smoke.sh --verify-embedded-assets --runner "qemu-aarch64 -L /usr/aarch64-linux-gnu" --binary target/${{ matrix.rust_target }}/release/rweb-clash-bin --listen 127.0.0.1:32990
       - name: Package binary
         run: |
           mkdir -p dist/${{ matrix.artifact }}
@@ -137,7 +267,12 @@ jobs:
   docker:
     name: Linux Docker image
     runs-on: ubuntu-24.04
-    needs: linux-binaries
+    needs:
+      - metadata
+      - linux-binaries
+      - runtime-assets
+    env:
+      MIHOMO_VERSION: ${{ needs.metadata.outputs.mihomo_version }}
     permissions:
       contents: read
       packages: write
@@ -147,12 +282,17 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - name: Sync release version from tag
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: shared-runtime-assets
+          path: packaging/cache
+      - name: Sync package version
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: pwsh -NoProfile -File scripts/sync-release-version.ps1 -Version $env:RELEASE_TAG
+          MACOS_BUNDLE_VERSION: ${{ needs.metadata.outputs.macos_bundle_version }}
+          PACKAGE_VERSION: ${{ needs.metadata.outputs.package_version }}
+          WINDOWS_BUNDLE_VERSION: ${{ needs.metadata.outputs.windows_bundle_version }}
+        run: pwsh -NoProfile -File scripts/sync-release-version.ps1 -Version $env:PACKAGE_VERSION -MacosBundleVersion $env:MACOS_BUNDLE_VERSION -WindowsBundleVersion $env:WINDOWS_BUNDLE_VERSION
       - name: Set GHCR image name
         id: image
         shell: bash
@@ -171,8 +311,9 @@ jobs:
         with:
           images: ${{ steps.image.outputs.image }}
           tags: |
-            type=ref,event=tag,enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-            type=raw,value=latest,enable=${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
+            type=raw,value=${{ needs.metadata.outputs.release_tag }}
+            type=raw,value=snapshot,enable=${{ needs.metadata.outputs.channel == 'snapshot' }}
+            type=raw,value=latest,enable=${{ needs.metadata.outputs.channel == 'stable' }}
             type=sha
       - name: Build Docker image for smoke test
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -183,15 +324,25 @@ jobs:
           push: false
           build-args: |
             MIHOMO_VERSION=${{ env.MIHOMO_VERSION }}
+            USE_PREPARED_RUNTIME_ASSETS=true
+          secrets: |
+            github_token=${{ secrets.GITHUB_TOKEN }}
           tags: rweb-clash:smoke
       - name: Smoke test Docker image
         run: |
           token="release-smoke-token-0123456789abcdef"
-          docker run -d --name rweb-clash-smoke -e RWEB_CLASH_API_TOKEN="$token" -p 127.0.0.1:32991:31990 rweb-clash:smoke
+          docker run -d --name rweb-clash-smoke --network none -e RWEB_CLASH_API_TOKEN="$token" rweb-clash:smoke
           trap 'docker logs rweb-clash-smoke || true; docker rm -f rweb-clash-smoke || true' EXIT
           for i in $(seq 1 40); do
-            if curl -fsS -H "Authorization: Bearer $token" http://127.0.0.1:32991/api/setup/status >/dev/null; then
-              curl -fsS -H "Authorization: Bearer $token" http://127.0.0.1:32991/api/diagnostics/export | grep -q '^# rweb-clash diagnostics'
+            if docker exec rweb-clash-smoke curl -fsS -H "Authorization: Bearer $token" http://127.0.0.1:31990/api/setup/status >/dev/null; then
+              docker exec rweb-clash-smoke curl -fsS -H "Authorization: Bearer $token" http://127.0.0.1:31990/api/diagnostics/export | grep -q '^# rweb-clash diagnostics'
+              docker exec rweb-clash-smoke test -x /var/lib/rweb-clash/cache-core/mihomo
+              docker exec rweb-clash-smoke test -s /var/lib/rweb-clash/data/profiles/geoip.metadb
+              rule_count="$(docker exec rweb-clash-smoke sh -c 'find /var/lib/rweb-clash/data/profiles/rule-sets -maxdepth 1 -type f -name "*.list" | wc -l')"
+              test "$rule_count" -eq 13
+              core_status="$(docker exec rweb-clash-smoke curl -fsS -X POST -H "Authorization: Bearer $token" http://127.0.0.1:31990/api/core/start)"
+              printf '%s' "$core_status" | grep -q '"state":"running"'
+              docker exec rweb-clash-smoke curl -fsS -X POST -H "Authorization: Bearer $token" http://127.0.0.1:31990/api/core/stop >/dev/null
               exit 0
             fi
             sleep 1
@@ -205,6 +356,9 @@ jobs:
           push: true
           build-args: |
             MIHOMO_VERSION=${{ env.MIHOMO_VERSION }}
+            USE_PREPARED_RUNTIME_ASSETS=true
+          secrets: |
+            github_token=${{ secrets.GITHUB_TOKEN }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
       - name: Verify Docker multiarch manifest
@@ -216,6 +370,11 @@ jobs:
   tauri:
     name: Tauri ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    needs:
+      - metadata
+      - runtime-assets
+    env:
+      MIHOMO_VERSION: ${{ needs.metadata.outputs.mihomo_version }}
     strategy:
       fail-fast: false
       matrix:
@@ -234,12 +393,17 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - name: Sync release version from tag
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: shared-runtime-assets
+          path: packaging/cache
+      - name: Sync package version
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: pwsh -NoProfile -File scripts/sync-release-version.ps1 -Version $env:RELEASE_TAG
+          MACOS_BUNDLE_VERSION: ${{ needs.metadata.outputs.macos_bundle_version }}
+          PACKAGE_VERSION: ${{ needs.metadata.outputs.package_version }}
+          WINDOWS_BUNDLE_VERSION: ${{ needs.metadata.outputs.windows_bundle_version }}
+        run: pwsh -NoProfile -File scripts/sync-release-version.ps1 -Version $env:PACKAGE_VERSION -MacosBundleVersion $env:MACOS_BUNDLE_VERSION -WindowsBundleVersion $env:WINDOWS_BUNDLE_VERSION
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: 10.24.0
@@ -252,8 +416,8 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.rust_target }}
-      - name: Check public release signing secrets on macOS
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && runner.os == 'macOS'
+      - name: Check signed release secrets on macOS
+        if: github.event_name == 'workflow_dispatch' && inputs.sign_desktop && runner.os == 'macOS'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -270,8 +434,8 @@ jobs:
             fi
           done
           exit "$missing"
-      - name: Check public release signing secrets on Windows
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && runner.os == 'Windows'
+      - name: Check signed release secrets on Windows
+        if: github.event_name == 'workflow_dispatch' && inputs.sign_desktop && runner.os == 'Windows'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
@@ -294,20 +458,26 @@ jobs:
           }
       - name: Install workspace dependencies
         run: pnpm --dir web install --frozen-lockfile
+      - name: Ensure macOS packaging dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: command -v jq >/dev/null 2>&1 || brew install jq
       - name: Prepare Tauri resources on macOS
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           bash scripts/package-core.sh --target "${{ matrix.package_target }}" --version "$MIHOMO_VERSION"
-          bash scripts/package-rule-sets.sh
           bash scripts/prepare-tauri-resources.sh --target "${{ matrix.package_target }}"
           bash scripts/verify-tauri-resources.sh --target "${{ matrix.package_target }}"
       - name: Prepare Tauri resources on Windows
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           powershell -ExecutionPolicy Bypass -File scripts/package-core.ps1 -Target "${{ matrix.package_target }}" -Version "$env:MIHOMO_VERSION"
-          powershell -ExecutionPolicy Bypass -File scripts/package-rule-sets.ps1
           powershell -ExecutionPolicy Bypass -File scripts/prepare-tauri-resources.ps1 -Target "${{ matrix.package_target }}"
           powershell -ExecutionPolicy Bypass -File scripts/verify-tauri-resources.ps1 -Target "${{ matrix.package_target }}"
       - name: Check Tauri Rust crate
@@ -315,7 +485,7 @@ jobs:
       - name: Check Tauri web build
         run: pnpm --dir web build:tauri
       - name: Configure macOS code signing
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && runner.os == 'macOS'
+        if: github.event_name == 'workflow_dispatch' && inputs.sign_desktop && runner.os == 'macOS'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -324,7 +494,7 @@ jobs:
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: bash scripts/configure-macos-signing.sh
       - name: Configure Windows code signing
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && runner.os == 'Windows'
+        if: github.event_name == 'workflow_dispatch' && inputs.sign_desktop && runner.os == 'Windows'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
@@ -334,11 +504,11 @@ jobs:
           WINDOWS_CERTIFICATE_TIMESTAMP_URL: ${{ vars.WINDOWS_CERTIFICATE_TIMESTAMP_URL }}
         run: powershell -ExecutionPolicy Bypass -File scripts/configure-tauri-signing.ps1
       - name: Configure unsigned Windows bundle
-        if: github.event_name == 'workflow_dispatch' && runner.os == 'Windows'
+        if: (github.event_name == 'push' || !inputs.sign_desktop) && runner.os == 'Windows'
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File scripts/configure-tauri-signing.ps1
       - name: Build signed macOS bundles
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && runner.os == 'macOS'
+        if: github.event_name == 'workflow_dispatch' && inputs.sign_desktop && runner.os == 'macOS'
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -351,7 +521,7 @@ jobs:
           projectPath: apps/desktop
           args: ${{ matrix.args }}
       - name: Build signed Windows bundles
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && runner.os == 'Windows'
+        if: github.event_name == 'workflow_dispatch' && inputs.sign_desktop && runner.os == 'Windows'
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -359,7 +529,7 @@ jobs:
           projectPath: apps/desktop
           args: ${{ matrix.args }}
       - name: Build unsigned desktop bundles
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'push' || !inputs.sign_desktop
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -393,11 +563,15 @@ jobs:
           $bundleDir = "apps/desktop/src-tauri/target/${{ matrix.rust_target }}/release/bundle"
           $packages = Get-ChildItem -Path $bundleDir -Recurse -File -Include *.dmg, *.msi, *.exe
           if (-not $packages) { throw "No desktop package files found under $bundleDir." }
-          $packages |
-            ForEach-Object {
+          $lines = @($packages | ForEach-Object {
               $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
               "$hash  $($_.Name)"
-            } | Set-Content -LiteralPath "rweb-clash-${{ matrix.name }}.sha256" -Encoding utf8
+            })
+          [System.IO.File]::WriteAllText(
+            "rweb-clash-${{ matrix.name }}.sha256",
+            (($lines -join "`n") + "`n"),
+            [System.Text.UTF8Encoding]::new($false)
+          )
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rweb-clash-${{ matrix.name }}-checksums
@@ -410,10 +584,10 @@ jobs:
     permissions:
       contents: write
     needs:
+      - metadata
       - linux-binaries
       - docker
       - tauri
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -440,8 +614,13 @@ jobs:
             find artifacts -type f | sort >&2
             exit 1
           fi
-          if ! find artifacts -type f \( -name '*.msi' -o -name '*.exe' \) | grep -q .; then
-            echo "missing required artifact: Windows amd64 installer (*.msi or *.exe)" >&2
+          if ! find artifacts -type f -name '*.msi' | grep -q .; then
+            echo "missing required artifact: Windows amd64 MSI (*.msi)" >&2
+            find artifacts -type f | sort >&2
+            exit 1
+          fi
+          if ! find artifacts -type f -name '*.exe' | grep -q .; then
+            echo "missing required artifact: Windows amd64 NSIS installer (*.exe)" >&2
             find artifacts -type f | sort >&2
             exit 1
           fi
@@ -452,6 +631,8 @@ jobs:
         run: |
           while IFS= read -r checksum; do
             while read -r expected file; do
+              expected="${expected%$'\r'}"
+              file="${file%$'\r'}"
               if [ -z "${expected:-}" ] || [ -z "${file:-}" ]; then
                 echo "invalid checksum line in $checksum" >&2
                 exit 1
@@ -474,10 +655,20 @@ jobs:
           done < <(find artifacts -type f -name '*.sha256' | sort)
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          make_latest: ${{ contains(github.ref_name, '-') && 'false' || 'true' }}
+          name: rweb-clash ${{ needs.metadata.outputs.release_tag }}
+          tag_name: ${{ needs.metadata.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ needs.metadata.outputs.channel == 'snapshot' }}
+          make_latest: ${{ needs.metadata.outputs.channel == 'stable' && 'true' || 'false' }}
           body: |
             ## rweb-clash
+
+            Channel: `${{ needs.metadata.outputs.channel }}`
+            Built at: `${{ needs.metadata.outputs.display_version }}`
+            Package version: `${{ needs.metadata.outputs.package_version }}`
+
+            ${{ needs.metadata.outputs.channel == 'snapshot' && '> Snapshot build generated automatically from master.' || '> Stable build generated by a manual release dispatch.' }}
+            ${{ (github.event_name == 'workflow_dispatch' && inputs.sign_desktop) && '> Desktop packages were built with the configured signing credentials.' || '> Desktop packages are unsigned; Windows SmartScreen and macOS Gatekeeper may warn.' }}
 
             Supported release targets:
             - macOS arm64: Tauri desktop package

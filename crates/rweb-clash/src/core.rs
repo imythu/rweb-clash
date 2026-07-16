@@ -12,6 +12,10 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 
+const DEFAULT_MIHOMO_VALIDATION_TIMEOUT_SECS: u64 = 120;
+const MAX_MIHOMO_VALIDATION_TIMEOUT_SECS: u64 = 3_600;
+const MIHOMO_VALIDATION_TIMEOUT_ENV: &str = "RWEB_CLASH_MIHOMO_VALIDATION_TIMEOUT_SECS";
+
 #[derive(Debug, Clone)]
 pub struct CoreManager {
     inner: Arc<CoreInner>,
@@ -462,8 +466,9 @@ pub(crate) async fn validate_mihomo_config(
             ),
         ));
     }
+    let validation_timeout = mihomo_validation_timeout();
     let output = tokio::time::timeout(
-        Duration::from_secs(30),
+        validation_timeout,
         Command::new(mihomo_binary)
             .arg("-t")
             .arg("-d")
@@ -501,6 +506,29 @@ pub(crate) async fn validate_mihomo_config(
     ))
 }
 
+fn mihomo_validation_timeout() -> Duration {
+    let configured = std::env::var(MIHOMO_VALIDATION_TIMEOUT_ENV).ok();
+    Duration::from_secs(validation_timeout_seconds(configured.as_deref()))
+}
+
+fn validation_timeout_seconds(configured: Option<&str>) -> u64 {
+    let Some(raw) = configured else {
+        return DEFAULT_MIHOMO_VALIDATION_TIMEOUT_SECS;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(seconds) if (1..=MAX_MIHOMO_VALIDATION_TIMEOUT_SECS).contains(&seconds) => seconds,
+        _ => {
+            warn!(
+                environment = MIHOMO_VALIDATION_TIMEOUT_ENV,
+                default_seconds = DEFAULT_MIHOMO_VALIDATION_TIMEOUT_SECS,
+                max_seconds = MAX_MIHOMO_VALIDATION_TIMEOUT_SECS,
+                "ignoring invalid Mihomo validation timeout"
+            );
+            DEFAULT_MIHOMO_VALIDATION_TIMEOUT_SECS
+        }
+    }
+}
+
 fn validate_candidate_files(config: &CoreStartConfig) -> Result<(), AppError> {
     if !config.mihomo_binary.exists() {
         return Err(AppError::bad_request(
@@ -535,6 +563,22 @@ fn controller_url(addr: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_timeout_defaults_and_rejects_invalid_extremes() {
+        assert_eq!(validation_timeout_seconds(None), 120);
+        assert_eq!(validation_timeout_seconds(Some(" 45 ")), 45);
+        assert_eq!(validation_timeout_seconds(Some("3600")), 3600);
+        assert_eq!(validation_timeout_seconds(Some("")), 120);
+        assert_eq!(validation_timeout_seconds(Some("0")), 120);
+        assert_eq!(validation_timeout_seconds(Some("-1")), 120);
+        assert_eq!(validation_timeout_seconds(Some("3601")), 120);
+        assert_eq!(
+            validation_timeout_seconds(Some("18446744073709551615")),
+            120
+        );
+        assert_eq!(validation_timeout_seconds(Some("not-a-number")), 120);
+    }
 
     #[tokio::test]
     async fn invalid_restart_candidate_preserves_running_status() {

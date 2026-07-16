@@ -4,6 +4,7 @@ set -euo pipefail
 binary="target/debug/rweb-clash-bin"
 listen="127.0.0.1:32990"
 runner=""
+verify_embedded_assets=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -18,6 +19,10 @@ while [[ $# -gt 0 ]]; do
     --runner|-Runner)
       runner="$2"
       shift 2
+      ;;
+    --verify-embedded-assets|-VerifyEmbeddedAssets)
+      verify_embedded_assets=1
+      shift
       ;;
     *)
       echo "unknown argument: $1" >&2
@@ -55,6 +60,26 @@ for _ in $(seq 1 40); do
   if setup="$(curl -fsS "http://$listen/api/setup/status" 2>/dev/null)" \
     && diagnostics="$(curl -fsS "http://$listen/api/diagnostics/export" 2>/dev/null)" \
     && printf '%s' "$diagnostics" | grep -q '^# rweb-clash diagnostics'; then
+    if [[ "$verify_embedded_assets" -eq 1 ]]; then
+      core="$root/cache-core/mihomo"
+      geoip="$root/data/profiles/geoip.metadb"
+      rule_set_dir="$root/data/profiles/rule-sets"
+      if [[ ! -x "$core" || ! -s "$geoip" ]]; then
+        echo "embedded Mihomo core or GeoIP database was not restored" >&2
+        exit 1
+      fi
+      rule_set_count="$(find "$rule_set_dir" -maxdepth 1 -type f -name '*.list' | wc -l | tr -d ' ')"
+      if [[ "$rule_set_count" -ne 13 ]]; then
+        echo "expected 13 embedded rule sets, found $rule_set_count" >&2
+        exit 1
+      fi
+      core_status="$(curl -fsS -X POST "http://$listen/api/core/start")"
+      if ! printf '%s' "$core_status" | grep -q '"state":"running"'; then
+        echo "Mihomo did not reach the running state: $core_status" >&2
+        exit 1
+      fi
+      curl -fsS -X POST "http://$listen/api/core/stop" >/dev/null
+    fi
     printf '{"ok":true,"setup":%s}\n' "$setup"
     exit 0
   fi

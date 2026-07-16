@@ -7,8 +7,9 @@ Tauri 负责 macOS arm64 和 Windows amd64。Linux 不使用 Tauri，完整流�
 1. 构建 `web/dist`。
 2. 将平台对应的 Mihomo core 放入 Tauri resources。
 3. 将默认规则集缓存和 manifest 放入 Tauri resources。
-4. 启动时把 resources 复制到平台 app data dir。
-5. 启动共享后端服务，并让前端继续调用同一套 API。
+4. 将构建时校验过的 `runtime/geoip.metadb` 和 manifest 放入 Tauri resources。
+5. 启动时把 resources 复制到平台 app data dir。
+6. 启动共享后端服务，并让前端继续调用同一套 API。
 
 ## 平台边界
 

@@ -134,6 +134,7 @@ Environment:
   RWEB_CLASH_ROOT     Runtime data directory
   RWEB_CLASH_LOG      Log level: trace, debug, info, warn, error
   RWEB_CLASH_API_TOKEN  Bearer token; required for non-loopback listen addresses
+  RWEB_CLASH_MIHOMO_VALIDATION_TIMEOUT_SECS  Mihomo config validation timeout, default 120
 "
     );
 }

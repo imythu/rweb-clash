@@ -9,10 +9,16 @@
 /apps/desktop/src-tauri/gen/schemas/
 /apps/desktop/src-tauri/resources/
 !/apps/desktop/src-tauri/resources/
+/apps/desktop/src-tauri/resources/*
 !/apps/desktop/src-tauri/resources/core/
 !/apps/desktop/src-tauri/resources/rule-sets/
+!/apps/desktop/src-tauri/resources/runtime/
+/apps/desktop/src-tauri/resources/core/*
+/apps/desktop/src-tauri/resources/rule-sets/*
+/apps/desktop/src-tauri/resources/runtime/*
 !/apps/desktop/src-tauri/resources/core/.gitkeep
 !/apps/desktop/src-tauri/resources/rule-sets/.gitkeep
+!/apps/desktop/src-tauri/resources/runtime/.gitkeep
 /apps/desktop/src-tauri/tauri.windows.conf.json
 /packaging/cache/
 /cache-core/
