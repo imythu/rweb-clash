@@ -13,7 +13,7 @@ ARG TARGETPLATFORM
 ARG MIHOMO_VERSION=latest
 WORKDIR /src
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends curl gzip unzip ca-certificates gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+  && apt-get install -y --no-install-recommends curl gzip unzip ca-certificates gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libc6-dev-arm64-cross \
   && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates

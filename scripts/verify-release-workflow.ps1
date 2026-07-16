@@ -8,6 +8,11 @@ if (-not (Test-Path -LiteralPath $workflowPath -PathType Leaf)) {
 }
 
 $workflow = Get-Content -LiteralPath $workflowPath -Raw
+$ciWorkflowPath = Join-Path $repoRoot ".github/workflows/ci.yml"
+if (-not (Test-Path -LiteralPath $ciWorkflowPath -PathType Leaf)) {
+  throw "CI workflow not found: $ciWorkflowPath"
+}
+$ciWorkflow = Get-Content -LiteralPath $ciWorkflowPath -Raw
 $dockerfilePath = Join-Path $repoRoot "Dockerfile"
 if (-not (Test-Path -LiteralPath $dockerfilePath -PathType Leaf)) {
   throw "Dockerfile not found: $dockerfilePath"
@@ -36,6 +41,15 @@ function Get-JobSection([string]$Name) {
   $match = [regex]::Match($workflow, $pattern)
   if (-not $match.Success) {
     throw "Release workflow job not found: $Name"
+  }
+  return $match.Value
+}
+
+function Get-StepSection([string]$Name) {
+  $pattern = "(?ms)^      - name:\s*$([regex]::Escape($Name))\s*\r?\n.*?(?=^      - (?:name:|uses:)|^  [A-Za-z0-9_-]+:\s*\r?\n|\z)"
+  $match = [regex]::Match($workflow, $pattern)
+  if (-not $match.Success) {
+    throw "Release workflow step not found: $Name"
   }
   return $match.Value
 }
@@ -86,6 +100,33 @@ Assert-ExactPermissions $dockerPermissions @{ contents = "read"; packages = "wri
 $publishPermissions = Get-Permissions (Get-JobSection "publish") 4 "Publish job"
 Assert-ExactPermissions $publishPermissions @{ contents = "write" } "Publish job"
 
+foreach ($entry in @(
+  @{ Name = "CI"; Content = $ciWorkflow },
+  @{ Name = "Release"; Content = $workflow }
+)) {
+  $actionUses = [regex]::Matches(
+    $entry.Content,
+    "(?m)^\s*(?:-\s*)?uses:\s*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@([^\s#]+)"
+  )
+  if ($actionUses.Count -eq 0) {
+    throw "$($entry.Name) workflow does not use any actions."
+  }
+  foreach ($actionUse in $actionUses) {
+    $repository = $actionUse.Groups[1].Value
+    $reference = $actionUse.Groups[2].Value
+    if ($reference -notmatch "^[0-9a-f]{40}$") {
+      throw "$($entry.Name) workflow action '$repository@$reference' must be pinned to a full commit SHA."
+    }
+  }
+  $hardenedCheckouts = [regex]::Matches(
+    $entry.Content,
+    "(?m)^\s*- uses:\s*actions/checkout@[0-9a-f]{40}[^\r\n]*\r?\n\s*with:\s*\r?\n\s*persist-credentials:\s*false\s*$"
+  ).Count
+  if ($hardenedCheckouts -ne 3) {
+    throw "$($entry.Name) workflow must contain three SHA-pinned checkout steps with persisted credentials disabled; found $hardenedCheckouts."
+  }
+}
+
 Assert-Contains "package_target:\s*linux-amd64" "Linux amd64 binary target"
 Assert-Contains "Sync release version from tag" "tag version synchronization step"
 Assert-Contains "sync-release-version\.ps1[\s\S]*RELEASE_TAG" "release version synchronization command"
@@ -93,15 +134,18 @@ $versionSyncCount = ([regex]::Matches($workflow, "run:\s*pwsh[^\r\n]*sync-releas
 if ($versionSyncCount -ne 3) {
   throw "Release workflow must synchronize tag versions in Linux, Docker, and Tauri jobs; found $versionSyncCount invocation(s)."
 }
-$versionSyncConditionCount = ([regex]::Matches(
+$versionSyncStepCount = ([regex]::Matches(
   $workflow,
-  "if:\s*github\.event_name == 'push' && startsWith\(github\.ref, 'refs/tags/v'\)"
+  "(?ms)^      - name:\s*Sync release version from tag\s*\r?\n\s*if:\s*github\.event_name == 'push' && startsWith\(github\.ref, 'refs/tags/v'\).*?^\s*run:\s*pwsh[^\r\n]*sync-release-version\.ps1"
 )).Count
-if ($versionSyncConditionCount -ne 3) {
-  throw "Release version synchronization must run only for pushed v* tags in all three build jobs."
+if ($versionSyncStepCount -ne 3) {
+  throw "Release workflow must condition tag version synchronization on pushed v* tags in Linux, Docker, and Tauri jobs; found $versionSyncStepCount matching step(s)."
 }
 Assert-Contains "Check release workflow structure" "CI release workflow structure check"
 Assert-Contains "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/verify-release-workflow\.ps1" "portable PowerShell workflow structure check"
+if ($ciWorkflow -notmatch "(?ms)name:\s*Check release workflow structure.*?pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/verify-release-workflow\.ps1") {
+  throw "CI must run the release workflow structure verifier."
+}
 Assert-Contains "rust_target:\s*x86_64-unknown-linux-gnu" "Linux amd64 Rust target"
 Assert-Contains "package_target:\s*linux-arm64" "Linux arm64 binary target"
 Assert-Contains "rust_target:\s*aarch64-unknown-linux-gnu" "Linux arm64 Rust target"
@@ -121,6 +165,10 @@ Assert-Contains "rust_target:\s*aarch64-apple-darwin" "macOS arm64 Rust target"
 Assert-Contains "--bundles dmg" "macOS DMG bundle"
 Assert-Contains "configure-macos-signing\.sh" "macOS signing setup"
 Assert-Contains "missing required macOS release secret" "macOS public release signing preflight"
+$publicTagCondition = "github\.event_name == 'push' && startsWith\(github\.ref, 'refs/tags/v'\)"
+Assert-Contains ("name:\s*Check public release signing secrets on macOS\s*\r?\n\s*if:\s*" + $publicTagCondition + " && runner\.os == 'macOS'") "macOS signing preflight limited to pushed v* tags"
+Assert-Contains ("name:\s*Configure macOS code signing\s*\r?\n\s*if:\s*" + $publicTagCondition + " && runner\.os == 'macOS'") "macOS signing setup limited to pushed v* tags"
+Assert-Contains ("name:\s*Build signed macOS bundles\s*\r?\n\s*if:\s*" + $publicTagCondition + " && runner\.os == 'macOS'") "signed macOS build limited to pushed v* tags"
 if ((Get-Content -LiteralPath (Join-Path $repoRoot "scripts/configure-macos-signing.sh") -Raw) -notmatch "APPLE_SIGNING_IDENTITY=.*GITHUB_ENV") {
   throw "macOS signing setup must export APPLE_SIGNING_IDENTITY through GITHUB_ENV"
 }
@@ -131,8 +179,18 @@ Assert-Contains "--bundles msi,nsis" "Windows MSI/NSIS bundle"
 Assert-Contains "--config src-tauri/tauri\.windows\.conf\.json" "Windows explicit signing config"
 Assert-Contains "configure-tauri-signing\.ps1" "Windows signing setup"
 Assert-Contains "Missing Windows signing configuration" "Windows public release signing preflight"
+Assert-Contains ("name:\s*Check public release signing secrets on Windows\s*\r?\n\s*if:\s*" + $publicTagCondition + " && runner\.os == 'Windows'") "Windows signing preflight limited to pushed v* tags"
+Assert-Contains ("name:\s*Configure Windows code signing\s*\r?\n\s*if:\s*" + $publicTagCondition + " && runner\.os == 'Windows'") "Windows signing setup limited to pushed v* tags"
+Assert-Contains ("name:\s*Build signed Windows bundles\s*\r?\n\s*if:\s*" + $publicTagCondition + " && runner\.os == 'Windows'") "signed Windows build limited to pushed v* tags"
+Assert-Contains "name:\s*Configure unsigned Windows bundle\s*\r?\n\s*if:\s*github\.event_name == 'workflow_dispatch' && runner\.os == 'Windows'" "manual Windows unsigned configuration"
+Assert-Contains "name:\s*Build unsigned desktop bundles\s*\r?\n\s*if:\s*github\.event_name == 'workflow_dispatch'" "manual unsigned desktop build"
+$windowsSignedStep = Get-StepSection "Build signed Windows bundles"
+if ($windowsSignedStep -match "APPLE_") {
+  throw "The signed Windows build must not receive Apple signing secrets."
+}
 
 Assert-Contains "platforms:\s*linux/amd64,linux/arm64" "Docker multiarch push"
+Assert-Contains ("type=ref,event=tag,enable=\$\{\{\s*" + $publicTagCondition + "\s*\}\}") "Docker tag metadata limited to pushed v* tags"
 $latestTagLines = @($workflow -split "`r?`n" | Where-Object { $_ -match 'type=raw,value=latest' })
 if ($latestTagLines.Count -ne 1 `
   -or $latestTagLines[0] -notmatch "refs/tags/v" `
@@ -146,11 +204,15 @@ Assert-Contains "verify-docker-manifest\.sh" "Docker multiarch manifest verifica
 Assert-Contains "Smoke test Docker image" "Docker smoke test"
 Assert-Contains '\$\{GITHUB_REPOSITORY,,\}' "lowercase GHCR image name"
 Assert-Contains "needs\.docker\.outputs\.image" "release body uses Docker image output"
+if ((Get-JobSection "publish") -notmatch ("(?m)^    if:\s*" + $publicTagCondition + "\s*$")) {
+  throw "GitHub releases must only be published for pushed v* tags."
+}
 Assert-Contains "prerelease:\s*\$\{\{\s*contains\(github\.ref_name, '-'\)\s*\}\}" "prerelease tags are marked as GitHub prereleases"
 Assert-Contains "make_latest:\s*\$\{\{\s*contains\(github\.ref_name, '-'\)[^\r\n]*'false'[^\r\n]*'true'[^\r\n]*\}\}" "only stable tags become the latest GitHub release"
 Assert-DockerfileContains "pnpm --dir web build" "web build stage"
 Assert-DockerfileContains "package-core\.sh --target linux-amd64" "Linux amd64 Mihomo core packaging"
 Assert-DockerfileContains "package-core\.sh --target linux-arm64" "Linux arm64 Mihomo core packaging"
+Assert-DockerfileContains "libc6-dev-arm64-cross" "Linux arm64 cross-compilation libc headers"
 Assert-DockerfileContains "cargo build -p rweb-clash-bin --features embedded-assets --release" "embedded Linux binary build"
 Assert-DockerfileContains "HEALTHCHECK[\s\S]*api/setup/status" "runtime healthcheck"
 Assert-DockerfileContains 'ENTRYPOINT \["/usr/local/bin/rweb-clash"\]' "runtime entrypoint"

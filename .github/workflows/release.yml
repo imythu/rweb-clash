@@ -14,6 +14,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   MIHOMO_VERSION: ${{ github.event.inputs.mihomo_version || 'latest' }}
@@ -38,23 +42,26 @@ jobs:
             cc: aarch64-linux-gnu-gcc
             ar: aarch64-linux-gnu-ar
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Sync release version from tag
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: pwsh -NoProfile -File scripts/sync-release-version.ps1 -Version $env:RELEASE_TAG
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: 10.24.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.rust_target }}
       - name: Install cross compiler and emulator
         if: matrix.name == 'arm64'
@@ -119,7 +126,7 @@ jobs:
           (cd dist && sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256)
       - name: Verify Linux archive contents
         run: bash scripts/verify-linux-archive.sh --archive dist/${{ matrix.artifact }}.tar.gz
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact }}
           if-no-files-found: error
@@ -137,7 +144,9 @@ jobs:
     outputs:
       image: ${{ steps.image.outputs.image }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Sync release version from tag
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -150,23 +159,23 @@ jobs:
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           echo "image=$image" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         id: meta
         with:
           images: ${{ steps.image.outputs.image }}
           tags: |
-            type=ref,event=tag
+            type=ref,event=tag,enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
             type=raw,value=latest,enable=${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
             type=sha
       - name: Build Docker image for smoke test
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64
@@ -189,7 +198,7 @@ jobs:
           done
           echo "Docker image did not become ready." >&2
           exit 1
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -222,26 +231,29 @@ jobs:
             rust_target: x86_64-pc-windows-msvc
             args: --target x86_64-pc-windows-msvc --bundles msi,nsis --config src-tauri/tauri.windows.conf.json --ci
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Sync release version from tag
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: pwsh -NoProfile -File scripts/sync-release-version.ps1 -Version $env:RELEASE_TAG
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: 10.24.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.rust_target }}
       - name: Check public release signing secrets on macOS
-        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'macOS'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && runner.os == 'macOS'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -259,7 +271,7 @@ jobs:
           done
           exit "$missing"
       - name: Check public release signing secrets on Windows
-        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'Windows'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && runner.os == 'Windows'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
@@ -303,7 +315,7 @@ jobs:
       - name: Check Tauri web build
         run: pnpm --dir web build:tauri
       - name: Configure macOS code signing
-        if: runner.os == 'macOS'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && runner.os == 'macOS'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -312,7 +324,7 @@ jobs:
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: bash scripts/configure-macos-signing.sh
       - name: Configure Windows code signing
-        if: runner.os == 'Windows'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && runner.os == 'Windows'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
@@ -321,9 +333,13 @@ jobs:
           WINDOWS_CERTIFICATE_DIGEST_ALGORITHM: ${{ vars.WINDOWS_CERTIFICATE_DIGEST_ALGORITHM }}
           WINDOWS_CERTIFICATE_TIMESTAMP_URL: ${{ vars.WINDOWS_CERTIFICATE_TIMESTAMP_URL }}
         run: powershell -ExecutionPolicy Bypass -File scripts/configure-tauri-signing.ps1
-      - name: Build signed desktop bundles
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: tauri-apps/tauri-action@v0
+      - name: Configure unsigned Windows bundle
+        if: github.event_name == 'workflow_dispatch' && runner.os == 'Windows'
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/configure-tauri-signing.ps1
+      - name: Build signed macOS bundles
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && runner.os == 'macOS'
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -334,15 +350,23 @@ jobs:
         with:
           projectPath: apps/desktop
           args: ${{ matrix.args }}
-      - name: Build unsigned desktop bundles
-        if: github.event_name == 'workflow_dispatch'
-        uses: tauri-apps/tauri-action@v0
+      - name: Build signed Windows bundles
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && runner.os == 'Windows'
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: apps/desktop
           args: ${{ matrix.args }}
-      - uses: actions/upload-artifact@v4
+      - name: Build unsigned desktop bundles
+        if: github.event_name == 'workflow_dispatch'
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          args: ${{ matrix.args }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rweb-clash-${{ matrix.name }}
           if-no-files-found: error
@@ -374,7 +398,7 @@ jobs:
               $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
               "$hash  $($_.Name)"
             } | Set-Content -LiteralPath "rweb-clash-${{ matrix.name }}.sha256" -Encoding utf8
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rweb-clash-${{ matrix.name }}-checksums
           if-no-files-found: error
@@ -389,9 +413,9 @@ jobs:
       - linux-binaries
       - docker
       - tauri
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
       - name: Verify release artifacts
@@ -448,7 +472,7 @@ jobs:
               echo "$file: OK"
             done < "$checksum"
           done < <(find artifacts -type f -name '*.sha256' | sort)
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           make_latest: ${{ contains(github.ref_name, '-') && 'false' || 'true' }}
