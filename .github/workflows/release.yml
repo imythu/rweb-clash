@@ -321,7 +321,9 @@ jobs:
           WINDOWS_CERTIFICATE_DIGEST_ALGORITHM: ${{ vars.WINDOWS_CERTIFICATE_DIGEST_ALGORITHM }}
           WINDOWS_CERTIFICATE_TIMESTAMP_URL: ${{ vars.WINDOWS_CERTIFICATE_TIMESTAMP_URL }}
         run: powershell -ExecutionPolicy Bypass -File scripts/configure-tauri-signing.ps1
-      - uses: tauri-apps/tauri-action@v0
+      - name: Build signed desktop bundles
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -329,6 +331,14 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: apps/desktop
+          args: ${{ matrix.args }}
+      - name: Build unsigned desktop bundles
+        if: github.event_name == 'workflow_dispatch'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: apps/desktop
           args: ${{ matrix.args }}
