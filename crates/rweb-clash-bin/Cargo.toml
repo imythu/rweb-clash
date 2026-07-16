@@ -1,0 +1,17 @@
+[package]
+name = "rweb-clash-bin"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[features]
+default = []
+embedded-assets = []
+
+[dependencies]
+anyhow.workspace = true
+rweb-clash = { path = "../rweb-clash" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

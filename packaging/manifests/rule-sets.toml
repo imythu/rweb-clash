@@ -1,0 +1,64 @@
+[[rule_sets]]
+id = "rs_builtin_applications"
+name = "applications"
+url = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/applications.txt"
+
+[[rule_sets]]
+id = "rs_builtin_private"
+name = "private"
+url = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/private.txt"
+
+[[rule_sets]]
+id = "rs_builtin_gfw"
+name = "gfw"
+url = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/gfw.txt"
+
+[[rule_sets]]
+id = "rs_builtin_tld_not_cn"
+name = "tld-not-cn"
+url = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/tld-not-cn.txt"
+
+[[rule_sets]]
+id = "rs_builtin_reject"
+name = "reject"
+url = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/reject.txt"
+
+[[rule_sets]]
+id = "rs_builtin_icloud"
+name = "icloud"
+url = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/icloud.txt"
+
+[[rule_sets]]
+id = "rs_builtin_apple"
+name = "apple"
+url = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/apple.txt"
+
+[[rule_sets]]
+id = "rs_builtin_google"
+name = "google"
+url = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/google.txt"
+
+[[rule_sets]]
+id = "rs_builtin_proxy"
+name = "proxy"
+url = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt"
+
+[[rule_sets]]
+id = "rs_builtin_direct"
+name = "direct"
+url = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/direct.txt"
+
+[[rule_sets]]
+id = "rs_builtin_lancidr"
+name = "lancidr"
+url = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/lancidr.txt"
+
+[[rule_sets]]
+id = "rs_builtin_cncidr"
+name = "cncidr"
+url = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/cncidr.txt"
+
+[[rule_sets]]
+id = "rs_builtin_telegramcidr"
+name = "telegramcidr"
+url = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/telegramcidr.txt"

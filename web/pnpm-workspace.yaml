@@ -1,2 +1,6 @@
+packages:
+  - "."
+  - "../apps/desktop"
+
 allowBuilds:
   msw: true

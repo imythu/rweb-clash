@@ -1,0 +1,461 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mihomo_version:
+        description: "Mihomo release tag, or latest"
+        default: "latest"
+        required: true
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MIHOMO_VERSION: ${{ github.event.inputs.mihomo_version || 'latest' }}
+
+jobs:
+  linux-binaries:
+    name: Linux ${{ matrix.name }} binary
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64
+            package_target: linux-amd64
+            rust_target: x86_64-unknown-linux-gnu
+            artifact: rweb-clash-linux-amd64
+          - name: arm64
+            package_target: linux-arm64
+            rust_target: aarch64-unknown-linux-gnu
+            artifact: rweb-clash-linux-arm64
+            linker: aarch64-linux-gnu-gcc
+            cc: aarch64-linux-gnu-gcc
+            ar: aarch64-linux-gnu-ar
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync release version from tag
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: pwsh -NoProfile -File scripts/sync-release-version.ps1 -Version $env:RELEASE_TAG
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.24.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+      - name: Install cross compiler and emulator
+        if: matrix.name == 'arm64'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
+      - name: Install frontend dependencies
+        run: pnpm --dir web install --frozen-lockfile
+      - name: Check packaging scripts
+        run: bash -n scripts/package-core.sh scripts/package-rule-sets.sh scripts/package-local.sh scripts/prepare-tauri-resources.sh scripts/verify-tauri-resources.sh scripts/release-smoke.sh scripts/configure-macos-signing.sh scripts/verify-docker-manifest.sh scripts/verify-linux-archive.sh packaging/linux/install.sh
+      - name: Check PowerShell packaging scripts
+        shell: pwsh
+        run: |
+          $scripts = @(
+            "scripts/package-core.ps1",
+            "scripts/package-rule-sets.ps1",
+            "scripts/package-local.ps1",
+            "scripts/prepare-tauri-resources.ps1",
+            "scripts/verify-tauri-resources.ps1",
+            "scripts/release-smoke.ps1",
+            "scripts/verify-release-local.ps1",
+            "scripts/verify-release-workflow.ps1",
+            "scripts/configure-tauri-signing.ps1",
+            "scripts/sync-release-version.ps1"
+          )
+          foreach ($script in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$script`: $($_.Message)" }
+              throw "PowerShell syntax check failed for $script"
+            }
+          }
+      - name: Check release workflow structure
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/verify-release-workflow.ps1
+      - name: Prepare embedded assets
+        run: |
+          bash scripts/package-core.sh --target "${{ matrix.package_target }}" --version "$MIHOMO_VERSION"
+          bash scripts/package-rule-sets.sh
+          pnpm --dir web build
+      - name: Build binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.cc }}
+          AR_aarch64_unknown_linux_gnu: ${{ matrix.ar }}
+        run: cargo build -p rweb-clash-bin --features embedded-assets --release --target "${{ matrix.rust_target }}"
+      - name: Smoke test Linux amd64 binary
+        if: matrix.name == 'amd64'
+        run: bash scripts/release-smoke.sh --binary target/${{ matrix.rust_target }}/release/rweb-clash-bin --listen 127.0.0.1:32990
+      - name: Smoke test Linux arm64 binary with QEMU
+        if: matrix.name == 'arm64'
+        run: bash scripts/release-smoke.sh --runner "qemu-aarch64 -L /usr/aarch64-linux-gnu" --binary target/${{ matrix.rust_target }}/release/rweb-clash-bin --listen 127.0.0.1:32990
+      - name: Package binary
+        run: |
+          mkdir -p dist/${{ matrix.artifact }}
+          cp target/${{ matrix.rust_target }}/release/rweb-clash-bin dist/${{ matrix.artifact }}/rweb-clash
+          cp README.md dist/${{ matrix.artifact }}/README.md
+          cp packaging/linux/README.md dist/${{ matrix.artifact }}/LINUX.md
+          cp packaging/linux/install.sh packaging/linux/rweb-clash.service scripts/release-smoke.sh scripts/release-smoke.ps1 dist/${{ matrix.artifact }}/
+          chmod +x dist/${{ matrix.artifact }}/rweb-clash dist/${{ matrix.artifact }}/install.sh dist/${{ matrix.artifact }}/release-smoke.sh
+          tar -C dist -czf dist/${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+          (cd dist && sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256)
+      - name: Verify Linux archive contents
+        run: bash scripts/verify-linux-archive.sh --archive dist/${{ matrix.artifact }}.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          path: |
+            dist/${{ matrix.artifact }}.tar.gz
+            dist/${{ matrix.artifact }}.tar.gz.sha256
+
+  docker:
+    name: Linux Docker image
+    runs-on: ubuntu-24.04
+    needs: linux-binaries
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync release version from tag
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: pwsh -NoProfile -File scripts/sync-release-version.ps1 -Version $env:RELEASE_TAG
+      - name: Set GHCR image name
+        id: image
+        shell: bash
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ steps.image.outputs.image }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
+            type=sha
+      - name: Build Docker image for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          build-args: |
+            MIHOMO_VERSION=${{ env.MIHOMO_VERSION }}
+          tags: rweb-clash:smoke
+      - name: Smoke test Docker image
+        run: |
+          token="release-smoke-token-0123456789abcdef"
+          docker run -d --name rweb-clash-smoke -e RWEB_CLASH_API_TOKEN="$token" -p 127.0.0.1:32991:31990 rweb-clash:smoke
+          trap 'docker logs rweb-clash-smoke || true; docker rm -f rweb-clash-smoke || true' EXIT
+          for i in $(seq 1 40); do
+            if curl -fsS -H "Authorization: Bearer $token" http://127.0.0.1:32991/api/setup/status >/dev/null; then
+              curl -fsS -H "Authorization: Bearer $token" http://127.0.0.1:32991/api/diagnostics/export | grep -q '^# rweb-clash diagnostics'
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Docker image did not become ready." >&2
+          exit 1
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            MIHOMO_VERSION=${{ env.MIHOMO_VERSION }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Verify Docker multiarch manifest
+        shell: bash
+        run: |
+          image="$(printf '%s\n' '${{ steps.meta.outputs.tags }}' | head -n 1)"
+          bash scripts/verify-docker-manifest.sh --image "$image"
+
+  tauri:
+    name: Tauri ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-15
+            package_target: macos-arm64
+            rust_target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --bundles dmg --ci
+          - name: windows-amd64
+            os: windows-2025
+            package_target: windows-amd64
+            rust_target: x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc --bundles msi,nsis --config src-tauri/tauri.windows.conf.json --ci
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync release version from tag
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: pwsh -NoProfile -File scripts/sync-release-version.ps1 -Version $env:RELEASE_TAG
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.24.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+      - name: Check public release signing secrets on macOS
+        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=0
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name:-}" ]; then
+              echo "missing required macOS release secret: $name" >&2
+              missing=1
+            fi
+          done
+          exit "$missing"
+      - name: Check public release signing secrets on Windows
+        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+          WINDOWS_CERTIFICATE_TIMESTAMP_URL: ${{ vars.WINDOWS_CERTIFICATE_TIMESTAMP_URL }}
+        run: |
+          $missing = @()
+          foreach ($name in @("WINDOWS_CERTIFICATE", "WINDOWS_CERTIFICATE_PASSWORD", "WINDOWS_CERTIFICATE_TIMESTAMP_URL")) {
+            if (-not (Get-Item "Env:\$name" -ErrorAction SilentlyContinue).Value) {
+              $missing += $name
+            }
+          }
+          if (-not $env:WINDOWS_CERTIFICATE_THUMBPRINT) {
+            Write-Host "WINDOWS_CERTIFICATE_THUMBPRINT is not set; it will be inferred from WINDOWS_CERTIFICATE."
+          }
+          if ($missing.Count -gt 0) {
+            $missing | ForEach-Object { Write-Error "missing required Windows release secret or variable: $_" }
+            throw "Missing Windows signing configuration."
+          }
+      - name: Install workspace dependencies
+        run: pnpm --dir web install --frozen-lockfile
+      - name: Prepare Tauri resources on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bash scripts/package-core.sh --target "${{ matrix.package_target }}" --version "$MIHOMO_VERSION"
+          bash scripts/package-rule-sets.sh
+          bash scripts/prepare-tauri-resources.sh --target "${{ matrix.package_target }}"
+          bash scripts/verify-tauri-resources.sh --target "${{ matrix.package_target }}"
+      - name: Prepare Tauri resources on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/package-core.ps1 -Target "${{ matrix.package_target }}" -Version "$env:MIHOMO_VERSION"
+          powershell -ExecutionPolicy Bypass -File scripts/package-rule-sets.ps1
+          powershell -ExecutionPolicy Bypass -File scripts/prepare-tauri-resources.ps1 -Target "${{ matrix.package_target }}"
+          powershell -ExecutionPolicy Bypass -File scripts/verify-tauri-resources.ps1 -Target "${{ matrix.package_target }}"
+      - name: Check Tauri Rust crate
+        run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --target "${{ matrix.rust_target }}"
+      - name: Check Tauri web build
+        run: pnpm --dir web build:tauri
+      - name: Configure macOS code signing
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: bash scripts/configure-macos-signing.sh
+      - name: Configure Windows code signing
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+          WINDOWS_CERTIFICATE_DIGEST_ALGORITHM: ${{ vars.WINDOWS_CERTIFICATE_DIGEST_ALGORITHM }}
+          WINDOWS_CERTIFICATE_TIMESTAMP_URL: ${{ vars.WINDOWS_CERTIFICATE_TIMESTAMP_URL }}
+        run: powershell -ExecutionPolicy Bypass -File scripts/configure-tauri-signing.ps1
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: apps/desktop
+          args: ${{ matrix.args }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rweb-clash-${{ matrix.name }}
+          if-no-files-found: error
+          path: |
+            apps/desktop/src-tauri/target/${{ matrix.rust_target }}/release/bundle/**/*.dmg
+            apps/desktop/src-tauri/target/${{ matrix.rust_target }}/release/bundle/**/*.msi
+            apps/desktop/src-tauri/target/${{ matrix.rust_target }}/release/bundle/**/*.exe
+      - name: Generate desktop checksums on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          find apps/desktop/src-tauri/target/${{ matrix.rust_target }}/release/bundle -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) -print0 > desktop-packages.txt
+          if [ ! -s desktop-packages.txt ]; then
+            echo "No desktop package files found." >&2
+            exit 1
+          fi
+          while IFS= read -r -d '' package; do
+            (cd "$(dirname "$package")" && shasum -a 256 "$(basename "$package")")
+          done < desktop-packages.txt > rweb-clash-${{ matrix.name }}.sha256
+      - name: Generate desktop checksums on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bundleDir = "apps/desktop/src-tauri/target/${{ matrix.rust_target }}/release/bundle"
+          $packages = Get-ChildItem -Path $bundleDir -Recurse -File -Include *.dmg, *.msi, *.exe
+          if (-not $packages) { throw "No desktop package files found under $bundleDir." }
+          $packages |
+            ForEach-Object {
+              $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+              "$hash  $($_.Name)"
+            } | Set-Content -LiteralPath "rweb-clash-${{ matrix.name }}.sha256" -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rweb-clash-${{ matrix.name }}-checksums
+          if-no-files-found: error
+          path: rweb-clash-${{ matrix.name }}.sha256
+
+  publish:
+    name: Publish GitHub release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    needs:
+      - linux-binaries
+      - docker
+      - tauri
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Verify release artifacts
+        shell: bash
+        run: |
+          require_one() {
+            local pattern="$1"
+            local label="$2"
+            if ! find artifacts -type f -path "$pattern" | grep -q .; then
+              echo "missing required artifact: $label ($pattern)" >&2
+              find artifacts -type f | sort >&2
+              exit 1
+            fi
+          }
+
+          require_one 'artifacts/*/rweb-clash-linux-amd64.tar.gz' 'Linux amd64 archive'
+          require_one 'artifacts/*/rweb-clash-linux-amd64.tar.gz.sha256' 'Linux amd64 checksum'
+          require_one 'artifacts/*/rweb-clash-linux-arm64.tar.gz' 'Linux arm64 archive'
+          require_one 'artifacts/*/rweb-clash-linux-arm64.tar.gz.sha256' 'Linux arm64 checksum'
+          if ! find artifacts -type f -name '*.dmg' | grep -q .; then
+            echo "missing required artifact: macOS arm64 DMG (*.dmg)" >&2
+            find artifacts -type f | sort >&2
+            exit 1
+          fi
+          if ! find artifacts -type f \( -name '*.msi' -o -name '*.exe' \) | grep -q .; then
+            echo "missing required artifact: Windows amd64 installer (*.msi or *.exe)" >&2
+            find artifacts -type f | sort >&2
+            exit 1
+          fi
+          require_one 'artifacts/*/rweb-clash-macos-arm64.sha256' 'macOS checksum'
+          require_one 'artifacts/*/rweb-clash-windows-amd64.sha256' 'Windows checksum'
+      - name: Verify release checksums
+        shell: bash
+        run: |
+          while IFS= read -r checksum; do
+            while read -r expected file; do
+              if [ -z "${expected:-}" ] || [ -z "${file:-}" ]; then
+                echo "invalid checksum line in $checksum" >&2
+                exit 1
+              fi
+              mapfile -t matches < <(find artifacts -type f -name "$file" | sort)
+              if [ "${#matches[@]}" -ne 1 ]; then
+                echo "expected exactly one artifact named $file for $checksum, found ${#matches[@]}" >&2
+                printf '%s\n' "${matches[@]}" >&2
+                exit 1
+              fi
+              actual="$(sha256sum "${matches[0]}" | awk '{ print $1 }')"
+              if [ "$actual" != "$expected" ]; then
+                echo "checksum mismatch for $file" >&2
+                echo "expected: $expected" >&2
+                echo "actual:   $actual" >&2
+                exit 1
+              fi
+              echo "$file: OK"
+            done < "$checksum"
+          done < <(find artifacts -type f -name '*.sha256' | sort)
+      - uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ contains(github.ref_name, '-') && 'false' || 'true' }}
+          body: |
+            ## rweb-clash
+
+            Supported release targets:
+            - macOS arm64: Tauri desktop package
+            - Windows amd64: Tauri desktop package
+            - Linux amd64: backend + embedded web single binary
+            - Linux arm64: backend + embedded web single binary
+            - Docker: `${{ needs.docker.outputs.image }}` for `linux/amd64` and `linux/arm64`
+
+            Linux does not use Tauri. The Linux binary serves both the API and the web UI.
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.sha256
+            artifacts/**/*.dmg
+            artifacts/**/*.msi
+            artifacts/**/*.exe

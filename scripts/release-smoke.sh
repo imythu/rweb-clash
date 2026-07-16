@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+binary="target/debug/rweb-clash-bin"
+listen="127.0.0.1:32990"
+runner=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --binary|-Binary)
+      binary="$2"
+      shift 2
+      ;;
+    --listen|-Listen)
+      listen="$2"
+      shift 2
+      ;;
+    --runner|-Runner)
+      runner="$2"
+      shift 2
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+root="$(pwd)/.tmp-smoke-runtime"
+stdout="$(pwd)/.tmp-smoke.out.log"
+stderr="$(pwd)/.tmp-smoke.err.log"
+pid=""
+
+cleanup() {
+  if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$root" "$stdout" "$stderr"
+}
+trap cleanup EXIT
+
+rm -rf "$root" "$stdout" "$stderr"
+mkdir -p "$root"
+
+if [[ -n "$runner" ]]; then
+  read -r -a runner_args <<< "$runner"
+  "${runner_args[@]}" "$binary" --listen "$listen" --data-dir "$root" --log-level warn >"$stdout" 2>"$stderr" &
+else
+  "$binary" --listen "$listen" --data-dir "$root" --log-level warn >"$stdout" 2>"$stderr" &
+fi
+pid="$!"
+
+for _ in $(seq 1 40); do
+  if setup="$(curl -fsS "http://$listen/api/setup/status" 2>/dev/null)" \
+    && diagnostics="$(curl -fsS "http://$listen/api/diagnostics/export" 2>/dev/null)" \
+    && printf '%s' "$diagnostics" | grep -q '^# rweb-clash diagnostics'; then
+    printf '{"ok":true,"setup":%s}\n' "$setup"
+    exit 0
+  fi
+  sleep 0.5
+done
+
+echo "rweb-clash did not become ready on $listen" >&2
+echo "--- stdout ---" >&2
+cat "$stdout" >&2 || true
+echo "--- stderr ---" >&2
+cat "$stderr" >&2 || true
+exit 1

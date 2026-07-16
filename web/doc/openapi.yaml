@@ -5,7 +5,9 @@ info:
   version: 1.5.0
 servers:
   - url: /api
-    description: Mock or Production API Server
+    description: Production API Server
+security:
+  - bearerAuth: []
 
 paths:
   /configs:
@@ -100,6 +102,13 @@ paths:
               properties:
                 name: { type: string }
                 url: { type: string }
+                intervalSeconds: { type: integer }
+                interval: { type: integer, description: "兼容旧前端，单位分钟" }
+                inheritGlobal: { type: boolean }
+                rules:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/FilterRule'
       responses:
         '201':
           description: Created
@@ -112,6 +121,23 @@ paths:
           in: path
           required: true
           schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, url]
+              properties:
+                name: { type: string }
+                url: { type: string }
+                intervalSeconds: { type: integer }
+                interval: { type: integer, description: "兼容旧前端，单位分钟" }
+                inheritGlobal: { type: boolean }
+                rules:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/FilterRule'
       responses:
         '200':
           description: Updated
@@ -125,6 +151,23 @@ paths:
       responses:
         '204':
           description: Deleted
+
+  /subscriptions/{id}/members:
+    get:
+      summary: 查看订阅成员
+      description: 返回订阅同步后保存的节点和订阅组，按过滤后与过滤前分组展示。过滤前订阅组当前不保存快照。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionMembers'
 
   /rules:
     get:
@@ -197,8 +240,30 @@ paths:
   /rule-sets:
     get:
       summary: 获取规则集清单
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RuleSet'
     post:
       summary: 导入外部规则集
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RuleSetInput'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleSet'
 
   /dns/flush:
     post:
@@ -270,6 +335,12 @@ paths:
                   delay: { type: integer }
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: 使用 RWEB_CLASH_API_TOKEN；非回环监听时必须配置，本地回环且未配置令牌时可省略。
   schemas:
     SystemConfig:
       type: object
@@ -280,23 +351,48 @@ components:
         mixed_port: { type: integer, example: 7890 }
         external_controller: { type: string, example: "127.0.0.1:9090" }
         external_controller_enabled: { type: boolean }
-        secret: { type: string, description: "API 访问密钥" }
+        secret: { type: string, description: "Mihomo external-controller 访问密钥（不是本 HTTP API 的 Bearer 令牌）" }
         dns_enabled: { type: boolean }
         dns_mode: { type: string, enum: [fake-ip, redir-host] }
         store_selected: { type: boolean, description: "持久化节点选择" }
         unified_delay: { type: boolean, description: "统一体感延迟" }
         tcp_concurrent: { type: boolean, description: "TCP 并发增强" }
+        tun: { type: boolean, description: "启用 TUN 模式" }
+        system_proxy: { type: boolean, description: "启用系统代理" }
+        mode: { type: string, enum: [rule, global, direct] }
+        auto_start: { type: boolean, description: "开机自动启动" }
 
     ProxyGroup:
       type: object
       properties:
         name: { type: string }
         type: { type: string }
+        source: { type: string, enum: [system, subscription, custom] }
+        subscriptionName: { type: string, nullable: true, description: "订阅托管分组的显示名称；内部运行时 ID 不包含该名称" }
+        builtin: { type: boolean, description: "系统内置分组不可增删改" }
         now: { type: string, description: "当前选中的节点名称" }
         delay: { type: integer }
         all:
           type: array
           items: { type: string }
+        filter:
+          type: array
+          items:
+            $ref: '#/components/schemas/GroupFilter'
+
+    GroupFilter:
+      type: object
+      properties:
+        id: { type: string }
+        action: { type: string, enum: [keep, discard] }
+        type: { type: string, enum: [name, country, protocol, latency, status, subscription] }
+        operator: { type: string, enum: [contains, equals, in, regex, is, less_than, starts_with] }
+        value: { type: string, description: "单值匹配参数；in 规则使用 values" }
+        values:
+          type: array
+          description: "多值匹配参数，operator 为 in 时使用"
+          items: { type: string }
+        enabled: { type: boolean }
 
     ProxyNode:
       type: object
@@ -305,6 +401,8 @@ components:
         type: { type: string }
         latency: { type: integer }
         country: { type: string, example: "HK" }
+        subscriptionId: { type: string, nullable: true }
+        subscriptionName: { type: string, nullable: true, description: "订阅显示名称；内部运行时 ID 不包含该名称" }
 
     Subscription:
       type: object
@@ -312,14 +410,86 @@ components:
         id: { type: string }
         name: { type: string }
         url: { type: string }
+        format: { type: string, description: "订阅源解析格式：clash、base64-clash、legacy、base64-legacy 或 unknown" }
         nodes: { type: integer }
         status: { type: string, enum: [online, offline, updating] }
+        expiry: { type: string, nullable: true }
+        intervalSeconds: { type: integer }
+        interval: { type: integer }
+        inheritGlobal: { type: boolean }
         lastUpdate: { type: string }
+        lastError: { type: string, nullable: true }
         traffic:
           type: object
           properties:
             used: { type: integer }
             total: { type: integer }
+        breakdown:
+          type: object
+          additionalProperties: { type: integer }
+        rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/FilterRule'
+
+    FilterRule:
+      type: object
+      properties:
+        id: { type: string }
+        action: { type: string, enum: [keep, discard] }
+        type: { type: string, enum: [contains, not_contains, regex, in] }
+        pattern: { type: string, description: "单值匹配参数；in 规则使用 values" }
+        values:
+          type: array
+          description: "精确匹配的名字方案列表，type 为 in 时使用"
+          items: { type: string }
+        enabled: { type: boolean }
+
+    SubscriptionMembers:
+      type: object
+      properties:
+        subscriptionId: { type: string }
+        subscriptionName: { type: string }
+        filtered:
+          $ref: '#/components/schemas/SubscriptionMemberSection'
+        beforeFilter:
+          $ref: '#/components/schemas/SubscriptionMemberSection'
+
+    SubscriptionMemberSection:
+      type: object
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/SubscriptionMemberNode'
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/SubscriptionMemberGroup'
+
+    SubscriptionMemberNode:
+      type: object
+      properties:
+        name: { type: string }
+        displayName: { type: string }
+        protocol: { type: string }
+        country: { type: string }
+        latency: { type: integer }
+        filteredOut: { type: boolean }
+        filterReason: { type: string }
+
+    SubscriptionMemberGroup:
+      type: object
+      properties:
+        name: { type: string }
+        displayName: { type: string }
+        type: { type: string }
+        members:
+          type: array
+          items: { type: string }
+        memberCount: { type: integer }
+        filteredOut: { type: boolean }
+        filterReason: { type: string }
 
     Rule:
       type: object
@@ -329,6 +499,33 @@ components:
         value: { type: string }
         policy: { type: string, description: "目标代理组或预设策略" }
         desc: { type: string }
+
+    RuleSetInput:
+      type: object
+      required: [name, url]
+      properties:
+        name: { type: string }
+        url: { type: string }
+        intervalSeconds: { type: integer, example: 86400 }
+        format:
+          type: string
+          enum: [text, yaml]
+          default: text
+
+    RuleSet:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        url: { type: string }
+        behavior:
+          type: string
+          nullable: true
+          enum: [domain, ipcidr, classical]
+        format: { type: string }
+        ruleCount: { type: integer }
+        lastUpdate: { type: string, nullable: true }
+        lastError: { type: string, nullable: true }
 
     LogEntry:
       type: object

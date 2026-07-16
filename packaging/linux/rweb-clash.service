@@ -1,0 +1,13 @@
+[Unit]
+Description=R-Clash user service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/rweb-clash --listen 127.0.0.1:31990 --data-dir %h/.local/share/rweb-clash
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

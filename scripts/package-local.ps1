@@ -1,0 +1,94 @@
+param(
+  [Parameter(Mandatory = $true)]
+  [ValidateSet("linux-amd64", "linux-arm64", "linux-x86_64", "linux-aarch64", "windows-amd64", "windows-x86_64", "macos-arm64", "macos-aarch64", "macos-x86_64")]
+  [string]$Target,
+  [string]$Version = "latest"
+)
+
+$ErrorActionPreference = "Stop"
+$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+
+function Invoke-Native {
+  param(
+    [Parameter(Mandatory = $true)]
+    [scriptblock]$Command
+  )
+  & $Command
+  if ($LASTEXITCODE -ne 0) {
+    throw "Command failed with exit code $LASTEXITCODE."
+  }
+}
+
+function New-LinuxArchive {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Artifact,
+    [Parameter(Mandatory = $true)]
+    [string]$RustTarget
+  )
+
+  $distRoot = Join-Path $repoRoot "dist"
+  $releaseDir = Join-Path $distRoot $Artifact
+  if (Test-Path -LiteralPath $releaseDir) {
+    Remove-Item -LiteralPath $releaseDir -Recurse -Force
+  }
+  New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+
+  $binaryName = if ($IsWindows) { "rweb-clash-bin.exe" } else { "rweb-clash-bin" }
+  $binaryPath = Join-Path $repoRoot "target/$RustTarget/release/$binaryName"
+  if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
+    throw "release binary not found: $binaryPath"
+  }
+
+  Copy-Item -LiteralPath $binaryPath -Destination (Join-Path $releaseDir "rweb-clash") -Force
+  Copy-Item -LiteralPath (Join-Path $repoRoot "README.md") -Destination (Join-Path $releaseDir "README.md") -Force
+  Copy-Item -LiteralPath (Join-Path $repoRoot "packaging/linux/README.md") -Destination (Join-Path $releaseDir "LINUX.md") -Force
+  Copy-Item -LiteralPath (Join-Path $repoRoot "packaging/linux/install.sh") -Destination $releaseDir -Force
+  Copy-Item -LiteralPath (Join-Path $repoRoot "packaging/linux/rweb-clash.service") -Destination $releaseDir -Force
+  Copy-Item -LiteralPath (Join-Path $repoRoot "scripts/release-smoke.sh") -Destination $releaseDir -Force
+  Copy-Item -LiteralPath (Join-Path $repoRoot "scripts/release-smoke.ps1") -Destination $releaseDir -Force
+
+  $archive = Join-Path $distRoot "$Artifact.tar.gz"
+  Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+  tar -C $distRoot -czf $archive $Artifact
+
+  $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+  "$hash  $Artifact.tar.gz" | Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
+
+  if (-not $IsWindows) {
+    & bash (Join-Path $repoRoot "scripts/verify-linux-archive.sh") --archive $archive
+  } else {
+    Write-Host "Created Linux release archive: $archive"
+    Write-Host "Run scripts/verify-linux-archive.sh on Linux to verify executable bits."
+  }
+}
+
+& (Join-Path $PSScriptRoot "package-core.ps1") -Target $Target -Version $Version
+& (Join-Path $PSScriptRoot "package-rule-sets.ps1")
+Invoke-Native { pnpm --dir (Join-Path $repoRoot "web") build }
+
+switch ($Target) {
+  { $_ -in @("linux-amd64", "linux-x86_64") } {
+    $rustTarget = "x86_64-unknown-linux-gnu"
+    Invoke-Native { cargo build -p rweb-clash-bin --features embedded-assets --release --target $rustTarget }
+    New-LinuxArchive -Artifact "rweb-clash-linux-amd64" -RustTarget $rustTarget
+    break
+  }
+  { $_ -in @("linux-arm64", "linux-aarch64") } {
+    $rustTarget = "aarch64-unknown-linux-gnu"
+    Invoke-Native { cargo build -p rweb-clash-bin --features embedded-assets --release --target $rustTarget }
+    New-LinuxArchive -Artifact "rweb-clash-linux-arm64" -RustTarget $rustTarget
+    break
+  }
+  { $_ -in @("windows-amd64", "windows-x86_64", "macos-arm64", "macos-aarch64", "macos-x86_64") } {
+    $resources = Join-Path $repoRoot "apps/desktop/src-tauri/resources"
+    if (Test-Path -LiteralPath $resources) { Remove-Item -LiteralPath $resources -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path (Join-Path $resources "core") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $resources "rule-sets") | Out-Null
+    Copy-Item -Path (Join-Path $repoRoot "packaging/cache/cores/$Target/*") -Destination (Join-Path $resources "core") -Force
+    Copy-Item -Path (Join-Path $repoRoot "packaging/cache/rule-sets/*.list") -Destination (Join-Path $resources "rule-sets") -Force
+    Copy-Item -LiteralPath (Join-Path $repoRoot "packaging/cache/rule-sets/manifest.json") -Destination (Join-Path $resources "rule-sets") -Force
+    Invoke-Native { pnpm --dir (Join-Path $repoRoot "apps/desktop") tauri build }
+    break
+  }
+}

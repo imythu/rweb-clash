@@ -27,5 +27,4 @@ The interface must cater to two distinct user segments simultaneously:
 
 ## 4. Engineering Standards
 - **API First**: All frontend interactions must be documented in `doc/openapi.yaml` and implemented via standard `fetch` calls.
-- **Stateful Mocking**: During development, use MSW (Mock Service Worker) with in-memory state persistence to simulate real backend behavior.
 - **Type Safety**: Maintain strict TypeScript definitions. Avoid `any` where possible.

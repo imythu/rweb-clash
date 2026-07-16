@@ -1,0 +1,18 @@
+[package]
+name = "rweb-clash-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1.0.103"
+rweb-clash = { path = "../../../crates/rweb-clash" }
+tauri = { version = "2.11.1", features = ["tray-icon"] }
+tokio = { version = "1.51.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"

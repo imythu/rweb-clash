@@ -1,0 +1,19 @@
+services:
+  rweb-clash:
+    image: ghcr.io/OWNER/REPO:latest
+    container_name: rweb-clash
+    restart: unless-stopped
+    environment:
+      RWEB_CLASH_API_TOKEN: "${RWEB_CLASH_API_TOKEN:?set RWEB_CLASH_API_TOKEN to a random value of at least 16 characters}"
+    ports:
+      # Keep the host binding on loopback unless a trusted reverse proxy terminates TLS.
+      - "127.0.0.1:31990:31990"
+    volumes:
+      - rweb-clash-data:/var/lib/rweb-clash
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  rweb-clash-data:

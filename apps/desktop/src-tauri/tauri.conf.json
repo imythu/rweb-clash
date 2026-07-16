@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "rweb-clash",
+  "version": "0.1.0",
+  "identifier": "dev.rweb-clash.client",
+  "build": {
+    "frontendDist": "../../../web/dist",
+    "beforeBuildCommand": "pnpm --dir ../../web build:tauri",
+    "beforeDevCommand": "pnpm --dir ../../web dev:tauri",
+    "devUrl": "http://localhost:5173"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "rweb-clash",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 640,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:31990 ws://127.0.0.1:31990; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app",
+      "dmg",
+      "msi",
+      "nsis"
+    ],
+    "icon": [
+      "icons/icon.ico",
+      "../../../web/public/favicon.svg"
+    ],
+    "resources": [
+      "resources/core/*",
+      "resources/rule-sets/*"
+    ]
+  }
+}

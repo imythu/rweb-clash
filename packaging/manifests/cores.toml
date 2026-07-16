@@ -1,0 +1,48 @@
+[targets.windows-amd64]
+os = "windows"
+arch_candidates = ["amd64", "amd64-compatible"]
+archive = "zip"
+binary = "mihomo.exe"
+
+[targets.macos-arm64]
+os = "darwin"
+arch_candidates = ["arm64"]
+archive = "gz"
+binary = "mihomo"
+
+[targets.linux-amd64]
+os = "linux"
+arch_candidates = ["amd64", "amd64-compatible"]
+archive = "gz"
+binary = "mihomo"
+
+[targets.linux-arm64]
+os = "linux"
+arch_candidates = ["arm64"]
+archive = "gz"
+binary = "mihomo"
+
+# Backward-compatible aliases used by older local scripts.
+[targets.windows-x86_64]
+os = "windows"
+arch_candidates = ["amd64", "amd64-compatible"]
+archive = "zip"
+binary = "mihomo.exe"
+
+[targets.macos-aarch64]
+os = "darwin"
+arch_candidates = ["arm64"]
+archive = "gz"
+binary = "mihomo"
+
+[targets.macos-x86_64]
+os = "darwin"
+arch_candidates = ["amd64", "amd64-compatible"]
+archive = "gz"
+binary = "mihomo"
+
+[targets.linux-x86_64]
+os = "linux"
+arch_candidates = ["amd64", "amd64-compatible"]
+archive = "gz"
+binary = "mihomo"
