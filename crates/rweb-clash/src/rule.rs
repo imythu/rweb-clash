@@ -80,7 +80,9 @@ impl RuleService {
             enabled = input.enabled.unwrap_or(true),
             "storing routing rule update"
         );
-        self.storage
+        let position = input.position;
+        let rule = self
+            .storage
             .update_rule(
                 id,
                 &input.rule_type,
@@ -89,7 +91,11 @@ impl RuleService {
                 input.desc.as_deref(),
                 input.enabled.unwrap_or(true),
             )
-            .await
+            .await?;
+        match position {
+            Some(position) => self.storage.move_rule(id, position).await,
+            None => Ok(rule),
+        }
     }
 
     pub async fn test_rule(&self, request: RuleTestRequest) -> Result<RuleTestResponse, AppError> {

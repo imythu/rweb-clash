@@ -6,6 +6,7 @@ import {
   X, ArrowDownRight, Fingerprint, ShieldAlert,
   Edit3, RotateCcw, Database, RefreshCw,
   ChevronRight, MousePointer2,
+  GripVertical, Pin,
   type LucideIcon
 } from 'lucide-react';
 import { cn, SUB_DELIMITER } from "@/lib/utils";
@@ -220,6 +221,8 @@ export const Rules = () => {
   const [testTarget, setTarget] = useState('');
   const [testResult, setTestResult] = useState<RuleTestResult | null>(null);
   const [isTesting, setIsTesting] = useState(false);
+  const [draggedRuleId, setDraggedRuleId] = useState<string | null>(null);
+  const [movingRuleId, setMovingRuleId] = useState<string | null>(null);
   const subscriptionByPolicy = useMemo(() => new Map<string, string>([
     ...proxies.flatMap(proxy => proxy.subscriptionName ? [[proxy.name, proxy.subscriptionName] as const] : []),
     ...nodes.flatMap(node => node.subscriptionName ? [[node.name, node.subscriptionName] as const] : []),
@@ -295,6 +298,28 @@ export const Rules = () => {
     } catch {
       toast('规则删除失败', 'error');
     }
+  };
+
+  const sourcePosition = (rule: Rule) => rules.filter(item => item.source === rule.source).findIndex(item => item.id === rule.id) + 1;
+  const sourceRuleCount = (rule: Rule) => rules.filter(item => item.source === rule.source).length;
+  const handleMoveRule = async (rule: Rule, position: number) => {
+    if (movingRuleId) return;
+    setMovingRuleId(rule.id);
+    try {
+      await api.updateRule(rule.id, {
+        type: rule.type, value: rule.value, policy: rule.policy, desc: rule.desc,
+        enabled: rule.enabled, position,
+      });
+      await fetchRules();
+    } catch { toast('规则顺序调整失败', 'error'); }
+    finally { setMovingRuleId(null); }
+  };
+
+  const handleDropRule = (target: Rule) => {
+    const dragged = rules.find(rule => rule.id === draggedRuleId);
+    setDraggedRuleId(null);
+    if (!dragged || dragged.id === target.id || dragged.source !== target.source) return;
+    void handleMoveRule(dragged, sourcePosition(target));
   };
 
   const handleAddRuleSet = async (data: RuleSetInput) => {
@@ -393,15 +418,21 @@ export const Rules = () => {
       {/* 4. The Data Grid */}
       <div className="space-y-2">
         {filteredRules.map((rule, idx) => (
-          <div key={rule.id} className="group relative bg-card hover:bg-card border border-border hover:border-primary/20 rounded-2xl p-3 md:px-6 md:py-4 transition-all duration-300 shadow-sm hover:shadow-md overflow-hidden text-left">
+          <div key={rule.id} draggable={!movingRuleId} onDragStart={() => setDraggedRuleId(rule.id)} onDragEnd={() => setDraggedRuleId(null)} onDragOver={event => event.preventDefault()} onDrop={() => handleDropRule(rule)} className={cn("group relative bg-card hover:bg-card border border-border hover:border-primary/20 rounded-2xl p-3 md:px-6 md:py-4 transition-all duration-300 shadow-sm hover:shadow-md overflow-hidden text-left", draggedRuleId === rule.id && "opacity-50", movingRuleId === rule.id && "pointer-events-none opacity-60")}>
              {/* Desktop Layout */}
              <div className={cn("hidden lg:grid items-center gap-4", GRID_COLS)}>
-                <div className="text-center font-mono text-[10px] opacity-70 font-black">{String(idx + 1).padStart(2, '0')}</div>
+                <div className="flex items-center justify-center gap-1">
+                  <GripVertical className="size-3.5 cursor-grab text-muted-foreground" />
+                  <select aria-label={`设置 ${rule.value} 的顺序`} value={sourcePosition(rule)} onChange={event => void handleMoveRule(rule, Number(event.target.value))} className="h-7 w-12 rounded-md border bg-background text-center font-mono text-[10px] font-black outline-none">
+                    {Array.from({ length: sourceRuleCount(rule) }, (_, position) => <option key={position + 1} value={position + 1}>{position + 1}</option>)}
+                  </select>
+                </div>
                 <div><div className="px-2 py-0.5 rounded bg-zinc-900 text-zinc-100 text-[9px] font-black uppercase tracking-wide inline-block border border-white/5">{rule.type}</div></div>
                 <div className="min-w-0"><h4 className="text-sm font-black truncate text-foreground">{rule.value}</h4><p className="text-[10px] font-bold text-muted-foreground uppercase truncate">{rule.desc || 'Active Dispatching'}</p></div>
                 <div className="flex justify-center"><LogicFlow policy={rule.policy} /></div>
                 <div className="flex justify-start min-w-0"><ActionPill action={rule.policy} subscriptionName={subscriptionByPolicy.get(rule.policy)} className="w-full max-w-[180px]" /></div>
                 <div className="flex items-center justify-end gap-1.5 opacity-0 group-hover:opacity-100 transition-all pr-2">
+                   <Button title="置顶" onClick={() => void handleMoveRule(rule, 1)} variant="ghost" size="icon" className="size-8 rounded-lg hover:bg-muted"><Pin className="size-3.5" /></Button>
                    <Button onClick={() => { setEditingRule(rule); setIsDrawerOpen(true); }} variant="ghost" size="icon" className="size-8 rounded-lg hover:bg-muted"><Edit3 className="size-3.5" /></Button>
                    <Button onClick={() => handleDeleteRule(rule.id)} variant="ghost" size="icon" className="size-8 rounded-lg text-red-500 hover:bg-red-500/10"><Trash2 className="size-3.5" /></Button>
                 </div>
@@ -411,10 +442,10 @@ export const Rules = () => {
              <div className="flex lg:hidden flex-col gap-4 text-left">
                 <div className="flex items-start justify-between gap-4 text-left">
                    <div className="flex gap-3 min-w-0 text-left">
-                      <span className="text-[10px] font-mono opacity-70 font-black pt-1">{String(idx + 1).padStart(2, '0')}</span>
+                      <span className="flex items-center gap-1 text-[10px] font-mono opacity-70 font-black pt-1"><GripVertical className="size-3.5" />{String(idx + 1).padStart(2, '0')}</span>
                       <div className="min-w-0 text-left"><div className="px-1.5 py-0.5 rounded bg-zinc-900 text-zinc-100 text-[9px] font-black uppercase tracking-wide mb-1.5 inline-block">{rule.type}</div><h4 className="text-sm font-black truncate text-foreground">{rule.value}</h4></div>
                    </div>
-                   <div className="flex gap-1 shrink-0"><Button onClick={() => { setEditingRule(rule); setIsDrawerOpen(true); }} variant="ghost" size="icon" className="size-8 rounded-lg bg-muted/50"><Edit3 className="size-3.5" /></Button><Button onClick={() => handleDeleteRule(rule.id)} variant="ghost" size="icon" className="size-8 rounded-lg text-red-500 bg-red-500/5"><Trash2 className="size-3.5" /></Button></div>
+                   <div className="flex gap-1 shrink-0"><select aria-label="设置规则顺序" value={sourcePosition(rule)} onChange={event => void handleMoveRule(rule, Number(event.target.value))} className="h-8 w-12 rounded-lg border bg-background text-center text-[10px] font-black">{Array.from({ length: sourceRuleCount(rule) }, (_, position) => <option key={position + 1} value={position + 1}>{position + 1}</option>)}</select><Button title="置顶" onClick={() => void handleMoveRule(rule, 1)} variant="ghost" size="icon" className="size-8 rounded-lg bg-muted/50"><Pin className="size-3.5" /></Button><Button onClick={() => { setEditingRule(rule); setIsDrawerOpen(true); }} variant="ghost" size="icon" className="size-8 rounded-lg bg-muted/50"><Edit3 className="size-3.5" /></Button><Button onClick={() => handleDeleteRule(rule.id)} variant="ghost" size="icon" className="size-8 rounded-lg text-red-500 bg-red-500/5"><Trash2 className="size-3.5" /></Button></div>
                 </div>
                 <div className="flex items-center gap-3 pt-3 border-t border-dashed border-muted/50"><div className="flex-1 min-w-0"><ActionPill action={rule.policy} subscriptionName={subscriptionByPolicy.get(rule.policy)} className="w-full" /></div></div>
              </div>

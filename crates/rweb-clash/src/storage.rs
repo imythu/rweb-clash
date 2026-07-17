@@ -1307,7 +1307,38 @@ WHERE id = ?
     }
 
     pub async fn sync_builtin_proxy_group(&self) -> Result<(), AppError> {
-        let members = self.valid_node_names().await?;
+        let mut members = self.valid_node_names().await?;
+        let group_names = sqlx::query_scalar::<_, String>(
+            r#"
+SELECT name FROM proxy_items
+WHERE kind = 'group' AND name <> ? AND enabled = 1 AND filtered_out = 0
+ORDER BY position, name
+"#,
+        )
+        .bind(BUILTIN_PROXY_GROUP_NAME)
+        .fetch_all(&self.pool)
+        .await?;
+        for group_name in group_names {
+            let depends_on_proxy = sqlx::query_scalar::<_, bool>(
+                r#"
+WITH RECURSIVE dependencies(name) AS (
+  SELECT member_name FROM proxy_group_members WHERE group_name = ?
+  UNION
+  SELECT members.member_name
+  FROM proxy_group_members members
+  JOIN dependencies ON members.group_name = dependencies.name
+)
+SELECT EXISTS(SELECT 1 FROM dependencies WHERE name = ?)
+"#,
+            )
+            .bind(&group_name)
+            .bind(BUILTIN_PROXY_GROUP_NAME)
+            .fetch_one(&self.pool)
+            .await?;
+            if !depends_on_proxy {
+                members.push(group_name);
+            }
+        }
         let current_now = self
             .current_group_now(BUILTIN_PROXY_GROUP_NAME)
             .await?
@@ -1845,6 +1876,62 @@ WHERE id = ?
                 format!("rule {id} not found"),
             ));
         }
+        self.rule_by_id(id).await
+    }
+
+    pub async fn move_rule(
+        &self,
+        id: &str,
+        target_position: usize,
+    ) -> Result<RuleResponse, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let source =
+            sqlx::query_scalar::<_, String>("SELECT source FROM routing_rules WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    AppError::not_found("rule_not_found", format!("rule {id} not found"))
+                })?;
+        let rows = sqlx::query(
+            "SELECT id, rule_type FROM routing_rules WHERE source = ? ORDER BY position, created_at, id",
+        )
+        .bind(&source)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut ids = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("id"),
+                    row.get::<String, _>("rule_type"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let current = ids
+            .iter()
+            .position(|(rule_id, _)| rule_id == id)
+            .expect("rule was selected above");
+        let item = ids.remove(current);
+        let target = if item.1 == "MATCH" {
+            ids.len()
+        } else {
+            let max_target = ids
+                .iter()
+                .position(|(_, kind)| kind == "MATCH")
+                .unwrap_or(ids.len());
+            target_position.saturating_sub(1).min(max_target)
+        };
+        ids.insert(target, item);
+        for (index, (rule_id, _)) in ids.iter().enumerate() {
+            sqlx::query("UPDATE routing_rules SET position = ?, updated_at = ? WHERE id = ?")
+                .bind(((index + 1) as i64) * 1024)
+                .bind(now_iso())
+                .bind(rule_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         self.rule_by_id(id).await
     }
 
@@ -2732,6 +2819,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn moving_rules_uses_one_based_positions_and_keeps_match_last() {
+        let temp = TestDir::new("move-rule");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        for (id, kind) in [("one", "DOMAIN"), ("two", "DOMAIN"), ("match", "MATCH")] {
+            storage
+                .upsert_rule(Some(id.into()), kind, id, "DIRECT", None, true)
+                .await
+                .expect("insert rule");
+        }
+
+        storage.move_rule("two", 1).await.expect("move to top");
+        storage
+            .move_rule("match", 1)
+            .await
+            .expect("keep match last");
+        let ids = storage
+            .list_rules()
+            .await
+            .expect("list rules")
+            .into_iter()
+            .filter(|rule| rule.source == "user")
+            .map(|rule| rule.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["two", "one", "match"]);
+    }
+
+    #[tokio::test]
     async fn replacing_subscription_assets_migrates_runtime_name_references() {
         let temp = TestDir::new("asset-name-migration");
         let storage = Storage::connect(&AppPaths::from_root(temp.path()))
@@ -3295,6 +3411,44 @@ mod tests {
             .expect("query due rule sets")
             .iter()
             .any(|id| id == rule_set_id));
+    }
+
+    #[tokio::test]
+    async fn builtin_proxy_contains_nodes_and_non_cyclic_strategy_groups() {
+        let temp = TestDir::new("builtin-proxy-members");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        storage
+            .upsert_proxy_item(&test_proxy_item("Node", "node", None, "Node", None))
+            .await
+            .expect("store node");
+        for name in ["Regional", "Depends on PROXY"] {
+            storage
+                .upsert_proxy_item(&test_proxy_item(name, "group", None, name, None))
+                .await
+                .expect("store group");
+        }
+        storage
+            .replace_group_members("Regional", &["Node".into()])
+            .await
+            .expect("store regional members");
+        storage
+            .replace_group_members("Depends on PROXY", &[BUILTIN_PROXY.into()])
+            .await
+            .expect("store cyclic members");
+
+        storage
+            .sync_builtin_proxy_group()
+            .await
+            .expect("sync builtin proxy");
+        let members = storage
+            .group_members(BUILTIN_PROXY)
+            .await
+            .expect("read builtin members");
+        assert!(members.iter().any(|member| member == "Node"));
+        assert!(members.iter().any(|member| member == "Regional"));
+        assert!(!members.iter().any(|member| member == "Depends on PROXY"));
     }
 
     fn test_proxy_item(

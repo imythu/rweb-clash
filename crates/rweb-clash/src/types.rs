@@ -458,6 +458,8 @@ pub struct RuleInput {
     pub policy: String,
     pub desc: Option<String>,
     pub enabled: Option<bool>,
+    /// One-based position within rules from the same source.
+    pub position: Option<usize>,
 }
 
 impl Default for RuleInput {
@@ -469,6 +471,7 @@ impl Default for RuleInput {
             policy: BUILTIN_DIRECT.into(),
             desc: None,
             enabled: Some(true),
+            position: None,
         }
     }
 }

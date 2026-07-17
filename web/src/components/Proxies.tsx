@@ -6,7 +6,7 @@ import {
   ZapOff, ShieldAlert,
   Flag, Tag, Clock
 } from 'lucide-react';
-import { cn, SUB_DELIMITER } from "@/lib/utils";
+import { cn, createId, SUB_DELIMITER } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useToast } from './toast-context';
 import { api, type GroupFilter, type ProxyGroup, type ProxyGroupInput, type ProxyNode } from '@/lib/api';
@@ -51,6 +51,17 @@ const isManagedGroup = (group: Pick<ProxyGroup, 'builtin' | 'source'>) =>
   isSystemBuiltinGroup(group) || group.source === 'subscription';
 
 const displayRuntimeName = (name: string) => name.split(SUB_DELIMITER)[0] || name;
+
+const COUNTRY_PRESET_PREFIX = '国家 · ';
+const COUNTRY_PRESET_DISABLED_KEY = 'rweb-clash.country-presets-disabled';
+const GROUP_STRATEGIES = ['url-test', 'select', 'fallback', 'load-balance'] as const;
+
+const presetCountry = (group: ProxyGroup) => {
+  if (group.source !== 'custom' || !group.name.startsWith(COUNTRY_PRESET_PREFIX) || group.filter.length !== 1) return null;
+  const filter = group.filter[0];
+  if (filter.action !== 'keep' || filter.type !== 'country') return null;
+  return filter.values?.length === 1 ? filter.values[0] : filter.value || null;
+};
 
 type SelectOption = {
   value: string;
@@ -186,7 +197,7 @@ const normalizeBlock = (block: NormalizableBlock): SemanticBlock => {
   const operator = values.length > 0 && (type === 'country' || rawOperator === 'equals' || rawOperator === 'in') ? 'in' : rawOperator;
 
   return {
-    id: block.id || crypto.randomUUID(),
+    id: block.id || createId(),
     action: (block.action || 'keep') as SemanticBlock['action'],
     type: type as SemanticBlock['type'],
     operator,
@@ -316,7 +327,7 @@ const CreateGroupDrawer = ({ isOpen, onClose, onSave, allNodes, initialData }: C
 
   const addBlock = (type: SemanticBlock['type']) => {
     const newBlock: SemanticBlock = {
-      id: crypto.randomUUID(),
+      id: createId(),
       action: 'keep',
       type,
       operator: type === 'name' ? 'contains' : (type === 'latency' ? 'less_than' : (type === 'country' ? 'in' : 'is')),
@@ -495,6 +506,9 @@ export const Proxies = () => {
   const [isSwitching, setIsSwitching] = useState<string | null>(null);
   const [testingGroup, setTestingGroup] = useState<string | null>(null);
   const [testingNode, setTestingNode] = useState<string | null>(null);
+  const [presetStrategy, setPresetStrategy] = useState('url-test');
+  const [updatingPresets, setUpdatingPresets] = useState(false);
+  const presetBootstrapAttempted = useRef(false);
 
   const fetchData = useCallback(async () => {
     try {
@@ -587,6 +601,63 @@ export const Proxies = () => {
     }
   };
 
+  const countryPresets = useMemo(() => groups.filter(group => presetCountry(group)), [groups]);
+  const availableCountries = useMemo(() => Array.from(new Set(nodes.map(node => node.country).filter((country): country is string => Boolean(country)))).sort(), [nodes]);
+
+  const handleCreateCountryPresets = async () => {
+    const existing = new Set(countryPresets.map(group => presetCountry(group)));
+    const missing = availableCountries.filter(country => !existing.has(country));
+    if (missing.length === 0) return toast('当前国家预设已齐全', 'info');
+    setUpdatingPresets(true);
+    try {
+      localStorage.removeItem(COUNTRY_PRESET_DISABLED_KEY);
+      await Promise.all(missing.map(country => api.createProxyGroup({
+        name: `${COUNTRY_PRESET_PREFIX}${country}`,
+        type: 'url-test',
+        filter: [{ action: 'keep', type: 'country', operator: 'in', values: [country], enabled: true }],
+      })));
+      await fetchData();
+      toast(`已创建 ${missing.length} 个自动测速国家分组`, 'success');
+    } catch {
+      await fetchData();
+      toast('部分国家分组创建失败，请检查重名分组', 'error');
+    } finally { setUpdatingPresets(false); }
+  };
+
+  const handleUpdateCountryPresets = async () => {
+    if (countryPresets.length === 0) return toast('暂无预设国家分组', 'info');
+    setUpdatingPresets(true);
+    try {
+      await Promise.all(countryPresets.map(group => api.updateProxyGroup(group.name, {
+        name: group.name, type: presetStrategy, filter: group.filter,
+      })));
+      await fetchData();
+      toast(`已将 ${countryPresets.length} 个国家分组改为 ${presetStrategy}`, 'success');
+    } catch { toast('预设策略修改失败', 'error'); }
+    finally { setUpdatingPresets(false); }
+  };
+
+  const handleDeleteCountryPresets = async () => {
+    if (countryPresets.length === 0) return toast('暂无预设国家分组', 'info');
+    if (!window.confirm(`确定删除 ${countryPresets.length} 个预设国家分组？`)) return;
+    setUpdatingPresets(true);
+    try {
+      await Promise.all(countryPresets.map(group => api.deleteProxyGroup(group.name)));
+      localStorage.setItem(COUNTRY_PRESET_DISABLED_KEY, 'true');
+      await fetchData();
+      toast('预设国家分组已删除', 'success');
+    } catch { toast('部分预设仍被路由引用，无法删除', 'error'); }
+    finally { setUpdatingPresets(false); }
+  };
+
+  useEffect(() => {
+    if (loading || updatingPresets || presetBootstrapAttempted.current || availableCountries.length === 0 || countryPresets.length > 0) return;
+    presetBootstrapAttempted.current = true;
+    if (localStorage.getItem(COUNTRY_PRESET_DISABLED_KEY) !== 'true') queueMicrotask(() => void handleCreateCountryPresets());
+    // The bootstrap intentionally runs only once for the first loaded topology.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, updatingPresets, availableCountries.length, countryPresets.length]);
+
   const filteredGroups = useMemo(() => {
     const query = searchGroup.toLowerCase();
     return groups.filter(group => [
@@ -604,7 +675,15 @@ export const Proxies = () => {
           <div className="flex items-center gap-2"><h2 className="text-2xl md:text-3xl font-black tracking-tight">分组管理</h2><div className="size-2 rounded-full bg-green-500 animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.6)]" /><div className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-500/5 border border-amber-500/10 text-amber-600/80 text-[10px] font-black uppercase ml-2"><Lock className="size-3" /> 锁标代表系统内置或订阅托管，不可编辑</div></div>
           <p className="text-xs text-muted-foreground mt-1 flex items-center gap-1.5 font-medium"><Radio className="size-3.5" /> 物理出口调度中心</p>
         </div>
-        <Button onClick={() => { setEditingData(null); setIsCreating(true); }} className="rounded-xl shadow-lg shadow-primary/20 h-10 px-4 text-xs bg-primary text-primary-foreground font-bold transition-all active:scale-95"><Plus className="size-4 md:mr-1.5" /> 新建分组</Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button onClick={handleCreateCountryPresets} disabled={updatingPresets || availableCountries.length === 0} variant="outline" className="h-10 rounded-xl gap-2 text-xs font-bold"><Flag className="size-4" /> 生成国家预设</Button>
+          <select aria-label="预设国家分组策略" value={presetStrategy} onChange={event => setPresetStrategy(event.target.value)} className="h-10 rounded-xl border bg-background px-3 text-xs font-bold outline-none focus:border-primary">
+            {GROUP_STRATEGIES.map(strategy => <option key={strategy} value={strategy}>{strategy}</option>)}
+          </select>
+          <Button onClick={handleUpdateCountryPresets} disabled={updatingPresets || countryPresets.length === 0} variant="outline" className="h-10 rounded-xl gap-2 text-xs font-bold"><RotateCcw className="size-4" /> 一键改策略</Button>
+          <Button onClick={handleDeleteCountryPresets} disabled={updatingPresets || countryPresets.length === 0} variant="outline" size="icon" title="删除全部预设国家分组" className="size-10 rounded-xl text-red-500"><Trash2 className="size-4" /></Button>
+          <Button onClick={() => { setEditingData(null); setIsCreating(true); }} className="rounded-xl shadow-lg shadow-primary/20 h-10 px-4 text-xs bg-primary text-primary-foreground font-bold transition-all active:scale-95"><Plus className="size-4 md:mr-1.5" /> 新建分组</Button>
+        </div>
       </div>
 
       <div className="hidden lg:flex flex-1 gap-4 overflow-hidden mt-2 min-h-0 text-foreground text-left">

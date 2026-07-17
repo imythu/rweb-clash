@@ -1,6 +1,7 @@
 param(
   [string]$Binary = "target/debug/rweb-clash-bin.exe",
   [string]$Listen = "127.0.0.1:32990",
+  [int]$MixedPort = 32991,
   [switch]$VerifyEmbeddedAssets
 )
 
@@ -72,6 +73,9 @@ try {
       if ($ruleSets.Count -ne 13) {
         throw "Expected 13 embedded rule sets, found $($ruleSets.Count)."
       }
+      Invoke-RestMethod -Method Patch -Uri "http://$Listen/api/configs" `
+        -ContentType "application/json" `
+        -Body (@{ mixed_port = $MixedPort } | ConvertTo-Json -Compress) | Out-Null
       $coreStatus = Invoke-RestMethod -Method Post -Uri "http://$Listen/api/core/start" -TimeoutSec 150
       if ($coreStatus.state -ne "running") {
         throw "Mihomo did not reach the running state: $($coreStatus | ConvertTo-Json -Compress)"

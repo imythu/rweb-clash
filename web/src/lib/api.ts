@@ -202,6 +202,7 @@ export type RuleInput = {
   policy: string;
   desc?: string | null;
   enabled?: boolean;
+  position?: number;
 };
 
 export type RuleSetBehavior = 'domain' | 'ipcidr' | 'classical';
