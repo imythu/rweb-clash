@@ -3438,14 +3438,15 @@ mod tests {
             .await
             .expect("store cyclic members");
 
-        storage
-            .sync_builtin_proxy_group()
+        let (groups, _) = storage
+            .proxy_topology()
             .await
-            .expect("sync builtin proxy");
-        let members = storage
-            .group_members(BUILTIN_PROXY)
-            .await
-            .expect("read builtin members");
+            .expect("load synchronized topology");
+        let members = &groups
+            .iter()
+            .find(|group| group.name == BUILTIN_PROXY)
+            .expect("builtin proxy group")
+            .all;
         assert!(members.iter().any(|member| member == "Node"));
         assert!(members.iter().any(|member| member == "Regional"));
         assert!(!members.iter().any(|member| member == "Depends on PROXY"));

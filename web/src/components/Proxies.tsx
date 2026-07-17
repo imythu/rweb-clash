@@ -55,6 +55,12 @@ const displayRuntimeName = (name: string) => name.split(SUB_DELIMITER)[0] || nam
 const COUNTRY_PRESET_PREFIX = '国家 · ';
 const COUNTRY_PRESET_DISABLED_KEY = 'rweb-clash.country-presets-disabled';
 const GROUP_STRATEGIES = ['url-test', 'select', 'fallback', 'load-balance'] as const;
+const GROUP_STRATEGY_LABELS: Record<string, string> = {
+  'url-test': '自动测速',
+  select: '手动选择',
+  fallback: '故障转移',
+  'load-balance': '负载均衡',
+};
 
 const presetCountry = (group: ProxyGroup) => {
   if (group.source !== 'custom' || !group.name.startsWith(COUNTRY_PRESET_PREFIX) || group.filter.length !== 1) return null;
@@ -209,7 +215,7 @@ const normalizeBlock = (block: NormalizableBlock): SemanticBlock => {
 interface CreateGroupDrawerProps {
   isOpen: boolean;
   onClose: () => void;
-  onSave: (data: ProxyGroupInput) => void;
+  onSave: (data: ProxyGroupInput) => Promise<boolean>;
   allNodes: ProxyNode[];
   initialData: ProxyGroup | null;
 }
@@ -218,6 +224,7 @@ const CreateGroupDrawer = ({ isOpen, onClose, onSave, allNodes, initialData }: C
   const [name, setName] = useState(() => initialData?.name ?? '');
   const [groupType, setGroupType] = useState(() => initialData?.type ?? 'select');
   const [blocks, setBlocks] = useState<SemanticBlock[]>(() => initialData?.filter.map(normalizeBlock) ?? []);
+  const [isSaving, setIsSaving] = useState(false);
   const { toast } = useToast();
 
   const uniqueTypes = useMemo(() => Array.from(new Set(allNodes.map(node => node.type))), [allNodes]);
@@ -308,7 +315,7 @@ const CreateGroupDrawer = ({ isOpen, onClose, onSave, allNodes, initialData }: C
     return result;
   }, [blocks, allNodes]);
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!name.trim()) return toast('请填写分组名称', 'error');
     if (blocks.length > 0 && previewNodes.length === 0) return toast('当前规则未命中任何节点', 'error');
     const filter = blocks.map(block => {
@@ -322,7 +329,12 @@ const CreateGroupDrawer = ({ isOpen, onClose, onSave, allNodes, initialData }: C
         ? { ...base, values: block.values }
         : { ...base, value: block.value };
     });
-    onSave({ name, type: groupType, filter });
+    setIsSaving(true);
+    try {
+      await onSave({ name: name.trim(), type: groupType, filter });
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const addBlock = (type: SemanticBlock['type']) => {
@@ -485,7 +497,7 @@ const CreateGroupDrawer = ({ isOpen, onClose, onSave, allNodes, initialData }: C
         </div>
         <div className="p-6 md:p-8 bg-card border-t border-border/50 flex gap-4 shrink-0">
            <Button variant="ghost" onClick={onClose} className="h-14 px-8 rounded-2xl font-black text-xs uppercase tracking-widest flex-1 hover:bg-muted text-foreground">取消操作</Button>
-           <Button onClick={handleSave} disabled={!name} className="h-14 px-12 rounded-2xl font-black text-xs uppercase tracking-wider shadow-2xl shadow-primary/30 flex-[2] bg-primary text-primary-foreground transition-all hover:scale-[1.02] active:scale-95">部署部署引擎</Button>
+           <Button onClick={() => void handleSave()} disabled={!name.trim() || isSaving} className="h-14 px-12 rounded-2xl font-black text-xs tracking-wider shadow-2xl shadow-primary/30 flex-[2] bg-primary text-primary-foreground transition-all hover:scale-[1.02] active:scale-95">{isSaving ? <Loader2 className="size-4 animate-spin" /> : initialData ? '保存修改' : '确认新增'}</Button>
         </div>
       </div>
     </div>
@@ -536,10 +548,18 @@ export const Proxies = () => {
     return nodes.filter(n => group.all.includes(n.name)).filter(n => n.name.toLowerCase().includes(searchNode.toLowerCase())).sort((a, b) => (group.type === 'select' ? 0 : (a.latency || 9999) - (b.latency || 9999)));
   }, [groups, nodes, searchNode]);
 
+  const getGroupsForGroup = useCallback((groupName: string) => {
+    const group = groups.find(item => item.name === groupName);
+    if (!group) return [];
+    const query = searchNode.toLowerCase();
+    return groups.filter(item => item.name !== groupName && group.all.includes(item.name) && displayRuntimeName(item.name).toLowerCase().includes(query));
+  }, [groups, searchNode]);
+
   const activeNodes = useMemo(() => {
     if (!activeGroup) return [];
     return getNodesForGroup(activeGroup.name);
   }, [activeGroup, getNodesForGroup]);
+  const activeMemberGroups = useMemo(() => activeGroup ? getGroupsForGroup(activeGroup.name) : [], [activeGroup, getGroupsForGroup]);
 
   const handleSelectNode = async (groupName: string, nodeName: string) => {
     const group = groups.find(g => g.name === groupName);
@@ -584,7 +604,7 @@ export const Proxies = () => {
   const handleSaveGroup = async (data: ProxyGroupInput) => {
     if (editingData && isManagedGroup(editingData)) {
       toast('系统内置或托管分组不可编辑', 'error');
-      return;
+      return false;
     }
     try {
       if (editingData) {
@@ -596,8 +616,10 @@ export const Proxies = () => {
       setIsCreating(false);
       setEditingData(null);
       toast('分组配置已同步', 'success');
+      return true;
     } catch {
       toast('分组配置同步失败', 'error');
+      return false;
     }
   };
 
@@ -611,11 +633,13 @@ export const Proxies = () => {
     setUpdatingPresets(true);
     try {
       localStorage.removeItem(COUNTRY_PRESET_DISABLED_KEY);
-      await Promise.all(missing.map(country => api.createProxyGroup({
-        name: `${COUNTRY_PRESET_PREFIX}${country}`,
-        type: 'url-test',
-        filter: [{ action: 'keep', type: 'country', operator: 'in', values: [country], enabled: true }],
-      })));
+      for (const country of missing) {
+        await api.createProxyGroup({
+          name: `${COUNTRY_PRESET_PREFIX}${country}`,
+          type: 'url-test',
+          filter: [{ action: 'keep', type: 'country', operator: 'in', values: [country], enabled: true }],
+        });
+      }
       await fetchData();
       toast(`已创建 ${missing.length} 个自动测速国家分组`, 'success');
     } catch {
@@ -676,12 +700,13 @@ export const Proxies = () => {
           <p className="text-xs text-muted-foreground mt-1 flex items-center gap-1.5 font-medium"><Radio className="size-3.5" /> 物理出口调度中心</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button onClick={handleCreateCountryPresets} disabled={updatingPresets || availableCountries.length === 0} variant="outline" className="h-10 rounded-xl gap-2 text-xs font-bold"><Flag className="size-4" /> 生成国家预设</Button>
-          <select aria-label="预设国家分组策略" value={presetStrategy} onChange={event => setPresetStrategy(event.target.value)} className="h-10 rounded-xl border bg-background px-3 text-xs font-bold outline-none focus:border-primary">
-            {GROUP_STRATEGIES.map(strategy => <option key={strategy} value={strategy}>{strategy}</option>)}
+          <span className="text-[10px] font-bold text-muted-foreground">国家分组批量操作</span>
+          <Button title="按当前节点国家补齐缺少的自动测速分组" onClick={handleCreateCountryPresets} disabled={updatingPresets || availableCountries.length === 0} variant="outline" className="h-10 rounded-xl gap-2 text-xs font-bold"><Flag className="size-4" /> 补齐国家分组</Button>
+          <select title="选择要批量应用到国家分组的策略" aria-label="国家分组批量策略" value={presetStrategy} onChange={event => setPresetStrategy(event.target.value)} className="h-10 rounded-xl border bg-background px-3 text-xs font-bold outline-none focus:border-primary">
+            {GROUP_STRATEGIES.map(strategy => <option key={strategy} value={strategy}>{GROUP_STRATEGY_LABELS[strategy]}</option>)}
           </select>
-          <Button onClick={handleUpdateCountryPresets} disabled={updatingPresets || countryPresets.length === 0} variant="outline" className="h-10 rounded-xl gap-2 text-xs font-bold"><RotateCcw className="size-4" /> 一键改策略</Button>
-          <Button onClick={handleDeleteCountryPresets} disabled={updatingPresets || countryPresets.length === 0} variant="outline" size="icon" title="删除全部预设国家分组" className="size-10 rounded-xl text-red-500"><Trash2 className="size-4" /></Button>
+          <Button title={`应用到 ${countryPresets.length} 个国家分组`} onClick={handleUpdateCountryPresets} disabled={updatingPresets || countryPresets.length === 0} variant="outline" className="h-10 rounded-xl gap-2 text-xs font-bold"><RotateCcw className="size-4" /> 应用策略 ({countryPresets.length})</Button>
+          <Button onClick={handleDeleteCountryPresets} disabled={updatingPresets || countryPresets.length === 0} variant="outline" title="删除全部自动创建的国家分组" className="h-10 rounded-xl gap-2 px-3 text-xs font-bold text-red-500"><Trash2 className="size-4" /> 删除国家分组</Button>
           <Button onClick={() => { setEditingData(null); setIsCreating(true); }} className="rounded-xl shadow-lg shadow-primary/20 h-10 px-4 text-xs bg-primary text-primary-foreground font-bold transition-all active:scale-95"><Plus className="size-4 md:mr-1.5" /> 新建分组</Button>
         </div>
       </div>
@@ -710,7 +735,7 @@ export const Proxies = () => {
                           {isSystemBuiltin && <span className="px-1.5 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/20 text-[9px] font-black text-amber-600 shrink-0">系统内置</span>}
                           {isReadOnly && <Lock className="size-3 text-amber-500/70" />}
                         </div>
-                        <div className="text-[10px] font-semibold text-muted-foreground uppercase text-left">{group.type} · {group.all.length} 节点</div>
+                        <div className="text-[10px] font-semibold text-muted-foreground uppercase text-left">{GROUP_STRATEGY_LABELS[group.type] ?? group.type} · {group.all.length} 成员</div>
                       </div>
                     </div>
                     <StatusBadge delay={group.delay} loading={testingGroup === group.name} onClick={(e) => handleTestGroup(e, group.name)} className={isActive ? "bg-background border-border text-foreground" : ""} />
@@ -757,6 +782,19 @@ export const Proxies = () => {
               <div className="flex-1 overflow-y-auto p-6 custom-scrollbar text-left text-foreground">
                 {activeGroup.type === 'select' ? (
                   <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4 text-left">
+                    {activeMemberGroups.map(member => {
+                      const isActive = activeGroup.now === member.name;
+                      return (
+                        <div key={member.name} className={cn("relative flex min-h-28 flex-col p-4 rounded-2xl border-2 transition-all duration-200 text-left overflow-hidden", isActive ? "bg-primary/10 border-primary shadow-sm text-foreground font-bold" : "bg-background border-border/50 hover:border-primary/40 text-muted-foreground hover:text-foreground")}>
+                          <button type="button" aria-label={`选择策略组 ${displayRuntimeName(member.name)}`} aria-pressed={isActive} onClick={() => handleSelectNode(activeGroup.name, member.name)} disabled={!!isSwitching} className="absolute inset-0 z-0 rounded-2xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" />
+                          <div className="relative z-10 pointer-events-none flex h-full flex-col justify-between gap-3">
+                            <div className="flex items-center justify-between"><span className="inline-flex items-center gap-1 rounded-md bg-primary/10 px-2 py-1 text-[9px] font-black text-primary"><Layers className="size-3" /> 策略组</span>{isActive && <CheckCircle2 className="size-4 text-primary" />}</div>
+                            <div className="min-w-0"><p className="truncate text-sm font-bold">{displayRuntimeName(member.name)}</p><p className="mt-1 text-[9px] font-bold text-muted-foreground">{GROUP_STRATEGY_LABELS[member.type] ?? member.type} · {member.all.length} 成员</p></div>
+                          </div>
+                          {isSwitching === member.name && <div className="absolute inset-0 z-20 bg-background/50 flex items-center justify-center"><Loader2 className="size-5 animate-spin text-primary" /></div>}
+                        </div>
+                      );
+                    })}
                     {activeNodes.map(node => {
                       const dName = displayRuntimeName(node.name);
                       const sName = node.subscriptionName;
@@ -782,6 +820,12 @@ export const Proxies = () => {
                 ) : (
                   <div className="space-y-2">
                     <div className="flex items-center gap-4 px-4 py-2 text-[10px] font-black uppercase text-muted-foreground border-b mb-4"><div className="w-12 text-center">Rank</div><div className="flex-1 text-left">Identity</div><div className="w-24 text-right">Latency</div></div>
+                    {activeMemberGroups.map((member, idx) => (
+                      <div key={member.name} className={cn("flex items-center justify-between p-3.5 rounded-2xl border transition-all text-foreground", activeGroup.now === member.name ? "bg-primary/10 border-primary shadow-sm font-bold" : "bg-background border-border/40 text-muted-foreground")}>
+                        <div className="flex items-center gap-5 flex-1 min-w-0"><div className="w-8 h-8 rounded-lg bg-primary/10 text-primary flex items-center justify-center"><Layers className="size-4" /></div><div className="min-w-0"><p className="text-sm font-bold truncate">{displayRuntimeName(member.name)}</p><p className="text-[10px] text-muted-foreground">策略组 · {GROUP_STRATEGY_LABELS[member.type] ?? member.type}</p></div></div>
+                        <span className="text-[10px] font-bold text-muted-foreground">#{idx + 1}</span>
+                      </div>
+                    ))}
                     {activeNodes.map((node, idx) => {
                       const dName = displayRuntimeName(node.name);
                       const sName = node.subscriptionName;
@@ -813,11 +857,19 @@ export const Proxies = () => {
           const sName = group.subscriptionName;
           return (
             <div key={group.name} className={cn("flex flex-col shrink-0 rounded-[1.25rem] border-2 transition-all overflow-hidden text-foreground", isExpanded ? "bg-card border-primary/30 shadow-md" : "bg-card border-border/50")}>
-              <div onClick={() => setExpandedGroupMobile(isExpanded ? null : group.name)} className="flex items-center justify-between p-4 cursor-pointer select-none text-foreground text-left"><div className="flex items-center gap-3 min-w-0 text-foreground text-left"><div className={cn("size-10 rounded-xl flex items-center justify-center shrink-0 shadow-sm text-foreground", isExpanded ? "bg-primary/10 text-primary" : "bg-muted/50 border text-muted-foreground")}><GroupIcon type={group.type} className="size-5 text-foreground" /></div><div className="min-w-0 text-left text-foreground"><div className="flex items-center gap-1.5 text-left text-foreground"><h4 className="text-base font-bold truncate text-foreground">{dName}</h4>{sName && <SubBadge name={sName} />}{isSystemBuiltin && <span className="px-1.5 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/20 text-[9px] font-black text-amber-600 shrink-0">系统内置</span>}{isReadOnly && <Lock className="size-3 text-amber-500/70 shrink-0" />}</div><div className="text-[10px] font-semibold text-muted-foreground uppercase text-left">{group.type} · {group.all.length} 节点</div></div></div><div className="flex items-center gap-3 shrink-0 text-foreground"><StatusBadge delay={group.delay} loading={testingGroup === group.name} onClick={(e) => handleTestGroup(e, group.name)} /><ChevronDown className={cn("size-4 text-muted-foreground transition-transform", isExpanded && "rotate-180 text-primary")} /></div></div>
+              <div onClick={() => setExpandedGroupMobile(isExpanded ? null : group.name)} className="flex items-center justify-between p-4 cursor-pointer select-none text-foreground text-left"><div className="flex items-center gap-3 min-w-0 text-foreground text-left"><div className={cn("size-10 rounded-xl flex items-center justify-center shrink-0 shadow-sm text-foreground", isExpanded ? "bg-primary/10 text-primary" : "bg-muted/50 border text-muted-foreground")}><GroupIcon type={group.type} className="size-5 text-foreground" /></div><div className="min-w-0 text-left text-foreground"><div className="flex items-center gap-1.5 text-left text-foreground"><h4 className="text-base font-bold truncate text-foreground">{dName}</h4>{sName && <SubBadge name={sName} />}{isSystemBuiltin && <span className="px-1.5 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/20 text-[9px] font-black text-amber-600 shrink-0">系统内置</span>}{isReadOnly && <Lock className="size-3 text-amber-500/70 shrink-0" />}</div><div className="text-[10px] font-semibold text-muted-foreground uppercase text-left">{GROUP_STRATEGY_LABELS[group.type] ?? group.type} · {group.all.length} 成员</div></div></div><div className="flex items-center gap-3 shrink-0 text-foreground"><StatusBadge delay={group.delay} loading={testingGroup === group.name} onClick={(e) => handleTestGroup(e, group.name)} /><ChevronDown className={cn("size-4 text-muted-foreground transition-transform", isExpanded && "rotate-180 text-primary")} /></div></div>
               {isExpanded && (
                 <div className="border-t bg-background/30 p-3 animate-in slide-in-from-top-2 duration-300 text-foreground text-left">
                   <div className="flex gap-2 mb-3 text-foreground text-left"><div className="relative flex-1"><Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground opacity-70" /><input value={searchNode} onChange={(e) => setSearchNode(e.target.value)} placeholder="过滤节点..." className="w-full pl-8 pr-3 py-2 bg-background border border-border/50 rounded-lg text-xs outline-none focus:border-primary/50 text-foreground" /></div>{!isReadOnly && <Button onClick={() => { setEditingData(group); setIsCreating(true); }} variant="outline" size="icon" className="h-9 w-9 text-foreground"><Edit3 className="size-3.5 text-foreground" /></Button>}<Button onClick={(e) => handleTestGroup(e, group.name)} disabled={testingGroup === group.name} variant="outline" className="h-9 px-3 rounded-lg gap-1.5 font-bold text-xs text-foreground">测速</Button></div>
                   <div className="space-y-2 max-h-[50vh] overflow-y-auto pr-1 text-left custom-scrollbar text-foreground">
+                    {getGroupsForGroup(group.name).map(member => {
+                      const isActive = group.now === member.name;
+                      return (
+                        <button key={member.name} type="button" onClick={() => handleSelectNode(group.name, member.name)} disabled={!!isSwitching || group.type !== 'select'} className={cn("w-full flex items-center justify-between p-3 rounded-xl border text-left", isActive ? "bg-primary/10 border-primary" : "bg-card border-border/50")}>
+                          <span className="flex min-w-0 items-center gap-2"><Layers className="size-4 shrink-0 text-primary" /><span className="truncate text-xs font-bold">{displayRuntimeName(member.name)}</span></span><span className="text-[9px] font-black text-primary">策略组</span>
+                        </button>
+                      );
+                    })}
                     {getNodesForGroup(group.name).map(node => {
                        const isNodeActive = group.now === node.name;
                        const dN = displayRuntimeName(node.name);

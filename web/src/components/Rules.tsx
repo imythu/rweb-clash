@@ -23,7 +23,7 @@ type RuleSetDrawerProps = {
   ruleSets: RuleSet[];
   onRefresh: (id: string) => void | Promise<void>;
   onDelete: (id: string) => void | Promise<void>;
-  onAdd: (input: RuleSetInput) => void | Promise<void>;
+  onAdd: (input: RuleSetInput) => Promise<boolean>;
 };
 
 type RuleDrawerProps = {
@@ -95,6 +95,26 @@ const RuleSetDrawer = ({ isOpen, onClose, ruleSets, onRefresh, onDelete, onAdd }
   const [newUrl, setNewUrl] = useState('');
   const newInterval = '86400';
   const [syncing, setSyncing] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const { toast } = useToast();
+
+  const handleAdd = async () => {
+    if (!newName.trim() || !newUrl.trim()) {
+      toast('请完整填写订阅名称和资源 URL', 'error');
+      return;
+    }
+    setIsSaving(true);
+    try {
+      const saved = await onAdd({ name: newName.trim(), url: newUrl.trim(), interval: parseInt(newInterval) });
+      if (saved) {
+        setIsAdding(false);
+        setNewName('');
+        setNewUrl('');
+      }
+    } finally {
+      setIsSaving(false);
+    }
+  };
 
   if (!isOpen) return null;
 
@@ -112,7 +132,7 @@ const RuleSetDrawer = ({ isOpen, onClose, ruleSets, onRefresh, onDelete, onAdd }
             <div className="bg-muted/10 border-2 rounded-2xl p-5 space-y-4 animate-in slide-in-from-top-4">
                <div className="space-y-1.5"><label className="text-[10px] font-black uppercase text-muted-foreground">订阅名称</label><input value={newName} onChange={e => setNewName(e.target.value)} placeholder="e.g. gfw_list" className="w-full bg-background border-2 border-muted rounded-xl px-4 py-3 text-xs font-black" /></div>
                <div className="space-y-1.5"><label className="text-[10px] font-black uppercase text-muted-foreground">资源 URL</label><input value={newUrl} onChange={e => setNewUrl(e.target.value)} placeholder="https://..." className="w-full bg-background border-2 border-muted rounded-xl px-4 py-3 text-[10px] font-mono" /></div>
-               <Button onClick={() => { onAdd({ name: newName, url: newUrl, interval: parseInt(newInterval) }); setIsAdding(false); setNewName(''); setNewUrl(''); }} className="w-full h-11 bg-primary text-primary-foreground rounded-xl font-black uppercase text-[10px]">确认订阅</Button>
+               <Button onClick={() => void handleAdd()} disabled={isSaving || !newName.trim() || !newUrl.trim()} className="w-full h-11 bg-primary text-primary-foreground rounded-xl font-black text-[10px]">{isSaving ? <Loader2 className="size-4 animate-spin" /> : '确认新增规则集'}</Button>
             </div>
           )}
           <div className="space-y-3">
@@ -327,8 +347,10 @@ export const Rules = () => {
       await api.createRuleSet(data);
       await fetchRuleSets();
       toast('规则集已添加', 'success');
+      return true;
     } catch {
       toast('规则集添加失败', 'error');
+      return false;
     }
   };
 
