@@ -399,16 +399,25 @@ async fn embedded_frontend(
     };
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
-    let asset_path = format!("web/{path}");
-    let bytes = assets
-        .get(&asset_path)
-        .or_else(|| assets.get("web/index.html"))
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let content_type = content_type(path);
+    let (bytes, content_type) =
+        embedded_frontend_asset(assets, path).ok_or(StatusCode::NOT_FOUND)?;
     Ok((
         [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
         bytes,
     ))
+}
+
+fn embedded_frontend_asset(
+    assets: &'static crate::EmbeddedAssets,
+    path: &str,
+) -> Option<(&'static [u8], &'static str)> {
+    let asset_path = format!("web/{path}");
+    if let Some(bytes) = assets.get(&asset_path) {
+        return Some((bytes, content_type(path)));
+    }
+    assets
+        .get("web/index.html")
+        .map(|bytes| (bytes, content_type("index.html")))
 }
 
 fn content_type(path: &str) -> &'static str {
@@ -424,6 +433,40 @@ fn content_type(path: &str) -> &'static str {
         "ico" => "image/x-icon",
         "wasm" => "application/wasm",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod embedded_frontend_tests {
+    use super::embedded_frontend_asset;
+    use crate::{EmbeddedAssets, EmbeddedFile};
+
+    static FILES: &[EmbeddedFile] = &[
+        EmbeddedFile {
+            path: "web/index.html",
+            bytes: b"<html></html>",
+        },
+        EmbeddedFile {
+            path: "web/assets/app.js",
+            bytes: b"console.log('app')",
+        },
+    ];
+    static ASSETS: EmbeddedAssets = EmbeddedAssets { files: FILES };
+
+    #[test]
+    fn frontend_routes_fall_back_to_html_with_an_html_content_type() {
+        let (bytes, content_type) =
+            embedded_frontend_asset(&ASSETS, "proxies").expect("serve frontend route fallback");
+        assert_eq!(bytes, b"<html></html>");
+        assert_eq!(content_type, "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn embedded_static_assets_keep_their_own_content_type() {
+        let (bytes, content_type) =
+            embedded_frontend_asset(&ASSETS, "assets/app.js").expect("serve embedded javascript");
+        assert_eq!(bytes, b"console.log('app')");
+        assert_eq!(content_type, "text/javascript; charset=utf-8");
     }
 }
 

@@ -61,6 +61,11 @@ for _ in $(seq 1 40); do
     && diagnostics="$(curl -fsS "http://$listen/api/diagnostics/export" 2>/dev/null)" \
     && printf '%s' "$diagnostics" | grep -q '^# rweb-clash diagnostics'; then
     if [[ "$verify_embedded_assets" -eq 1 ]]; then
+      frontend_content_type="$(curl -fsS -o /dev/null -w '%{content_type}' "http://$listen/proxies")"
+      if [[ "$frontend_content_type" != text/html* ]]; then
+        echo "frontend route refresh returned an invalid content type: $frontend_content_type" >&2
+        exit 1
+      fi
       core="$root/cache-core/mihomo"
       geoip="$root/data/profiles/geoip.metadb"
       rule_set_dir="$root/data/profiles/rule-sets"

@@ -60,6 +60,10 @@ try {
 
   if ($VerifyEmbeddedAssets) {
     try {
+      $frontendRoute = Invoke-WebRequest -UseBasicParsing -Uri "http://$Listen/proxies" -TimeoutSec 10
+      if (-not $frontendRoute.Headers["Content-Type"].StartsWith("text/html")) {
+        throw "Frontend route refresh returned an invalid content type: $($frontendRoute.Headers['Content-Type'])"
+      }
       $coreName = if ($env:OS -eq "Windows_NT") { "mihomo.exe" } else { "mihomo" }
       $corePath = Join-Path $root "cache-core/$coreName"
       $geoipPath = Join-Path $root "data/profiles/geoip.metadb"
