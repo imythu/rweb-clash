@@ -17,10 +17,16 @@ const MAX_MIHOMO_VALIDATION_TIMEOUT_SECS: u64 = 3_600;
 const MIHOMO_VALIDATION_TIMEOUT_ENV: &str = "RWEB_CLASH_MIHOMO_VALIDATION_TIMEOUT_SECS";
 
 fn mihomo_command(binary: &std::path::Path) -> Command {
-    let mut command = Command::new(binary);
     #[cfg(target_os = "windows")]
-    command.creation_flags(0x0800_0000);
-    command
+    {
+        let mut command = Command::new(binary);
+        command.creation_flags(0x0800_0000);
+        command
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new(binary)
+    }
 }
 
 #[derive(Debug, Clone)]

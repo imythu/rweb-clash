@@ -13,10 +13,16 @@ const SYSTEM_PROXY_BACKUP_VERSION: u8 = 1;
 static SYSTEM_PROXY_OPERATION: Mutex<()> = Mutex::const_new(());
 
 fn platform_command(program: &str) -> Command {
-    let mut command = Command::new(program);
     #[cfg(target_os = "windows")]
-    command.creation_flags(0x0800_0000);
-    command
+    {
+        let mut command = Command::new(program);
+        command.creation_flags(0x0800_0000);
+        command
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new(program)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
