@@ -1,18 +1,19 @@
 # Release Checklist
 
-Use this checklist for every automatic snapshot and manual stable release run.
+Use this checklist for every automatic snapshot and semantic stable release run.
 
 - A push to `master` creates a Beijing-time snapshot tag named `snapshot-YYYYMMDD-HHmm` and a prerelease.
-- A manual `workflow_dispatch` creates a Beijing-time stable tag named `vYYYYMMDD-HHmm` and marks that release as latest.
-- The shared timestamp is synchronized into Cargo and desktop manifests before every Linux, Docker, or Tauri build.
-- The package SemVer is numeric and sortable as `YYYY.MDD.HHmm`; macOS uses `YYYYMMDDHHmm` for `CFBundleVersion`, and MSI uses `YY.M.D.HHmm` within WiX limits.
-- Manual stable releases are rejected unless dispatched from `master`, and an existing minute-level tag is never overwritten.
+- A pushed `vMAJOR.MINOR.PATCH` tag creates that stable release and marks it as latest.
+- A manual `workflow_dispatch` from `master` requires the same numeric `release_version` and can optionally enable desktop signing.
+- Stable release tags are synchronized into Cargo and desktop package versions; snapshots use sortable `YYYY.MDD.HHmm` package versions.
+- macOS uses `YYYYMMDDHHmm` for `CFBundleVersion`, and MSI uses `YY.M.D.HHmm` within WiX limits for both channels.
+- Existing release tags are never overwritten, and non-numeric stable SemVer tags are rejected.
 
 ## Workflow Semantics
 
 - Pushes to `master` publish all target artifacts, the timestamped Docker tag, the moving `snapshot` Docker tag, and a GitHub prerelease.
-- Manual runs publish all target artifacts, the timestamped Docker tag, the moving `latest` Docker tag, and a stable GitHub Release.
-- Automatic snapshots are unsigned. Manual stable releases are also unsigned unless `sign_desktop` is explicitly enabled and all platform secrets are configured.
+- Semantic tag pushes and manual runs publish all target artifacts, the SemVer Docker tag, the moving `latest` Docker tag, and a stable GitHub Release.
+- Automatic snapshots and tag-triggered stable releases are unsigned. Manual stable releases are unsigned unless `sign_desktop` is explicitly enabled and all platform secrets are configured.
 - Rule URLs intentionally track their mutable `@release` branches, so each build fetches and records the latest available snapshots.
 - A shared asset job resolves one rule commit and one GeoIP release, then every platform and Docker build consumes that same verified artifact.
 - `mihomo_version=latest` is resolved once to a concrete release tag; each core archive must match GitHub's asset size and SHA256 digest before extraction.
@@ -20,18 +21,22 @@ Use this checklist for every automatic snapshot and manual stable release run.
 ## Required GitHub Actions Jobs
 
 - `Linux amd64 binary`
-  - Checks Linux install script syntax.
-  - Builds `rweb-clash-bin` with `embedded-assets`.
+  - Checks user and system Linux install script syntax.
+  - Builds static musl `rweb-clash-bin` with `embedded-assets` and `--locked`.
   - Runs `scripts/release-smoke.sh` against the release binary.
-  - Verifies the tar archive contents, executable bits, and systemd service template.
-  - Exercises the install/upgrade path and requires an explicit systemd restart.
+  - Verifies the tar archive contents, executable bits, license, and all systemd service templates.
+  - Verifies the non-root system service grants only the `CAP_NET_ADMIN` capability required by TUN mode.
+  - Exercises both user and system installation layouts.
+  - Uploads `rweb-clash-linux-amd64.bin` and its checksum.
   - Uploads `rweb-clash-linux-amd64.tar.gz`.
   - Uploads `rweb-clash-linux-amd64.tar.gz.sha256`.
 - `Linux arm64 binary`
-  - Checks Linux install script syntax.
-  - Builds `rweb-clash-bin` with `embedded-assets`.
+  - Checks user and system Linux install script syntax.
+  - Builds static musl `rweb-clash-bin` with `embedded-assets` and `--locked`.
   - Runs `scripts/release-smoke.sh` under `qemu-aarch64`.
-  - Verifies the tar archive contents, executable bits, and systemd service template.
+  - Verifies the tar archive contents, executable bits, license, and all systemd service templates.
+  - Verifies the non-root system service grants only the `CAP_NET_ADMIN` capability required by TUN mode.
+  - Uploads `rweb-clash-linux-arm64.bin` and its checksum.
   - Uploads `rweb-clash-linux-arm64.tar.gz`.
   - Uploads `rweb-clash-linux-arm64.tar.gz.sha256`.
 - `Tauri macos-arm64`
@@ -62,9 +67,14 @@ Linux does not use Tauri. The Linux release archive must contain:
 
 - `rweb-clash`
 - `install.sh`
+- `install-systemd.sh`
 - `rweb-clash.service`
+- `rweb-clash-system.service`
+- `rweb-clash-ready.service`
+- `rweb-clash.env`
 - `README.md`
 - `LINUX.md`
+- `LICENSE`
 - `release-smoke.sh`
 - `release-smoke.ps1`
 
@@ -98,7 +108,7 @@ Windows signing is optional. Enable `sign_desktop` for releases intended for bro
 
 ## Manual Verification After CI
 
-Before pushing to `master` or manually dispatching a stable release, run the local verification script on a developer machine:
+Before pushing to `master`, pushing a stable SemVer tag, or manually dispatching a stable release, run the local verification script on a developer machine:
 
 ```text
 powershell -ExecutionPolicy Bypass -File scripts/verify-release-local.ps1
@@ -146,5 +156,6 @@ Do not publish or mark the release complete if any of these are true:
 - Any downloaded artifact does not match its `.sha256` checksum.
 - Docker manifest lacks either `linux/amd64` or `linux/arm64`.
 - Linux artifact contains a Tauri package instead of the backend + web single binary.
+- Linux binary has a dynamic ELF interpreter or either architecture lacks its standalone `.bin` asset.
 - Desktop packages start without bundled Mihomo core, verified GeoIP, or all 13 default rule sets.
 - A run requested `sign_desktop=true`, but signing or macOS notarization is missing.

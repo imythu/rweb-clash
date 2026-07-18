@@ -117,3 +117,7 @@ pub fn validate_url(value: &str) -> bool {
 pub fn valid_policy_target(name: &str, available: &std::collections::HashSet<String>) -> bool {
     matches!(name, "DIRECT" | "REJECT" | "GLOBAL" | "PROXY") || available.contains(name)
 }
+
+pub fn contains_rule_delimiter_or_control(value: &str) -> bool {
+    value.contains(',') || value.chars().any(char::is_control)
+}

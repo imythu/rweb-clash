@@ -1,0 +1,27 @@
+[Unit]
+Description=R-Clash proxy readiness gate for container services
+Documentation=https://github.com/imythu/rweb-clash
+Requires=rweb-clash.service
+After=rweb-clash.service
+Before=docker.service containerd.service
+
+[Service]
+Type=oneshot
+User=rweb-clash
+Group=rweb-clash
+Environment=RWEB_CLASH_LISTEN=127.0.0.1:31990
+EnvironmentFile=-/etc/default/rweb-clash
+ExecStart=/usr/local/bin/rweb-clash --wait-ready 3600
+TimeoutStartSec=3700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+RequiredBy=docker.service containerd.service

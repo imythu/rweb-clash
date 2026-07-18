@@ -54,3 +54,13 @@ corepack pnpm --dir web build
 - 订阅与规则集下载会校验每次重定向和 DNS 结果，并限制并发、总时长和响应大小。私网、回环及保留地址默认拒绝；仅对可信本地源设置 `RWEB_CLASH_ALLOW_PRIVATE_SOURCES=1`。
 - 启用系统代理前会在数据目录持久化原设置，停止、退出或 Mihomo 异常退出时恢复；备份仅在恢复成功后删除，Unix 权限为 `0600`。
 - Docker 默认只映射到宿主 `127.0.0.1`，并要求 API 令牌。完整示例见 [`packaging/linux/README.md`](packaging/linux/README.md)。
+
+## Linux 原生安装
+
+GitHub Release 提供 musl 静态 amd64/arm64 单二进制，以及包含安装脚本的压缩包。服务器或 Docker 宿主解压后运行：
+
+```text
+./install-systemd.sh
+```
+
+脚本安装开机启动的 system service，不依赖 Docker 自身，并生成本机 API token；主服务以非 root 用户运行但默认具备 TUN 所需的 `CAP_NET_ADMIN`，独立 readiness gate 会在 Docker/Containerd 每次启动前复核代理状态。桌面 Linux 可继续使用 `./install.sh` 安装 `systemctl --user` 服务。Docker daemon 应代理到 Mihomo mixed port，而不是 Web/API 端口；完整安装、升级与启动顺序说明见 [`packaging/linux/README.md`](packaging/linux/README.md)。

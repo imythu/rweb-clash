@@ -3,6 +3,9 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
+      release_version:
+        description: "Stable SemVer without a leading v (for example, 1.0.0)"
+        required: true
       mihomo_version:
         description: "Mihomo release tag, or latest"
         default: "latest"
@@ -15,6 +18,8 @@ on:
   push:
     branches:
       - master
+    tags:
+      - "v*.*.*"
 
 permissions:
   contents: read
@@ -45,6 +50,9 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           GIT_REF: ${{ github.ref }}
+          GIT_REF_NAME: ${{ github.ref_name }}
+          GIT_REF_TYPE: ${{ github.ref_type }}
+          REQUESTED_RELEASE_VERSION: ${{ github.event.inputs.release_version || '' }}
         run: |
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$GIT_REF" != "refs/heads/master" ]; then
             echo "Stable releases must be dispatched from master; got $GIT_REF" >&2
@@ -52,16 +60,30 @@ jobs:
           fi
           IFS='|' read -r compact year year_short month day clock display \
             <<< "$(TZ=Asia/Shanghai date '+%Y%m%d-%H%M|%Y|%y|%-m|%-d|%H%M|%Y-%m-%d %H:%M CST')"
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          if [ "$GIT_REF_TYPE" = "tag" ]; then
+            release_version="${GIT_REF_NAME#v}"
             channel="stable"
-            release_tag="v$compact"
+            release_tag="$GIT_REF_NAME"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            release_version="${REQUESTED_RELEASE_VERSION#v}"
+            channel="stable"
+            release_tag="v$release_version"
           else
             channel="snapshot"
             release_tag="snapshot-$compact"
           fi
+          if [ "$channel" = "stable" ] &&
+             [[ ! "$release_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Stable release version must be numeric SemVer (for example, 1.0.0): $release_version" >&2
+            exit 1
+          fi
           month_day="$((10#$month * 100 + 10#$day))"
           clock_number="$((10#$clock))"
-          package_version="$((10#$year)).$month_day.$clock_number"
+          if [ "$channel" = "stable" ]; then
+            package_version="$release_version"
+          else
+            package_version="$((10#$year)).$month_day.$clock_number"
+          fi
           macos_bundle_version="${compact/-/}"
           windows_bundle_version="$((10#$year_short)).$month.$day.$clock_number"
           {
@@ -74,7 +96,8 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           printf 'channel=%s\nrelease_tag=%s\npackage_version=%s\nmacos_bundle_version=%s\nwindows_bundle_version=%s\n' \
             "$channel" "$release_tag" "$package_version" "$macos_bundle_version" "$windows_bundle_version"
-      - name: Reject an existing timestamp tag
+      - name: Reject an existing generated release tag
+        if: github.ref_type != 'tag'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -88,7 +111,7 @@ jobs:
           case "$status" in
             404) ;;
             200)
-              echo "Release tag already exists: $RELEASE_TAG. Wait for the next Beijing-time minute." >&2
+              echo "Release tag already exists: $RELEASE_TAG." >&2
               exit 1
               ;;
             *)
@@ -155,15 +178,12 @@ jobs:
         include:
           - name: amd64
             package_target: linux-amd64
-            rust_target: x86_64-unknown-linux-gnu
+            rust_target: x86_64-unknown-linux-musl
             artifact: rweb-clash-linux-amd64
           - name: arm64
             package_target: linux-arm64
-            rust_target: aarch64-unknown-linux-gnu
+            rust_target: aarch64-unknown-linux-musl
             artifact: rweb-clash-linux-arm64
-            linker: aarch64-linux-gnu-gcc
-            cc: aarch64-linux-gnu-gcc
-            ar: aarch64-linux-gnu-ar
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -191,13 +211,18 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.rust_target }}
-      - name: Install cross compiler and emulator
+      - name: Install static cross builder and emulator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user qemu-user-binfmt
+          cargo install cross --version 0.2.5 --locked
+      - name: Verify arm64 binfmt handler
         if: matrix.name == 'arm64'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
+        run: test -r /proc/sys/fs/binfmt_misc/qemu-aarch64
       - name: Install frontend dependencies
         run: pnpm --dir web install --frozen-lockfile
       - name: Check packaging scripts
-        run: bash -n scripts/package-core.sh scripts/package-rule-sets.sh scripts/package-runtime-assets.sh scripts/package-local.sh scripts/prepare-tauri-resources.sh scripts/verify-tauri-resources.sh scripts/release-smoke.sh scripts/configure-macos-signing.sh scripts/verify-docker-manifest.sh scripts/verify-linux-archive.sh packaging/linux/install.sh
+        run: bash -n scripts/package-core.sh scripts/package-rule-sets.sh scripts/package-runtime-assets.sh scripts/package-local.sh scripts/prepare-tauri-resources.sh scripts/verify-tauri-resources.sh scripts/release-smoke.sh scripts/configure-macos-signing.sh scripts/verify-docker-manifest.sh scripts/verify-linux-archive.sh packaging/linux/install.sh packaging/linux/install-systemd.sh
       - name: Check PowerShell packaging scripts
         shell: pwsh
         run: |
@@ -233,26 +258,36 @@ jobs:
           bash scripts/package-core.sh --target "${{ matrix.package_target }}" --version "$MIHOMO_VERSION"
           pnpm --dir web build
       - name: Build binary
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
-          CC_aarch64_unknown_linux_gnu: ${{ matrix.cc }}
-          AR_aarch64_unknown_linux_gnu: ${{ matrix.ar }}
-        run: cargo build -p rweb-clash-bin --features embedded-assets --release --target "${{ matrix.rust_target }}"
+        run: cross build -p rweb-clash-bin --features embedded-assets --release --locked --target "${{ matrix.rust_target }}"
+      - name: Verify statically linked binary
+        run: |
+          file target/${{ matrix.rust_target }}/release/rweb-clash-bin
+          if readelf -l target/${{ matrix.rust_target }}/release/rweb-clash-bin | grep -Fq 'Requesting program interpreter'; then
+            echo "Linux release binary is dynamically linked" >&2
+            exit 1
+          fi
+          if readelf -d target/${{ matrix.rust_target }}/release/rweb-clash-bin 2>/dev/null | grep -Fq '(NEEDED)'; then
+            echo "Linux release binary has dynamic library dependencies" >&2
+            exit 1
+          fi
       - name: Smoke test Linux amd64 binary
         if: matrix.name == 'amd64'
         run: bash scripts/release-smoke.sh --verify-embedded-assets --binary target/${{ matrix.rust_target }}/release/rweb-clash-bin --listen 127.0.0.1:32990
       - name: Smoke test Linux arm64 binary with QEMU
         if: matrix.name == 'arm64'
-        run: bash scripts/release-smoke.sh --verify-embedded-assets --runner "qemu-aarch64 -L /usr/aarch64-linux-gnu" --binary target/${{ matrix.rust_target }}/release/rweb-clash-bin --listen 127.0.0.1:32990
+        run: bash scripts/release-smoke.sh --verify-embedded-assets --runner "qemu-aarch64" --binary target/${{ matrix.rust_target }}/release/rweb-clash-bin --listen 127.0.0.1:32990
       - name: Package binary
         run: |
           mkdir -p dist/${{ matrix.artifact }}
           cp target/${{ matrix.rust_target }}/release/rweb-clash-bin dist/${{ matrix.artifact }}/rweb-clash
+          cp target/${{ matrix.rust_target }}/release/rweb-clash-bin dist/${{ matrix.artifact }}.bin
           cp README.md dist/${{ matrix.artifact }}/README.md
+          cp LICENSE dist/${{ matrix.artifact }}/LICENSE
           cp packaging/linux/README.md dist/${{ matrix.artifact }}/LINUX.md
-          cp packaging/linux/install.sh packaging/linux/rweb-clash.service scripts/release-smoke.sh scripts/release-smoke.ps1 dist/${{ matrix.artifact }}/
-          chmod +x dist/${{ matrix.artifact }}/rweb-clash dist/${{ matrix.artifact }}/install.sh dist/${{ matrix.artifact }}/release-smoke.sh
+          cp packaging/linux/install.sh packaging/linux/install-systemd.sh packaging/linux/rweb-clash.service packaging/linux/rweb-clash-system.service packaging/linux/rweb-clash-ready.service packaging/linux/rweb-clash.env scripts/release-smoke.sh scripts/release-smoke.ps1 dist/${{ matrix.artifact }}/
+          chmod +x dist/${{ matrix.artifact }}/rweb-clash dist/${{ matrix.artifact }}.bin dist/${{ matrix.artifact }}/install.sh dist/${{ matrix.artifact }}/install-systemd.sh dist/${{ matrix.artifact }}/release-smoke.sh
           tar -C dist -czf dist/${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+          (cd dist && sha256sum ${{ matrix.artifact }}.bin > ${{ matrix.artifact }}.bin.sha256)
           (cd dist && sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256)
       - name: Verify Linux archive contents
         run: bash scripts/verify-linux-archive.sh --archive dist/${{ matrix.artifact }}.tar.gz
@@ -263,6 +298,8 @@ jobs:
           path: |
             dist/${{ matrix.artifact }}.tar.gz
             dist/${{ matrix.artifact }}.tar.gz.sha256
+            dist/${{ matrix.artifact }}.bin
+            dist/${{ matrix.artifact }}.bin.sha256
 
   docker:
     name: Linux Docker image
@@ -607,8 +644,12 @@ jobs:
 
           require_one 'artifacts/*/rweb-clash-linux-amd64.tar.gz' 'Linux amd64 archive'
           require_one 'artifacts/*/rweb-clash-linux-amd64.tar.gz.sha256' 'Linux amd64 checksum'
+          require_one 'artifacts/*/rweb-clash-linux-amd64.bin' 'Linux amd64 standalone binary'
+          require_one 'artifacts/*/rweb-clash-linux-amd64.bin.sha256' 'Linux amd64 standalone binary checksum'
           require_one 'artifacts/*/rweb-clash-linux-arm64.tar.gz' 'Linux arm64 archive'
           require_one 'artifacts/*/rweb-clash-linux-arm64.tar.gz.sha256' 'Linux arm64 checksum'
+          require_one 'artifacts/*/rweb-clash-linux-arm64.bin' 'Linux arm64 standalone binary'
+          require_one 'artifacts/*/rweb-clash-linux-arm64.bin.sha256' 'Linux arm64 standalone binary checksum'
           if ! find artifacts -type f -name '*.dmg' | grep -q .; then
             echo "missing required artifact: macOS arm64 DMG (*.dmg)" >&2
             find artifacts -type f | sort >&2
@@ -667,18 +708,21 @@ jobs:
             Built at: `${{ needs.metadata.outputs.display_version }}`
             Package version: `${{ needs.metadata.outputs.package_version }}`
 
-            ${{ needs.metadata.outputs.channel == 'snapshot' && '> Snapshot build generated automatically from master.' || '> Stable build generated by a manual release dispatch.' }}
+            ${{ needs.metadata.outputs.channel == 'snapshot' && '> Snapshot build generated automatically from master.' || '> Stable build generated from a semantic version tag or manual release dispatch.' }}
             ${{ (github.event_name == 'workflow_dispatch' && inputs.sign_desktop) && '> Desktop packages were built with the configured signing credentials.' || '> Desktop packages are unsigned; Windows SmartScreen and macOS Gatekeeper may warn.' }}
 
             Supported release targets:
             - macOS arm64: Tauri desktop package
             - Windows amd64: Tauri desktop package
-            - Linux amd64: backend + embedded web single binary
-            - Linux arm64: backend + embedded web single binary
+            - Linux amd64: static backend + embedded web binary and systemd installer
+            - Linux arm64: static backend + embedded web binary and systemd installer
             - Docker: `${{ needs.docker.outputs.image }}` for `linux/amd64` and `linux/arm64`
 
             Linux does not use Tauri. The Linux binary serves both the API and the web UI.
+            For a reboot-safe host service independent of Docker, verify and extract the Linux `.tar.gz`, then run `./install-systemd.sh`.
+            The standalone `.bin` assets are statically linked; verify the matching `.sha256` before use.
           files: |
+            artifacts/**/*.bin
             artifacts/**/*.tar.gz
             artifacts/**/*.sha256
             artifacts/**/*.dmg

@@ -50,6 +50,7 @@ export function usePageActivity(timeoutMs = DEFAULT_PAGE_IDLE_TIMEOUT_MS) {
 
     const handleVisibilityChange = () => {
       if (document.hidden) markInactive();
+      else markActive();
     };
 
     markActive();

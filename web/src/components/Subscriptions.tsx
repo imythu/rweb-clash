@@ -38,8 +38,8 @@ type SelectOption = {
 type MemberSection = SubscriptionMembers['filtered'];
 type MemberViewFilter = 'all' | 'imported' | 'rejected';
 type EditableFilterRule = Omit<FilterRule, 'id'> & { id?: string; values: string[] };
-type SubscriptionDraft = Pick<Subscription, 'name' | 'url' | 'traffic' | 'interval' | 'inheritGlobal'> &
-  Partial<Pick<Subscription, 'id' | 'format' | 'intervalSeconds' | 'breakdown'>> & {
+type SubscriptionDraft = Pick<Subscription, 'name' | 'url' | 'traffic' | 'intervalSeconds' | 'inheritGlobal'> &
+  Partial<Pick<Subscription, 'id' | 'format' | 'breakdown'>> & {
     rules: EditableFilterRule[];
   };
 
@@ -49,7 +49,7 @@ const EMPTY_SUBSCRIPTION_DRAFT: SubscriptionDraft = {
   url: '',
   rules: [],
   traffic: { used: 0, total: 100 * 1024 ** 3 },
-  interval: 360,
+  intervalSeconds: 21_600,
   inheritGlobal: true,
 };
 
@@ -488,6 +488,7 @@ export const Subscriptions = () => {
   const [isGlobalDrawerOpen, setIsGlobalDrawerOpen] = useState(false);
   const [globalRules, setGlobalRules] = useState<FilterRule[]>([]);
   const [isSavingGlobalRules, setIsSavingGlobalRules] = useState(false);
+  const membersRequestId = useRef(0);
 
   const fetchSubs = useCallback(async () => {
     try {
@@ -581,7 +582,6 @@ export const Subscriptions = () => {
       name: editingSub.name,
       url: editingSub.url,
       format: editingSub.format,
-      interval: editingSub.interval,
       intervalSeconds: editingSub.intervalSeconds,
       inheritGlobal: editingSub.inheritGlobal,
       rules: editingSub.rules.map(rule => ({
@@ -618,15 +618,17 @@ export const Subscriptions = () => {
   };
 
   const handleViewMembers = async (sub: Subscription) => {
+    const requestId = ++membersRequestId.current;
     setMembersSub(sub);
     setMembersData(null);
     setMembersLoading(true);
     try {
-      setMembersData(await api.subscriptionMembers(sub.id));
+      const data = await api.subscriptionMembers(sub.id);
+      if (membersRequestId.current === requestId) setMembersData(data);
     } catch {
-      toast('订阅成员加载失败', 'error');
+      if (membersRequestId.current === requestId) toast('订阅成员加载失败', 'error');
     } finally {
-      setMembersLoading(false);
+      if (membersRequestId.current === requestId) setMembersLoading(false);
     }
   };
 
@@ -787,7 +789,7 @@ export const Subscriptions = () => {
         </div>
       </div>
 
-      {membersSub && <MembersDrawer key={membersSub.id} sub={membersSub} data={membersData} loading={membersLoading} onClose={() => { setMembersSub(null); setMembersData(null); }} />}
+      {membersSub && <MembersDrawer key={membersSub.id} sub={membersSub} data={membersData} loading={membersLoading} onClose={() => { membersRequestId.current += 1; setMembersSub(null); setMembersData(null); setMembersLoading(false); }} />}
 
       {/* Editor Side Panel (Drawer) - RESPONSIBLE REDESIGN */}
       {editingSub && (
@@ -844,9 +846,9 @@ export const Subscriptions = () => {
                     <label className="text-[10px] font-black uppercase ml-1 text-muted-foreground block tracking-wide">自动同步频率</label>
                     <div className="flex flex-wrap gap-1.5">
                        {intervals.map((item) => (
-                         <button key={item.value} onClick={() => setEditingSub({...editingSub, interval: item.value})}
+                         <button key={item.value} onClick={() => setEditingSub({...editingSub, intervalSeconds: item.value * 60})}
                            className={cn("px-3 md:px-4 py-1.5 md:py-2 rounded-lg md:rounded-xl text-[10px] font-black uppercase border-2 transition-all active:scale-95",
-                             editingSub.interval === item.value ? "bg-zinc-900 text-white border-zinc-900 shadow-lg" : "bg-background border-transparent text-muted-foreground hover:bg-muted")}>{item.label}</button>
+                             editingSub.intervalSeconds === item.value * 60 ? "bg-zinc-900 text-white border-zinc-900 shadow-lg" : "bg-background border-transparent text-muted-foreground hover:bg-muted")}>{item.label}</button>
                        ))}
                     </div>
                   </div>

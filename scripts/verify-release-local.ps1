@@ -45,6 +45,17 @@ Invoke-Step "Check PowerShell script syntax" {
   }
 }
 
+Invoke-Step "Check shell packaging script syntax" {
+  Invoke-Native {
+    bash -n `
+      packaging/linux/install.sh `
+      packaging/linux/install-systemd.sh `
+      scripts/package-local.sh `
+      scripts/verify-linux-archive.sh `
+      scripts/release-smoke.sh
+  }
+}
+
 Invoke-Step "Run Rust tests" {
   Invoke-Native { cargo test }
 }
@@ -57,8 +68,14 @@ Invoke-Step "Check release version synchronization" {
   $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("rweb-clash-version-test-" + [guid]::NewGuid().ToString("N"))
   try {
     New-Item -ItemType Directory -Force -Path (Join-Path $tempRoot "apps/desktop/src-tauri") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $tempRoot "apps/desktop/src-tauri/src") | Out-Null
     Copy-Item -LiteralPath (Join-Path $repoRoot "Cargo.toml") -Destination (Join-Path $tempRoot "Cargo.toml")
+    Copy-Item -LiteralPath (Join-Path $repoRoot "Cargo.lock") -Destination (Join-Path $tempRoot "Cargo.lock")
+    Copy-Item -LiteralPath (Join-Path $repoRoot "crates") -Destination (Join-Path $tempRoot "crates") -Recurse
     Copy-Item -LiteralPath (Join-Path $repoRoot "apps/desktop/src-tauri/Cargo.toml") -Destination (Join-Path $tempRoot "apps/desktop/src-tauri/Cargo.toml")
+    Copy-Item -LiteralPath (Join-Path $repoRoot "apps/desktop/src-tauri/Cargo.lock") -Destination (Join-Path $tempRoot "apps/desktop/src-tauri/Cargo.lock")
+    Copy-Item -LiteralPath (Join-Path $repoRoot "apps/desktop/src-tauri/build.rs") -Destination (Join-Path $tempRoot "apps/desktop/src-tauri/build.rs")
+    Copy-Item -LiteralPath (Join-Path $repoRoot "apps/desktop/src-tauri/src/main.rs") -Destination (Join-Path $tempRoot "apps/desktop/src-tauri/src/main.rs")
     Copy-Item -LiteralPath (Join-Path $repoRoot "apps/desktop/src-tauri/tauri.conf.json") -Destination (Join-Path $tempRoot "apps/desktop/src-tauri/tauri.conf.json")
     Copy-Item -LiteralPath (Join-Path $repoRoot "apps/desktop/package.json") -Destination (Join-Path $tempRoot "apps/desktop/package.json")
 
@@ -72,7 +89,9 @@ Invoke-Step "Check release version synchronization" {
 
     $expectedVersion = "2026.717.234"
     $workspaceCargo = Get-Content -LiteralPath (Join-Path $tempRoot "Cargo.toml") -Raw
+    $workspaceCargoLock = Get-Content -LiteralPath (Join-Path $tempRoot "Cargo.lock") -Raw
     $desktopCargo = Get-Content -LiteralPath (Join-Path $tempRoot "apps/desktop/src-tauri/Cargo.toml") -Raw
+    $desktopCargoLock = Get-Content -LiteralPath (Join-Path $tempRoot "apps/desktop/src-tauri/Cargo.lock") -Raw
     $tauriConfig = Get-Content -LiteralPath (Join-Path $tempRoot "apps/desktop/src-tauri/tauri.conf.json") -Raw | ConvertFrom-Json
     $desktopPackage = Get-Content -LiteralPath (Join-Path $tempRoot "apps/desktop/package.json") -Raw | ConvertFrom-Json
     if ($workspaceCargo -notmatch "(?m)^version = `"$([regex]::Escape($expectedVersion))`"$") {
@@ -81,12 +100,37 @@ Invoke-Step "Check release version synchronization" {
     if ($desktopCargo -notmatch "(?m)^version = `"$([regex]::Escape($expectedVersion))`"$") {
       throw "Desktop Cargo version was not synchronized."
     }
+    foreach ($lockPackage in @(
+      @{ Content = $workspaceCargoLock; Name = "rweb-clash" },
+      @{ Content = $workspaceCargoLock; Name = "rweb-clash-bin" },
+      @{ Content = $desktopCargoLock; Name = "rweb-clash" },
+      @{ Content = $desktopCargoLock; Name = "rweb-clash-desktop" }
+    )) {
+      $packagePattern = "(?ms)^\[\[package\]\]\r?\n(?:(?!^\[\[package\]\]).)*?^name = `"$([regex]::Escape($lockPackage.Name))`"\r?\n(?:(?!^\[\[package\]\]).)*?^version = `"$([regex]::Escape($expectedVersion))`""
+      if ($lockPackage.Content -notmatch $packagePattern) {
+        throw "Cargo.lock version was not synchronized for $($lockPackage.Name)."
+      }
+    }
     if ($tauriConfig.version -ne $expectedVersion -or $desktopPackage.version -ne $expectedVersion) {
       throw "Desktop JSON versions were not synchronized."
     }
     if ($tauriConfig.bundle.macOS.bundleVersion -ne "202607170234" -or
         $tauriConfig.bundle.windows.wix.version -ne "26.7.17.234") {
       throw "Platform bundle versions were not synchronized."
+    }
+
+    Push-Location $tempRoot
+    try {
+      Invoke-Native { cargo metadata --locked --no-deps --format-version 1 | Out-Null }
+      Invoke-Native {
+        cargo metadata `
+          --locked `
+          --no-deps `
+          --format-version 1 `
+          --manifest-path apps/desktop/src-tauri/Cargo.toml | Out-Null
+      }
+    } finally {
+      Pop-Location
     }
 
     $previousErrorPreference = $ErrorActionPreference

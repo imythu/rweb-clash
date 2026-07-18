@@ -16,11 +16,11 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, OwnedMutexGuard};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const DEFAULT_USER_AGENT: &str = "rweb-clash/1.0 clash-verge";
 const MAX_SUBSCRIPTION_BYTES: usize = 16 * 1024 * 1024;
@@ -40,7 +40,7 @@ const SUBSCRIPTION_CANDIDATE_SUFFIX: &str = ".yaml";
 #[derive(Debug, Clone)]
 pub struct SubscriptionSyncer {
     storage: Storage,
-    refresh_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    refresh_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     paths: AppPaths,
 }
 
@@ -83,23 +83,37 @@ impl SubscriptionSyncer {
         }
     }
 
-    pub async fn refresh(&self, subscription_id: &str) -> Result<(), AppError> {
+    pub async fn refresh(
+        &self,
+        subscription_id: &str,
+        run_mihomo_validation: bool,
+    ) -> Result<(), AppError> {
+        self.storage.get_subscription_url(subscription_id).await?;
         let _refresh_guard = self.lock_refresh(subscription_id).await;
-        self.refresh_locked(subscription_id).await
+        self.refresh_locked(subscription_id, run_mihomo_validation)
+            .await
     }
 
     pub(crate) async fn lock_refresh(&self, subscription_id: &str) -> OwnedMutexGuard<()> {
         let refresh_lock = {
             let mut locks = self.refresh_locks.lock().await;
-            locks
-                .entry(subscription_id.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
+            locks.retain(|_, refresh_lock| refresh_lock.strong_count() > 0);
+            if let Some(refresh_lock) = locks.get(subscription_id).and_then(Weak::upgrade) {
+                refresh_lock
+            } else {
+                let refresh_lock = Arc::new(Mutex::new(()));
+                locks.insert(subscription_id.to_string(), Arc::downgrade(&refresh_lock));
+                refresh_lock
+            }
         };
         refresh_lock.lock_owned().await
     }
 
-    pub(crate) async fn refresh_locked(&self, subscription_id: &str) -> Result<(), AppError> {
+    pub(crate) async fn refresh_locked(
+        &self,
+        subscription_id: &str,
+        run_mihomo_validation: bool,
+    ) -> Result<(), AppError> {
         let (stored_name, url) = self.storage.get_subscription_url(subscription_id).await?;
         if !validate_url(&url) {
             let err = AppError::bad_request(
@@ -135,7 +149,13 @@ impl SubscriptionSyncer {
         );
         let started = Instant::now();
         let result = self
-            .refresh_inner(subscription_id, &fallback_name, use_remote_name, &url)
+            .refresh_inner(
+                subscription_id,
+                &fallback_name,
+                use_remote_name,
+                &url,
+                run_mihomo_validation,
+            )
             .await;
         if let Err(err) = &result {
             warn!(
@@ -163,6 +183,7 @@ impl SubscriptionSyncer {
         fallback_name: &str,
         use_remote_name: bool,
         url: &str,
+        run_mihomo_validation: bool,
     ) -> Result<(), AppError> {
         info!(
             subscription_id = %subscription_id,
@@ -319,6 +340,7 @@ impl SubscriptionSyncer {
                 source_format: source_format.to_string(),
                 raw_content_hash: content_hash(&body),
             },
+            run_mihomo_validation,
         )
         .await?;
         info!(
@@ -336,9 +358,11 @@ impl SubscriptionSyncer {
         items: &[ProxyItemRecord],
         group_members: &[(String, Vec<String>)],
         commit: SubscriptionSyncCommit,
+        run_mihomo_validation: bool,
     ) -> Result<(), AppError> {
         let candidate_yaml = crate::runtime::subscription_candidate_yaml(items, group_members)?;
-        validate_subscription_candidate(&self.paths, &candidate_yaml).await?;
+        validate_subscription_candidate(&self.paths, &candidate_yaml, run_mihomo_validation)
+            .await?;
         self.storage
             .replace_subscription_assets(subscription_id, items, group_members, commit)
             .await?;
@@ -349,10 +373,15 @@ impl SubscriptionSyncer {
 async fn validate_subscription_candidate(
     paths: &AppPaths,
     candidate_yaml: &str,
+    run_mihomo_validation: bool,
 ) -> Result<(), AppError> {
+    validate_subscription_candidate_structure(candidate_yaml)?;
+    if !run_mihomo_validation {
+        debug!("core is stopped; subscription candidate passed structural validation");
+        return Ok(());
+    }
     let mihomo_binary = paths.mihomo_binary();
     if !mihomo_binary.is_file() {
-        validate_subscription_candidate_structure(candidate_yaml)?;
         warn!(
             mihomo_binary = %AppPaths::display(&mihomo_binary),
             "mihomo is unavailable; subscription candidate passed conservative structural validation"
@@ -1535,7 +1564,11 @@ fn parse_subscription_userinfo(value: &HeaderValue, meta: &mut SubscriptionMeta)
         let Some((key, value)) = part.trim().split_once('=') else {
             continue;
         };
-        let parsed = value.trim().parse::<u64>().ok();
+        let parsed = value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|value| i64::try_from(*value).is_ok());
         match key.trim().to_ascii_lowercase().as_str() {
             "upload" => meta.upload = parsed,
             "download" => meta.download = parsed,
@@ -1550,7 +1583,7 @@ fn parse_subscription_userinfo(value: &HeaderValue, meta: &mut SubscriptionMeta)
 }
 
 fn unix_seconds_to_display(value: u64) -> Option<String> {
-    let datetime = time::OffsetDateTime::from_unix_timestamp(value as i64).ok()?;
+    let datetime = time::OffsetDateTime::from_unix_timestamp(i64::try_from(value).ok()?).ok()?;
     let mut formatted = datetime
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| now_iso());
@@ -1563,6 +1596,25 @@ fn unix_seconds_to_display(value: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_userinfo_drops_values_that_cannot_fit_in_sqlite() {
+        let mut meta = SubscriptionMeta::default();
+        let header = HeaderValue::from_str(&format!(
+            "upload={}; download=42; total={}; expire={}",
+            u64::MAX,
+            u64::MAX,
+            u64::MAX
+        ))
+        .expect("valid header");
+
+        parse_subscription_userinfo(&header, &mut meta);
+
+        assert_eq!(meta.upload, None);
+        assert_eq!(meta.download, Some(42));
+        assert_eq!(meta.total, None);
+        assert_eq!(meta.expire, None);
+    }
 
     #[test]
     fn discard_rule_filters_matching_node() {
@@ -1872,6 +1924,7 @@ proxy-groups:
                 &[invalid_node],
                 &[],
                 candidate_commit("New Provider", "new-hash"),
+                false,
             )
             .await
             .expect_err("invalid proxy type must fail candidate validation");
@@ -1928,6 +1981,7 @@ proxy-groups:
                 &[missing_server],
                 &[],
                 candidate_commit("Changed Provider", "changed-hash"),
+                false,
             )
             .await
             .expect_err("missing server must fail candidate validation");
@@ -1986,6 +2040,7 @@ proxy-groups:
                 &items,
                 &[],
                 candidate_commit("Provider", "filtered-hash"),
+                false,
             )
             .await
             .expect("filtered invalid node must not block the valid candidate");
@@ -2034,6 +2089,56 @@ proxy-groups:
         drop(candidate);
 
         assert!(!candidate_path.exists());
+    }
+
+    #[tokio::test]
+    async fn stopped_core_candidate_validation_does_not_execute_mihomo() {
+        let temp = TestDir::new("candidate-stopped-core");
+        let paths = AppPaths::from_root(temp.path());
+        paths.ensure_dirs().expect("create app paths");
+        std::fs::write(paths.mihomo_binary(), b"not an executable")
+            .expect("write invalid mihomo fixture");
+        let candidate = r#"
+proxies:
+  - name: valid
+    type: ss
+    server: example.com
+    port: 443
+    cipher: aes-128-gcm
+    password: test
+"#;
+
+        validate_subscription_candidate(&paths, candidate, false)
+            .await
+            .expect("stopped core must use structural validation only");
+
+        assert_eq!(cleanup_stale_subscription_candidates(&paths), 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_lock_registry_rejects_missing_ids_and_prunes_finished_keys() {
+        let temp = TestDir::new("subscription-refresh-locks");
+        let paths = AppPaths::from_root(temp.path());
+        let storage = Storage::connect(&paths)
+            .await
+            .expect("connect test storage");
+        let syncer = SubscriptionSyncer::new(storage, paths);
+
+        let missing = syncer
+            .refresh("sub_missing", false)
+            .await
+            .expect_err("reject a missing subscription before allocating a lock");
+        assert_eq!(missing.code, "subscription_not_found");
+        assert!(syncer.refresh_locks.lock().await.is_empty());
+
+        let finished = syncer.lock_refresh("sub_finished").await;
+        drop(finished);
+        let active = syncer.lock_refresh("sub_active").await;
+        let locks = syncer.refresh_locks.lock().await;
+        assert_eq!(locks.len(), 1);
+        assert!(locks.contains_key("sub_active"));
+        drop(locks);
+        drop(active);
     }
 
     #[test]

@@ -26,6 +26,7 @@ if [[ -z "$target" ]]; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
 
 package_linux_archive() {
   artifact="$1"
@@ -42,12 +43,15 @@ package_linux_archive() {
   rm -rf "$release_dir"
   mkdir -p "$release_dir"
   cp "$binary" "$release_dir/rweb-clash"
+  cp "$binary" "$dist_root/$artifact.bin"
   cp "$repo_root/README.md" "$release_dir/README.md"
+  cp "$repo_root/LICENSE" "$release_dir/LICENSE"
   cp "$repo_root/packaging/linux/README.md" "$release_dir/LINUX.md"
-  cp "$repo_root/packaging/linux/install.sh" "$repo_root/packaging/linux/rweb-clash.service" "$repo_root/scripts/release-smoke.sh" "$repo_root/scripts/release-smoke.ps1" "$release_dir/"
-  chmod +x "$release_dir/rweb-clash" "$release_dir/install.sh" "$release_dir/release-smoke.sh"
+  cp "$repo_root/packaging/linux/install.sh" "$repo_root/packaging/linux/install-systemd.sh" "$repo_root/packaging/linux/rweb-clash.service" "$repo_root/packaging/linux/rweb-clash-system.service" "$repo_root/packaging/linux/rweb-clash-ready.service" "$repo_root/packaging/linux/rweb-clash.env" "$repo_root/scripts/release-smoke.sh" "$repo_root/scripts/release-smoke.ps1" "$release_dir/"
+  chmod +x "$release_dir/rweb-clash" "$dist_root/$artifact.bin" "$release_dir/install.sh" "$release_dir/install-systemd.sh" "$release_dir/release-smoke.sh"
 
   tar -C "$dist_root" -czf "$dist_root/$artifact.tar.gz" "$artifact"
+  (cd "$dist_root" && sha256sum "$artifact.bin" > "$artifact.bin.sha256")
   (cd "$dist_root" && sha256sum "$artifact.tar.gz" > "$artifact.tar.gz.sha256")
   "$repo_root/scripts/verify-linux-archive.sh" --archive "$dist_root/$artifact.tar.gz"
 }
@@ -59,13 +63,13 @@ pnpm --dir "$repo_root/web" build
 
 case "$target" in
   linux-amd64|linux-x86_64)
-    rust_target="x86_64-unknown-linux-gnu"
-    cargo build -p rweb-clash-bin --features embedded-assets --release --target "$rust_target"
+    rust_target="x86_64-unknown-linux-musl"
+    cross build -p rweb-clash-bin --features embedded-assets --release --locked --target "$rust_target"
     package_linux_archive "rweb-clash-linux-amd64" "$rust_target"
     ;;
   linux-arm64|linux-aarch64)
-    rust_target="aarch64-unknown-linux-gnu"
-    cargo build -p rweb-clash-bin --features embedded-assets --release --target "$rust_target"
+    rust_target="aarch64-unknown-linux-musl"
+    cross build -p rweb-clash-bin --features embedded-assets --release --locked --target "$rust_target"
     package_linux_archive "rweb-clash-linux-arm64" "$rust_target"
     ;;
   windows-amd64|windows-x86_64|macos-arm64|macos-aarch64|macos-x86_64)

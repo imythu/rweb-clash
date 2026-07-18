@@ -7,6 +7,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+Set-Location $repoRoot
+if ($IsWindows -and $Target -like "linux-*") {
+  throw "Linux archives must be packaged from Linux or WSL so tar preserves executable modes. Use scripts/package-local.sh there."
+}
 
 function Invoke-Native {
   param(
@@ -34,19 +38,35 @@ function New-LinuxArchive {
   }
   New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 
-  $binaryName = if ($IsWindows) { "rweb-clash-bin.exe" } else { "rweb-clash-bin" }
-  $binaryPath = Join-Path $repoRoot "target/$RustTarget/release/$binaryName"
+  $binaryPath = Join-Path $repoRoot "target/$RustTarget/release/rweb-clash-bin"
   if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
     throw "release binary not found: $binaryPath"
   }
 
   Copy-Item -LiteralPath $binaryPath -Destination (Join-Path $releaseDir "rweb-clash") -Force
+  Copy-Item -LiteralPath $binaryPath -Destination (Join-Path $distRoot "$Artifact.bin") -Force
   Copy-Item -LiteralPath (Join-Path $repoRoot "README.md") -Destination (Join-Path $releaseDir "README.md") -Force
+  Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination (Join-Path $releaseDir "LICENSE") -Force
   Copy-Item -LiteralPath (Join-Path $repoRoot "packaging/linux/README.md") -Destination (Join-Path $releaseDir "LINUX.md") -Force
   Copy-Item -LiteralPath (Join-Path $repoRoot "packaging/linux/install.sh") -Destination $releaseDir -Force
+  Copy-Item -LiteralPath (Join-Path $repoRoot "packaging/linux/install-systemd.sh") -Destination $releaseDir -Force
   Copy-Item -LiteralPath (Join-Path $repoRoot "packaging/linux/rweb-clash.service") -Destination $releaseDir -Force
+  Copy-Item -LiteralPath (Join-Path $repoRoot "packaging/linux/rweb-clash-system.service") -Destination $releaseDir -Force
+  Copy-Item -LiteralPath (Join-Path $repoRoot "packaging/linux/rweb-clash-ready.service") -Destination $releaseDir -Force
+  Copy-Item -LiteralPath (Join-Path $repoRoot "packaging/linux/rweb-clash.env") -Destination $releaseDir -Force
   Copy-Item -LiteralPath (Join-Path $repoRoot "scripts/release-smoke.sh") -Destination $releaseDir -Force
   Copy-Item -LiteralPath (Join-Path $repoRoot "scripts/release-smoke.ps1") -Destination $releaseDir -Force
+
+  if (-not $IsWindows) {
+    Invoke-Native {
+      chmod +x `
+        (Join-Path $releaseDir "rweb-clash") `
+        (Join-Path $distRoot "$Artifact.bin") `
+        (Join-Path $releaseDir "install.sh") `
+        (Join-Path $releaseDir "install-systemd.sh") `
+        (Join-Path $releaseDir "release-smoke.sh")
+    }
+  }
 
   $archive = Join-Path $distRoot "$Artifact.tar.gz"
   Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
@@ -54,6 +74,10 @@ function New-LinuxArchive {
 
   $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
   "$hash  $Artifact.tar.gz" | Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
+  $binaryArtifact = Join-Path $distRoot "$Artifact.bin"
+  $binaryHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $binaryArtifact).Hash.ToLowerInvariant()
+  $binaryChecksum = Join-Path $distRoot "$Artifact.bin.sha256"
+  "$binaryHash  $Artifact.bin" | Set-Content -LiteralPath $binaryChecksum -Encoding ascii
 
   if (-not $IsWindows) {
     & bash (Join-Path $repoRoot "scripts/verify-linux-archive.sh") --archive $archive
@@ -70,14 +94,14 @@ Invoke-Native { pnpm --dir (Join-Path $repoRoot "web") build }
 
 switch ($Target) {
   { $_ -in @("linux-amd64", "linux-x86_64") } {
-    $rustTarget = "x86_64-unknown-linux-gnu"
-    Invoke-Native { cargo build -p rweb-clash-bin --features embedded-assets --release --target $rustTarget }
+    $rustTarget = "x86_64-unknown-linux-musl"
+    Invoke-Native { cross build -p rweb-clash-bin --features embedded-assets --release --locked --target $rustTarget }
     New-LinuxArchive -Artifact "rweb-clash-linux-amd64" -RustTarget $rustTarget
     break
   }
   { $_ -in @("linux-arm64", "linux-aarch64") } {
-    $rustTarget = "aarch64-unknown-linux-gnu"
-    Invoke-Native { cargo build -p rweb-clash-bin --features embedded-assets --release --target $rustTarget }
+    $rustTarget = "aarch64-unknown-linux-musl"
+    Invoke-Native { cross build -p rweb-clash-bin --features embedded-assets --release --locked --target $rustTarget }
     New-LinuxArchive -Artifact "rweb-clash-linux-arm64" -RustTarget $rustTarget
     break
   }

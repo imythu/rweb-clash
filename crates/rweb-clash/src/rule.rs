@@ -2,14 +2,15 @@ use crate::error::AppError;
 use crate::paths::AppPaths;
 use crate::remote;
 use crate::runtime::available_policy_targets;
-use crate::storage::Storage;
+use crate::storage::{RuleSetRefreshState, Storage};
 use crate::types::{
     RuleInput, RuleResponse, RuleSetInput, RuleSetResponse, RuleTestRequest, RuleTestResponse,
     BUILTIN_DIRECT, BUILTIN_GLOBAL, BUILTIN_PROXY, BUILTIN_REJECT,
 };
-use crate::util::{content_hash, new_id, validate_url};
+use crate::util::{contains_rule_delimiter_or_control, content_hash, new_id, validate_url};
 use ipnet::IpNet;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -37,7 +38,13 @@ impl From<bool> for RuleMatchOutcome {
 pub struct RuleService {
     storage: Storage,
     paths: AppPaths,
-    refresh_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    snapshot_mutation: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct OrphanSnapshotCleanupReport {
+    pub(crate) removed: usize,
+    pub(crate) failed: usize,
 }
 
 impl RuleService {
@@ -45,8 +52,106 @@ impl RuleService {
         Self {
             storage,
             paths,
-            refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+            snapshot_mutation: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub(crate) async fn cleanup_orphan_snapshots(
+        &self,
+    ) -> Result<OrphanSnapshotCleanupReport, AppError> {
+        let _snapshot_mutation = self.snapshot_mutation.lock().await;
+        let active_snapshot_names = self
+            .storage
+            .rule_set_snapshot_paths()
+            .await?
+            .into_iter()
+            .filter_map(|local_path| self.managed_snapshot_path(&local_path))
+            .filter_map(|path| path.file_name().map(OsStr::to_os_string))
+            .collect::<HashSet<_>>();
+        let mut entries = tokio::fs::read_dir(&self.paths.rule_sets_dir)
+            .await
+            .map_err(|error| {
+                AppError::internal(format!(
+                    "failed to scan rule-set snapshot directory {}: {error}",
+                    AppPaths::display(&self.paths.rule_sets_dir)
+                ))
+            })?;
+        let mut report = OrphanSnapshotCleanupReport::default();
+
+        loop {
+            let entry = entries.next_entry().await.map_err(|error| {
+                AppError::internal(format!(
+                    "failed to inspect rule-set snapshot directory {}: {error}",
+                    AppPaths::display(&self.paths.rule_sets_dir)
+                ))
+            })?;
+            let Some(entry) = entry else {
+                break;
+            };
+            let file_name = entry.file_name();
+            let file_name_text = file_name.to_string_lossy();
+            let is_current_download_temp = file_name_text.starts_with(".rule-set-download-")
+                && file_name_text.ends_with(".tmp");
+            let is_legacy_download_temp = file_name_text.ends_with(".tmp")
+                && file_name_text
+                    .split_once(".download_")
+                    .is_some_and(|(id, suffix)| !id.is_empty() && suffix.len() > ".tmp".len());
+            let is_download_temp = is_current_download_temp || is_legacy_download_temp;
+            let is_snapshot =
+                std::path::Path::new(&file_name).extension() == Some(OsStr::new("list"));
+            if !is_snapshot && !is_download_temp {
+                continue;
+            }
+            match entry.file_type().await {
+                Ok(file_type) if file_type.is_file() => {}
+                Ok(_) => continue,
+                Err(error) => {
+                    report.failed += 1;
+                    warn!(
+                        %error,
+                        path = %AppPaths::display(&entry.path()),
+                        "failed to inspect a possible orphan rule-set snapshot"
+                    );
+                    continue;
+                }
+            }
+            if is_download_temp {
+                match tokio::fs::remove_file(entry.path()).await {
+                    Ok(()) => report.removed += 1,
+                    Err(error) => {
+                        report.failed += 1;
+                        warn!(
+                            %error,
+                            path = %AppPaths::display(&entry.path()),
+                            "failed to remove a stale rule-set download"
+                        );
+                    }
+                }
+                continue;
+            }
+            if active_snapshot_names.contains(&file_name) {
+                continue;
+            }
+            match tokio::fs::remove_file(entry.path()).await {
+                Ok(()) => report.removed += 1,
+                Err(error) => {
+                    report.failed += 1;
+                    warn!(
+                        %error,
+                        path = %AppPaths::display(&entry.path()),
+                        "failed to remove an orphan rule-set snapshot"
+                    );
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    fn managed_snapshot_path(&self, local_path: &str) -> Option<std::path::PathBuf> {
+        let resolved = self.paths.resolve_local_path(local_path);
+        let file_name = resolved.file_name()?;
+        (self.paths.rule_sets_dir.join(file_name) == resolved).then_some(resolved)
     }
 
     pub async fn create_rule(&self, input: RuleInput) -> Result<RuleResponse, AppError> {
@@ -64,7 +169,7 @@ impl RuleService {
                 input.id,
                 &input.rule_type,
                 &value,
-                &input.policy,
+                input.policy.trim(),
                 input.desc.as_deref(),
                 input.enabled.unwrap_or(true),
             )
@@ -80,22 +185,17 @@ impl RuleService {
             enabled = input.enabled.unwrap_or(true),
             "storing routing rule update"
         );
-        let position = input.position;
-        let rule = self
-            .storage
+        self.storage
             .update_rule(
                 id,
                 &input.rule_type,
                 normalized_rule_value(&input),
-                &input.policy,
+                input.policy.trim(),
                 input.desc.as_deref(),
                 input.enabled.unwrap_or(true),
+                input.position,
             )
-            .await?;
-        match position {
-            Some(position) => self.storage.move_rule(id, position).await,
-            None => Ok(rule),
-        }
+            .await
     }
 
     pub async fn test_rule(&self, request: RuleTestRequest) -> Result<RuleTestResponse, AppError> {
@@ -158,86 +258,169 @@ impl RuleService {
     }
 
     pub async fn create_rule_set(&self, input: RuleSetInput) -> Result<RuleSetResponse, AppError> {
-        if input.name.trim().is_empty() {
+        let name = input.name.trim();
+        if name.is_empty() {
             return Err(AppError::bad_request(
                 "ruleset_invalid",
                 "rule set name cannot be empty",
             ));
         }
-        if !validate_url(&input.url) {
+        if contains_rule_delimiter_or_control(name) {
+            return Err(AppError::bad_request(
+                "ruleset_invalid",
+                "rule set name cannot contain commas or control characters",
+            ));
+        }
+        let url = input.url.trim();
+        if !validate_url(url) {
             return Err(AppError::bad_request(
                 "ruleset_invalid_url",
                 "rule set url must start with http:// or https://",
             ));
         }
+        let behavior = input
+            .behavior
+            .as_deref()
+            .unwrap_or("classical")
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(behavior.as_str(), "domain" | "ipcidr" | "classical") {
+            return Err(AppError::bad_request(
+                "ruleset_invalid",
+                format!("unsupported rule set behavior {behavior}"),
+            ));
+        }
+        let format = input
+            .format
+            .as_deref()
+            .unwrap_or("text")
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(format.as_str(), "text" | "yaml") {
+            return Err(AppError::bad_request(
+                "ruleset_invalid",
+                format!("unsupported rule set format {format}"),
+            ));
+        }
         let id = new_id("rs");
         info!(
             rule_set_id = %id,
-            name = %input.name.trim(),
-            format = %input.format.as_deref().unwrap_or("text"),
+            name,
+            %behavior,
+            %format,
             interval_seconds = input.interval_seconds(),
-            url_host = %url_host_label(&input.url),
+            url_host = %url_host_label(url),
             "creating rule set"
         );
         self.storage
-            .create_rule_set(
+            .create_pending_rule_set(
                 &id,
-                input.name.trim(),
-                input.url.trim(),
+                name,
+                url,
                 input.interval_seconds(),
-                input.behavior.as_deref(),
-                input.format.as_deref().unwrap_or("text"),
+                Some(&behavior),
+                &format,
             )
             .await?;
-        if let Err(fetch_error) = self.refresh_rule_set(&id).await {
-            warn!(
-                rule_set_id = %id,
-                error = %fetch_error,
-                "initial rule set fetch failed, rolling back record"
-            );
-            if let Err(rollback_error) = self.rollback_rule_set_creation(&id).await {
-                return Err(AppError::internal(format!(
-                    "initial rule set fetch failed ({fetch_error}); rollback failed: {rollback_error}"
-                )));
-            }
-            return Err(fetch_error);
+        let creation = async {
+            self.refresh_rule_set(&id).await?;
+            self.storage
+                .rule_set_including_staged(&id)
+                .await?
+                .ok_or_else(|| AppError::internal("created rule set disappeared"))
         }
-        let all = self.storage.list_rule_sets().await?;
-        all.into_iter()
-            .find(|item| item.id == id)
-            .ok_or_else(|| AppError::internal("created rule set disappeared"))
+        .await;
+        match creation {
+            Ok(rule_set) => Ok(rule_set),
+            Err(create_error) => {
+                warn!(
+                    rule_set_id = %id,
+                    error = %create_error,
+                    "initial rule set staging failed, rolling back record"
+                );
+                if let Err(rollback_error) = self.rollback_rule_set_creation(&id).await {
+                    return Err(AppError::internal(format!(
+                        "initial rule set staging failed ({create_error}); rollback failed: {rollback_error}"
+                    )));
+                }
+                Err(create_error)
+            }
+        }
     }
 
     async fn rollback_rule_set_creation(&self, id: &str) -> Result<(), AppError> {
+        let _snapshot_mutation = self.snapshot_mutation.lock().await;
+        let local_paths = self.storage.rule_set_snapshot_paths_for_id(id).await?;
         self.storage.delete_rule_set(id).await?;
-        let _ = tokio::fs::remove_file(self.paths.rule_sets_dir.join(format!("{id}.list"))).await;
-        let _ =
-            tokio::fs::remove_file(self.paths.rule_sets_dir.join(format!("{id}.list.tmp"))).await;
+        self.remove_rule_set_snapshots(id, &local_paths).await;
         Ok(())
     }
 
-    pub async fn refresh_rule_set(&self, id: &str) -> Result<(), AppError> {
-        let refresh_lock = {
-            let mut locks = self.refresh_locks.lock().await;
-            locks
-                .entry(id.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _refresh_guard = refresh_lock.lock().await;
-        let Some(rule_set) = self
-            .storage
-            .rule_sets_for_runtime()
-            .await?
-            .into_iter()
-            .find(|rule_set| rule_set.id == id)
-        else {
-            warn!(rule_set_id = %id, "rule set refresh requested for missing rule set");
+    pub async fn delete_rule_set(&self, id: &str) -> Result<(), AppError> {
+        let _snapshot_mutation = self.snapshot_mutation.lock().await;
+        let local_paths = self.storage.rule_set_snapshot_paths_for_id(id).await?;
+        self.storage.delete_rule_set(id).await?;
+        self.remove_rule_set_snapshots(id, &local_paths).await;
+        Ok(())
+    }
+
+    async fn remove_rule_set_snapshots(&self, id: &str, local_paths: &[String]) {
+        let mut snapshots = vec![self.paths.rule_sets_dir.join(format!("{id}.list"))];
+        for local_path in local_paths {
+            let Some(snapshot) = self.managed_snapshot_path(local_path) else {
+                continue;
+            };
+            if !snapshots.contains(&snapshot) {
+                snapshots.push(snapshot);
+            }
+        }
+        for snapshot in snapshots {
+            if let Err(error) = tokio::fs::remove_file(&snapshot).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        rule_set_id = %id,
+                        path = %AppPaths::display(&snapshot),
+                        %error,
+                        "rule set record was deleted but its snapshot could not be removed"
+                    );
+                }
+            }
+        }
+    }
+
+    pub async fn refresh_rule_set(&self, id: &str) -> Result<RuleSetRefreshState, AppError> {
+        if self.storage.rule_set_for_refresh(id).await?.is_none() {
             return Err(AppError::not_found(
                 "ruleset_not_found",
                 format!("rule set {id} not found"),
             ));
-        };
+        }
+        let _snapshot_mutation = self.snapshot_mutation.lock().await;
+        let result = self.refresh_rule_set_locked(id).await;
+        if let Err(error) = &result {
+            if let Err(mark_error) = self
+                .storage
+                .mark_rule_set_refresh_error(id, &error.message)
+                .await
+            {
+                warn!(
+                    rule_set_id = %id,
+                    %mark_error,
+                    "failed to persist a rule-set refresh error"
+                );
+            }
+        }
+        result
+    }
+
+    async fn refresh_rule_set_locked(&self, id: &str) -> Result<RuleSetRefreshState, AppError> {
+        let rule_set = self
+            .storage
+            .rule_set_for_refresh(id)
+            .await?
+            .ok_or_else(|| {
+                AppError::not_found("ruleset_not_found", format!("rule set {id} not found"))
+            })?;
         info!(
             rule_set_id = %id,
             name = %rule_set.name,
@@ -253,13 +436,17 @@ impl RuleService {
         .await?;
         let status = response.status;
         let content = response.body;
+        let behavior = rule_set
+            .behavior
+            .as_deref()
+            .unwrap_or("classical")
+            .to_string();
         let (content, rule_count, detected_format) = tokio::task::spawn_blocking(move || {
-            let rule_count = count_rules(&content);
-            let detected_format = detect_rule_set_format(&content);
-            (content, rule_count, detected_format)
+            let (rule_count, detected_format) = validate_rule_set_payload(&content, &behavior)?;
+            Ok::<_, AppError>((content, rule_count, detected_format))
         })
         .await
-        .map_err(|error| AppError::internal(format!("rule-set analyzer task failed: {error}")))?;
+        .map_err(|error| AppError::internal(format!("rule-set analyzer task failed: {error}")))??;
         info!(
             rule_set_id = %id,
             status = status.as_u16(),
@@ -268,35 +455,71 @@ impl RuleService {
             format = %detected_format,
             "rule set fetched"
         );
-        let local = self.paths.rule_sets_dir.join(format!("{id}.list"));
+        let digest = content_hash(content.as_bytes());
+        let relative = self.paths.rule_set_version_relative_path(id, &digest);
+        let local = self.paths.resolve_local_path(&relative);
         let tmp = self
             .paths
             .rule_sets_dir
-            .join(format!("{id}.{}.tmp", new_id("download")));
-        tokio::fs::write(&tmp, &content).await?;
-        if let Err(err) = replace_downloaded_file(&tmp, &local).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(err);
+            .join(format!(".rule-set-download-{}.tmp", new_id("download")));
+        let temporary = RuleSetDownloadTemp(tmp);
+        tokio::fs::write(temporary.path(), &content).await?;
+        let (destination_existed, existing_matches) = match tokio::fs::metadata(&local).await {
+            Ok(metadata) if metadata.is_file() => {
+                let matches = metadata.len() == content.len() as u64
+                    && content_hash(&tokio::fs::read(&local).await?) == digest;
+                (true, matches)
+            }
+            Ok(_) => {
+                return Err(AppError::internal(format!(
+                    "rule-set snapshot destination is not a regular file: {}",
+                    AppPaths::display(&local)
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, false),
+            Err(error) => return Err(AppError::from(error)),
+        };
+        let installed_by_this_attempt = !destination_existed;
+        if !existing_matches {
+            replace_downloaded_file(temporary.path(), &local).await?;
         }
-        let relative = self.paths.rule_set_relative_path(id);
-        self.storage
-            .update_rule_set_refresh(
+        let previous = match self
+            .storage
+            .stage_rule_set_refresh(
                 id,
                 &relative,
                 content.len() as u64,
                 rule_count,
-                &content_hash(content.as_bytes()),
+                &digest,
                 detected_format,
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(previous) => previous,
+            Err(error) => {
+                if installed_by_this_attempt {
+                    let _ = tokio::fs::remove_file(&local).await;
+                }
+                return Err(error);
+            }
+        };
         info!(
             rule_set_id = %id,
             local_path = %relative,
             format = %detected_format,
             "rule set saved"
         );
-        Ok(())
+        Ok(previous)
+    }
+
+    pub async fn restore_rule_set_refresh(
+        &self,
+        id: &str,
+        previous: &RuleSetRefreshState,
+    ) -> Result<(), AppError> {
+        let _snapshot_mutation = self.snapshot_mutation.lock().await;
+        self.storage.restore_rule_set_refresh(id, previous).await
     }
 
     async fn rule_matches(
@@ -356,6 +579,20 @@ fn url_host_label(value: &str) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+struct RuleSetDownloadTemp(std::path::PathBuf);
+
+impl RuleSetDownloadTemp {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for RuleSetDownloadTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 async fn replace_downloaded_file(
     temporary: &std::path::Path,
@@ -413,6 +650,12 @@ pub fn validate_rule_input(input: &RuleInput) -> Result<(), AppError> {
             "rule value cannot be empty",
         ));
     }
+    if input.rule_type != "MATCH" && contains_rule_delimiter_or_control(input.value.trim()) {
+        return Err(AppError::bad_request(
+            "rule_invalid",
+            "rule value cannot contain commas or control characters",
+        ));
+    }
     if matches!(input.rule_type.as_str(), "IP-CIDR" | "IP-CIDR6")
         && input.value.trim().parse::<IpNet>().is_err()
     {
@@ -425,6 +668,12 @@ pub fn validate_rule_input(input: &RuleInput) -> Result<(), AppError> {
         return Err(AppError::bad_request(
             "rule_invalid",
             "rule policy cannot be empty",
+        ));
+    }
+    if contains_rule_delimiter_or_control(input.policy.trim()) {
+        return Err(AppError::bad_request(
+            "rule_invalid",
+            "rule policy cannot contain commas or control characters",
         ));
     }
     Ok(())
@@ -450,6 +699,7 @@ fn normalized_rule_value(input: &RuleInput) -> &str {
     }
 }
 
+#[cfg(test)]
 fn count_rules(content: &str) -> u64 {
     content.lines().filter_map(normalize_rule_set_line).count() as u64
 }
@@ -468,6 +718,119 @@ fn detect_rule_set_format(content: &str) -> &'static str {
         "yaml"
     } else {
         "text"
+    }
+}
+
+fn validate_rule_set_payload(
+    content: &str,
+    behavior: &str,
+) -> Result<(u64, &'static str), AppError> {
+    if content
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+    {
+        return Err(AppError::bad_request(
+            "ruleset_invalid_payload",
+            "rule set contains unsupported control characters",
+        ));
+    }
+    let trimmed = content.trim_start();
+    let lowercase_prefix = trimmed
+        .chars()
+        .take(256)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if lowercase_prefix.starts_with("<!doctype html")
+        || lowercase_prefix.starts_with("<html")
+        || lowercase_prefix.contains("<body")
+    {
+        return Err(AppError::bad_request(
+            "ruleset_invalid_payload",
+            "rule set response is an HTML document",
+        ));
+    }
+
+    let detected_format = detect_rule_set_format(content);
+    let entries = if detected_format == "yaml" {
+        let value = serde_yaml::from_str::<serde_yaml::Value>(content)?;
+        let payload = value
+            .as_mapping()
+            .and_then(|mapping| mapping.get(serde_yaml::Value::String("payload".into())))
+            .and_then(serde_yaml::Value::as_sequence)
+            .ok_or_else(|| {
+                AppError::bad_request(
+                    "ruleset_invalid_payload",
+                    "YAML rule set must contain a payload sequence",
+                )
+            })?;
+        payload
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_str()
+                    .map(|entry| entry.trim().to_string())
+                    .ok_or_else(|| {
+                        AppError::bad_request(
+                            "ruleset_invalid_payload",
+                            "YAML rule-set payload entries must be strings",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        content
+            .lines()
+            .filter_map(normalize_rule_set_line)
+            .map(str::to_string)
+            .collect()
+    };
+    if entries.is_empty() || entries.iter().any(|entry| entry.is_empty()) {
+        return Err(AppError::bad_request(
+            "ruleset_invalid_payload",
+            "rule set contains no rules",
+        ));
+    }
+    for line in &entries {
+        let valid = match behavior {
+            "domain" => valid_domain_rule_set_entry(line),
+            "ipcidr" => line.parse::<IpNet>().is_ok(),
+            "classical" => valid_classical_rule_set_entry(line),
+            _ => false,
+        };
+        if !valid {
+            return Err(AppError::bad_request(
+                "ruleset_invalid_payload",
+                format!("invalid {behavior} rule-set entry: {line}"),
+            ));
+        }
+    }
+    Ok((entries.len() as u64, detected_format))
+}
+
+fn valid_domain_rule_set_entry(value: &str) -> bool {
+    !value.contains(char::is_whitespace)
+        && !value.contains("//")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ".-_+*".contains(ch))
+}
+
+fn valid_classical_rule_set_entry(value: &str) -> bool {
+    let Some((kind, remainder)) = value.split_once(',') else {
+        return false;
+    };
+    let rule_value = remainder.split(',').next().unwrap_or_default().trim();
+    if rule_value.is_empty() {
+        return false;
+    }
+    match kind.trim() {
+        "DOMAIN" | "DOMAIN-SUFFIX" => valid_domain_rule_set_entry(rule_value),
+        "DOMAIN-KEYWORD" => !rule_value.contains(char::is_whitespace),
+        "IP-CIDR" | "IP-CIDR6" => rule_value.parse::<IpNet>().is_ok(),
+        "GEOIP" => rule_value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'),
+        _ => false,
     }
 }
 
@@ -649,6 +1012,44 @@ payload:
     }
 
     #[test]
+    fn rule_set_payload_validation_rejects_error_documents_and_malformed_entries() {
+        assert_eq!(
+            validate_rule_set_payload("payload:\n  - '+.example.com'\n", "domain")
+                .expect("valid domain payload"),
+            (1, "yaml")
+        );
+        assert_eq!(
+            validate_rule_set_payload("payload: ['+.example.com']\n", "domain")
+                .expect("valid inline YAML payload"),
+            (1, "yaml")
+        );
+        assert!(validate_rule_set_payload("10.0.0.0/8\n2001:db8::/32\n", "ipcidr").is_ok());
+        assert!(validate_rule_set_payload(
+            "DOMAIN-SUFFIX,example.com\nIP-CIDR,10.0.0.0/8\n",
+            "classical"
+        )
+        .is_ok());
+        for (content, behavior) in [
+            (
+                "<!doctype html><html><body>gateway error</body></html>",
+                "domain",
+            ),
+            ("# comments only\n", "domain"),
+            ("payload:\n  - key: value\n", "domain"),
+            ("10.0.0.0/99\n", "ipcidr"),
+            ("upstream temporarily unavailable\n", "classical"),
+            ("NOT-A-MIHOMO-RULE,anything\n", "classical"),
+        ] {
+            assert_eq!(
+                validate_rule_set_payload(content, behavior)
+                    .expect_err("reject malformed rule-set response")
+                    .code,
+                "ruleset_invalid_payload"
+            );
+        }
+    }
+
+    #[test]
     fn match_rule_value_is_normalized_to_any() {
         let input = RuleInput {
             rule_type: "MATCH".into(),
@@ -671,6 +1072,70 @@ payload:
         };
 
         assert!(validate_rule_input(&input).is_err());
+    }
+
+    #[test]
+    fn rule_fields_reject_clash_delimiters_and_control_characters() {
+        for input in [
+            RuleInput {
+                value: "example.com,DIRECT".into(),
+                ..RuleInput::default()
+            },
+            RuleInput {
+                policy: "Group,One".into(),
+                ..RuleInput::default()
+            },
+            RuleInput {
+                value: "example.com\nMATCH".into(),
+                ..RuleInput::default()
+            },
+        ] {
+            assert_eq!(
+                validate_rule_input(&input)
+                    .expect_err("reject ambiguous rule serialization")
+                    .code,
+                "rule_invalid"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rule_set_inputs_reject_invalid_names_and_enums_before_fetching() {
+        let temp = TestDir::new("rule-set-input-validation");
+        let paths = AppPaths::from_root(temp.path());
+        paths.ensure_dirs().expect("create app directories");
+        let storage = Storage::connect(&paths)
+            .await
+            .expect("connect test storage");
+        let service = RuleService::new(storage, paths);
+        for input in [
+            RuleSetInput {
+                name: "bad,name".into(),
+                url: "https://example.com/rules.txt".into(),
+                ..RuleSetInput::default()
+            },
+            RuleSetInput {
+                name: "bad-behavior".into(),
+                url: "https://example.com/rules.txt".into(),
+                behavior: Some("domains".into()),
+                ..RuleSetInput::default()
+            },
+            RuleSetInput {
+                name: "bad-format".into(),
+                url: "https://example.com/rules.mrs".into(),
+                format: Some("mrs".into()),
+                ..RuleSetInput::default()
+            },
+        ] {
+            assert_eq!(
+                service
+                    .create_rule_set(input)
+                    .await
+                    .expect_err("reject invalid rule set input before network access")
+                    .code,
+                "ruleset_invalid"
+            );
+        }
     }
 
     #[test]
@@ -719,7 +1184,213 @@ payload:
     }
 
     #[tokio::test]
-    async fn rule_test_sanitizes_policies_and_missing_snapshots_fail_closed() {
+    async fn rule_set_deletion_removes_its_downloaded_snapshot() {
+        let temp = TestDir::new("rule-set-snapshot-delete");
+        let paths = AppPaths::from_root(temp.path());
+        paths.ensure_dirs().expect("create app directories");
+        let storage = Storage::connect(&paths)
+            .await
+            .expect("connect test storage");
+        let service = RuleService::new(storage.clone(), paths.clone());
+        let id = "rs_snapshot_delete";
+        storage
+            .create_rule_set(
+                id,
+                "snapshot-delete",
+                "https://example.com/rules.txt",
+                3_600,
+                Some("domain"),
+                "text",
+            )
+            .await
+            .expect("create rule set record");
+        let snapshot = paths.rule_sets_dir.join(format!("{id}.version.list"));
+        tokio::fs::write(&snapshot, "example.com\n")
+            .await
+            .expect("write rule set snapshot");
+        storage
+            .update_rule_set_refresh(
+                id,
+                &paths.rule_set_version_relative_path(id, "version"),
+                12,
+                1,
+                "version",
+                "text",
+                None,
+            )
+            .await
+            .expect("record versioned snapshot");
+
+        let snapshot_guard = service.snapshot_mutation.lock().await;
+        let delete_service = service.clone();
+        let mut deletion = tokio::spawn(async move { delete_service.delete_rule_set(id).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut deletion)
+                .await
+                .is_err(),
+            "deletion must wait for an in-flight refresh"
+        );
+        drop(snapshot_guard);
+        deletion
+            .await
+            .expect("join deletion task")
+            .expect("delete rule set and snapshot");
+
+        assert!(!snapshot.exists());
+        assert!(storage
+            .list_rule_sets()
+            .await
+            .expect("list rule sets")
+            .into_iter()
+            .all(|rule_set| rule_set.id != id));
+    }
+
+    #[tokio::test]
+    async fn orphan_snapshot_cleanup_only_removes_unreferenced_regular_list_files() {
+        let temp = TestDir::new("rule-set-orphan-cleanup");
+        let paths = AppPaths::from_root(temp.path());
+        paths.ensure_dirs().expect("create app directories");
+        let storage = Storage::connect(&paths)
+            .await
+            .expect("connect test storage");
+        let active_id = "rs_active_snapshot";
+        storage
+            .create_rule_set(
+                active_id,
+                "active-snapshot",
+                "https://example.com/active.txt",
+                3_600,
+                Some("domain"),
+                "text",
+            )
+            .await
+            .expect("create active rule set record");
+
+        let active = paths.rule_sets_dir.join(format!("{active_id}.v1.list"));
+        let orphan = paths.rule_sets_dir.join("rs_active_snapshot_old.list");
+        let temporary = paths.rule_sets_dir.join("rs_interrupted.list.tmp");
+        let stale_download = paths
+            .rule_sets_dir
+            .join(".rule-set-download-download_stale.tmp");
+        let legacy_stale_download = paths
+            .rule_sets_dir
+            .join("rs_legacy.download_download_stale.tmp");
+        let wrong_extension = paths.rule_sets_dir.join("rs_orphan.LIST");
+        let matching_directory = paths.rule_sets_dir.join("rs_directory.list");
+        for file in [
+            &active,
+            &orphan,
+            &temporary,
+            &stale_download,
+            &legacy_stale_download,
+            &wrong_extension,
+        ] {
+            tokio::fs::write(file, "example.com\n")
+                .await
+                .expect("write snapshot cleanup fixture");
+        }
+        storage
+            .update_rule_set_refresh(
+                active_id,
+                &paths.rule_set_version_relative_path(active_id, "v1"),
+                12,
+                1,
+                "active-hash",
+                "text",
+                None,
+            )
+            .await
+            .expect("mark the active snapshot in storage");
+        tokio::fs::create_dir(&matching_directory)
+            .await
+            .expect("create matching directory");
+        let nested_snapshot = matching_directory.join("nested.list");
+        tokio::fs::write(&nested_snapshot, "keep nested\n")
+            .await
+            .expect("write nested snapshot");
+
+        #[cfg(unix)]
+        let (matching_symlink, symlink_target) = {
+            use std::os::unix::fs::symlink;
+
+            let target = paths.rule_sets_dir.join("symlink-target.txt");
+            let link = paths.rule_sets_dir.join("rs_symlink.list");
+            std::fs::write(&target, b"keep target\n").expect("write symlink target");
+            symlink(&target, &link).expect("create snapshot symlink");
+            (link, target)
+        };
+
+        let service = RuleService::new(storage, paths);
+        let report = service
+            .cleanup_orphan_snapshots()
+            .await
+            .expect("clean orphan snapshots");
+
+        assert_eq!(
+            report,
+            OrphanSnapshotCleanupReport {
+                removed: 3,
+                failed: 0,
+            }
+        );
+        assert!(!orphan.exists());
+        assert!(!stale_download.exists());
+        assert!(!legacy_stale_download.exists());
+        for preserved in [
+            &active,
+            &temporary,
+            &wrong_extension,
+            &matching_directory,
+            &nested_snapshot,
+        ] {
+            assert!(preserved.exists(), "{}", preserved.display());
+        }
+        #[cfg(unix)]
+        {
+            assert!(matching_symlink.is_symlink());
+            assert!(symlink_target.is_file());
+        }
+    }
+
+    #[test]
+    fn rule_set_download_guard_removes_partial_files() {
+        let temp = TestDir::new("rule-set-download-guard");
+        let temporary = temp.path().join("partial.tmp");
+        std::fs::write(&temporary, b"partial").expect("write partial download");
+        {
+            let guard = RuleSetDownloadTemp(temporary.clone());
+            assert_eq!(guard.path(), temporary);
+        }
+        assert!(!temporary.exists());
+    }
+
+    #[tokio::test]
+    async fn orphan_snapshot_cleanup_reports_an_unreadable_snapshot_directory() {
+        let temp = TestDir::new("rule-set-orphan-cleanup-error");
+        let paths = AppPaths::from_root(temp.path());
+        paths.ensure_dirs().expect("create app directories");
+        let storage = Storage::connect(&paths)
+            .await
+            .expect("connect test storage");
+        tokio::fs::remove_dir(&paths.rule_sets_dir)
+            .await
+            .expect("remove rule-set directory");
+        tokio::fs::write(&paths.rule_sets_dir, "not a directory")
+            .await
+            .expect("replace rule-set directory with a file");
+
+        let error = RuleService::new(storage, paths)
+            .cleanup_orphan_snapshots()
+            .await
+            .expect_err("surface snapshot directory scan failure");
+
+        assert!(error
+            .message
+            .contains("failed to scan rule-set snapshot directory"));
+    }
+
+    #[tokio::test]
+    async fn rule_test_missing_snapshots_fail_closed() {
         let temp = TestDir::new("rule-test-fail-closed");
         let paths = AppPaths::from_root(temp.path());
         paths.ensure_dirs().expect("create app directories");
@@ -727,31 +1398,17 @@ payload:
             .await
             .expect("connect test storage");
         let service = RuleService::new(storage.clone(), paths);
-        let invalid_policy_rule = storage
-            .upsert_rule(
-                Some("rule_invalid_policy".into()),
-                "DOMAIN",
-                "example.com",
-                "Missing Group",
-                None,
-                true,
+        storage
+            .create_rule_set(
+                "rs_not_downloaded",
+                "not-downloaded",
+                "https://example.com/not-downloaded.txt",
+                3_600,
+                Some("domain"),
+                "text",
             )
             .await
-            .expect("create invalid policy rule");
-
-        let result = service
-            .test_rule(RuleTestRequest {
-                target: "example.com".into(),
-            })
-            .await
-            .expect("test invalid policy rule");
-        assert_eq!(result.hit_rule.id, invalid_policy_rule.id);
-        assert_eq!(result.final_proxy, BUILTIN_REJECT);
-
-        storage
-            .delete_rule(&invalid_policy_rule.id)
-            .await
-            .expect("delete invalid policy rule");
+            .expect("create rule set without a snapshot");
         let missing_snapshot_rule = storage
             .upsert_rule(
                 Some("rule_missing_snapshot".into()),
@@ -782,9 +1439,9 @@ payload:
             .await
             .expect("connect test storage");
         storage
-            .upsert_proxy_item(&test_runtime_item("Broken JSON", "node", Some("{")))
+            .upsert_proxy_item(&test_runtime_item("Broken JSON", "node", Some("{}")))
             .await
-            .expect("store malformed node");
+            .expect("store initially valid node");
         storage
             .upsert_proxy_item(&test_runtime_item("Missing JSON", "node", None))
             .await
@@ -799,7 +1456,7 @@ payload:
                 &["Broken JSON".into(), "Missing JSON".into()],
             )
             .await
-            .expect("store unavailable members");
+            .expect("store dependent members");
         storage
             .upsert_rule(
                 Some("rule_unavailable_runtime_group".into()),
@@ -810,7 +1467,11 @@ payload:
                 true,
             )
             .await
-            .expect("store unavailable policy rule");
+            .expect("store initially available policy rule");
+        storage
+            .upsert_proxy_item(&test_runtime_item("Broken JSON", "node", Some("{")))
+            .await
+            .expect("corrupt the last valid member after the rule was stored");
 
         let service = RuleService::new(storage.clone(), paths.clone());
         let result = service

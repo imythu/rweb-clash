@@ -12,6 +12,13 @@ use tokio::sync::Mutex;
 const SYSTEM_PROXY_BACKUP_VERSION: u8 = 1;
 static SYSTEM_PROXY_OPERATION: Mutex<()> = Mutex::const_new(());
 
+fn platform_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(0x0800_0000);
+    command
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SystemProxyBackup {
     version: u8,
@@ -550,7 +557,7 @@ $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 }
 exit 1
 "#;
-    let output = Command::new("powershell")
+    let output = platform_command("powershell")
         .args([
             "-NoProfile",
             "-ExecutionPolicy",
@@ -570,6 +577,8 @@ exit 1
 
 #[cfg(all(unix, not(target_os = "macos")))]
 async fn validate_tun_permissions_inner() -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+
     let status = tokio::fs::read_to_string("/proc/self/status")
         .await
         .map_err(|err| format!("TUN mode requires CAP_NET_ADMIN on Linux: {err}"))?;
@@ -581,11 +590,26 @@ async fn validate_tun_permissions_inner() -> Result<(), String> {
     let caps = u64::from_str_radix(cap_eff, 16)
         .map_err(|err| format!("TUN mode requires CAP_NET_ADMIN on Linux: {err}"))?;
     const CAP_NET_ADMIN: u64 = 1 << 12;
-    if caps & CAP_NET_ADMIN != 0 {
-        Ok(())
-    } else {
-        Err("TUN mode requires CAP_NET_ADMIN on Linux. Start rweb-clash with CAP_NET_ADMIN, run as root, or disable TUN mode.".into())
+    if caps & CAP_NET_ADMIN == 0 {
+        return Err("TUN mode requires CAP_NET_ADMIN on Linux. Start rweb-clash with CAP_NET_ADMIN, run as root, or disable TUN mode.".into());
     }
+
+    const TUN_DEVICE: &str = "/dev/net/tun";
+    let metadata = tokio::fs::metadata(TUN_DEVICE)
+        .await
+        .map_err(|err| format!("TUN mode requires {TUN_DEVICE}: {err}"))?;
+    if !metadata.file_type().is_char_device() {
+        return Err(format!(
+            "TUN mode requires {TUN_DEVICE} to be a character device"
+        ));
+    }
+    tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(TUN_DEVICE)
+        .await
+        .map_err(|err| format!("TUN mode requires read/write access to {TUN_DEVICE}: {err}"))?;
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", not(any(target_os = "windows", unix))))]
@@ -829,7 +853,7 @@ public static extern bool InternetSetOption(System.IntPtr hInternet, int dwOptio
 [WinInet.NativeMethods]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
 [WinInet.NativeMethods]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
 "#;
-    let _ = Command::new("powershell")
+    let _ = platform_command("powershell")
         .args([
             "-NoProfile",
             "-ExecutionPolicy",
@@ -1249,7 +1273,7 @@ async fn run_command(program: &str, args: &[&str]) -> Result<(), AppError> {
 }
 
 async fn command_output(program: &str, args: &[&str]) -> Result<String, AppError> {
-    let output = Command::new(program)
+    let output = platform_command(program)
         .args(args)
         .output()
         .await

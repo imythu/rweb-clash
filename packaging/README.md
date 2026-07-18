@@ -8,8 +8,8 @@
 | --- | --- | --- | --- |
 | macOS arm64 | Tauri 桌面应用 | `apps/desktop/src-tauri` | `.dmg` / `.app` |
 | Windows amd64 | Tauri 桌面应用 | `apps/desktop/src-tauri` | `.msi` / `.exe` |
-| Linux amd64 | 后端 + 前端单二进制 | `crates/rweb-clash-bin` | `rweb-clash` / Docker 镜像 |
-| Linux arm64 | 后端 + 前端单二进制 | `crates/rweb-clash-bin` | `rweb-clash` / Docker 镜像 |
+| Linux amd64 | 后端 + 前端静态单二进制 | `crates/rweb-clash-bin` | `.bin` / `.tar.gz` / Docker 镜像 |
+| Linux arm64 | 后端 + 前端静态单二进制 | `crates/rweb-clash-bin` | `.bin` / `.tar.gz` / Docker 镜像 |
 
 ## 发布原则
 
@@ -49,7 +49,7 @@ packaging/
 5. 执行 `pnpm --dir web install --frozen-lockfile` 和 `pnpm --dir web build`。
 6. 按目标平台构建：
    - macOS/Windows：复制 core、默认规则集和 GeoIP 资源到 Tauri resource，再执行 Tauri build。
-   - Linux：把 `web/dist`、core、默认规则集和 GeoIP 资源作为编译期资源嵌入 `rweb-clash-bin`。
+   - Linux：用 musl 静态目标把 `web/dist`、core、默认规则集和 GeoIP 资源嵌入 `rweb-clash-bin`。
 
 GitHub Release 前必须按 [`release-checklist.md`](release-checklist.md) 核对目标平台、产物和 Docker manifest。
 
@@ -137,7 +137,7 @@ Tauri 覆盖 macOS arm64 和 Windows amd64。Linux 不使用 Tauri。resources �
 
 ## Linux 单二进制
 
-Linux 目标是不依赖 Tauri，产出一个可执行文件，同时提供后端 API 和前端静态资源。
+Linux 目标是不依赖 Tauri，产出可跨常见发行版运行的 musl 静态可执行文件，同时提供后端 API 和前端静态资源。Release 同时发布独立 `.bin` 和包含 systemd 安装器的 `.tar.gz`。
 
 构建步骤：
 
@@ -145,5 +145,7 @@ Linux 目标是不依赖 Tauri，产出一个可执行文件，同时提供后�
 2. 准备 `packaging/cache/cores/linux-amd64/mihomo` 或 `packaging/cache/cores/linux-arm64/mihomo`。
 3. 准备 `packaging/cache/rule-sets/`。
 4. 准备 `packaging/cache/runtime/geoip.metadb` 与 manifest。
-5. `cargo build --release -p rweb-clash-bin --features embedded-assets`。
+5. `cross build --release --locked --target <arch>-unknown-linux-musl -p rweb-clash-bin --features embedded-assets`。
 6. 启动时释放内置资源到 root_dir。
+
+服务器或 Docker 宿主使用压缩包内的 `install-systemd.sh` 安装 system service；桌面 Linux 可继续使用 `install.sh` 安装 user service。详细约束见 [`linux/README.md`](linux/README.md)。

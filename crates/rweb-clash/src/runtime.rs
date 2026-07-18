@@ -21,7 +21,7 @@ pub async fn compile_runtime_yaml(
     paths: &AppPaths,
     config: &SystemConfig,
 ) -> Result<std::path::PathBuf, AppError> {
-    let proxy_plan = build_runtime_proxy_plan(storage).await?;
+    let proxy_plan = build_runtime_proxy_plan(storage, config.store_selected).await?;
     let rule_sets = storage.rule_sets_for_runtime().await?;
     let rules = storage.list_rules().await?;
     info!(
@@ -58,6 +58,7 @@ pub async fn compile_runtime_yaml(
         yaml_value(config.tcp_concurrent),
     );
     insert(&mut root, "unified-delay", yaml_value(config.unified_delay));
+    insert(&mut root, "profile", profile_mapping(config));
     if config.dns_enabled {
         insert(&mut root, "dns", dns_mapping(config));
     }
@@ -125,12 +126,13 @@ pub async fn compile_runtime_yaml(
 pub(crate) async fn available_policy_targets(
     storage: &Storage,
 ) -> Result<HashSet<String>, AppError> {
-    Ok(build_runtime_proxy_plan(storage).await?.available)
+    Ok(build_runtime_proxy_plan(storage, false).await?.available)
 }
 
-async fn build_runtime_proxy_plan(storage: &Storage) -> Result<RuntimeProxyPlan, AppError> {
-    storage.sync_builtin_proxy_group().await?;
-    crate::proxy::reconcile_custom_groups(storage).await?;
+async fn build_runtime_proxy_plan(
+    storage: &Storage,
+    restore_persisted_selections: bool,
+) -> Result<RuntimeProxyPlan, AppError> {
     let items = storage.proxy_items_for_runtime().await?;
     let mut proxies = Vec::new();
     let mut available_nodes = HashSet::new();
@@ -153,7 +155,13 @@ async fn build_runtime_proxy_plan(storage: &Storage) -> Result<RuntimeProxyPlan,
         }
     }
 
-    let (groups, available_groups) = build_groups(storage, &items, &available_nodes).await?;
+    let (groups, available_groups) = build_groups(
+        storage,
+        &items,
+        &available_nodes,
+        restore_persisted_selections,
+    )
+    .await?;
     let available = available_nodes
         .into_iter()
         .chain(available_groups)
@@ -170,21 +178,85 @@ async fn build_groups(
     storage: &Storage,
     items: &[ProxyItemRecord],
     available_nodes: &HashSet<String>,
+    restore_persisted_selections: bool,
 ) -> Result<(Vec<Value>, HashSet<String>), AppError> {
     let mut member_map = HashMap::new();
+    let nodes = items
+        .iter()
+        .filter(|item| item.kind == "node" && item.enabled && !item.filtered_out)
+        .map(|item| crate::types::ProxyNodeResponse {
+            name: item.name.clone(),
+            display_name: item.display_name.clone(),
+            protocol: item.protocol.clone().unwrap_or_else(|| "unknown".into()),
+            latency: item.latency_ms.unwrap_or(0),
+            country: item.country.clone(),
+            subscription_id: item.subscription_id.clone(),
+            subscription_name: item.source_name.clone(),
+        })
+        .collect::<Vec<_>>();
     for item in items
         .iter()
         .filter(|item| item.kind == "group" && item.enabled && !item.filtered_out)
     {
-        member_map.insert(item.name.clone(), storage.group_members(&item.name).await?);
+        let members = if item.source == "custom" {
+            let filters = storage.group_filters(&item.name).await?;
+            crate::proxy::calculate_members(&nodes, &filters)
+        } else {
+            storage.group_members(&item.name).await?
+        };
+        member_map.insert(item.name.clone(), members);
     }
-    build_groups_from_members(items, member_map, available_nodes)
+    let mut builtin_members = nodes
+        .iter()
+        .map(|node| node.name.clone())
+        .collect::<Vec<_>>();
+    let candidate_groups = member_map
+        .keys()
+        .filter(|name| name.as_str() != BUILTIN_PROXY)
+        .cloned()
+        .collect::<Vec<_>>();
+    for group_name in candidate_groups {
+        if !group_depends_on(&member_map, &group_name, BUILTIN_PROXY, &mut HashSet::new()) {
+            builtin_members.push(group_name);
+        }
+    }
+    member_map.insert(BUILTIN_PROXY.into(), builtin_members);
+    build_groups_from_members(
+        items,
+        member_map,
+        available_nodes,
+        restore_persisted_selections,
+    )
+}
+
+fn group_depends_on(
+    member_map: &HashMap<String, Vec<String>>,
+    group_name: &str,
+    target: &str,
+    visiting: &mut HashSet<String>,
+) -> bool {
+    if group_name == target {
+        return true;
+    }
+    if !visiting.insert(group_name.to_string()) {
+        return false;
+    }
+    let depends = member_map.get(group_name).is_some_and(|members| {
+        members.iter().any(|member| {
+            member == target
+                || (member_map.contains_key(member)
+                    && group_depends_on(member_map, member, target, visiting))
+        })
+    });
+    visiting.remove(group_name);
+    depends
 }
 
 fn build_groups_from_members(
     items: &[ProxyItemRecord],
     mut member_map: HashMap<String, Vec<String>>,
     available_nodes: &HashSet<String>,
+    restore_persisted_selections: bool,
 ) -> Result<(Vec<Value>, HashSet<String>), AppError> {
     let available_groups = resolve_available_groups(&member_map, available_nodes)?;
 
@@ -205,6 +277,23 @@ fn build_groups_from_members(
         });
         if item.name == BUILTIN_PROXY && members.is_empty() {
             members.push(BUILTIN_DIRECT.into());
+        }
+        if restore_persisted_selections && item.group_type.as_deref() == Some("select") {
+            let selected = serde_json::from_str::<serde_json::Value>(&item.strategy_json)
+                .ok()
+                .and_then(|strategy| {
+                    strategy
+                        .get("now")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
+            if let Some(index) = selected
+                .as_deref()
+                .and_then(|selected| members.iter().position(|member| member == selected))
+            {
+                let selected = members.remove(index);
+                members.insert(0, selected);
+            }
         }
         let mut mapping = Mapping::new();
         insert(&mut mapping, "name", Value::String(item.name.clone()));
@@ -230,6 +319,40 @@ fn build_groups_from_members(
         groups.push(Value::Mapping(mapping));
     }
     Ok((groups, available_groups))
+}
+
+pub(crate) fn available_policy_targets_from_assets(
+    items: &[ProxyItemRecord],
+    group_members: &HashMap<String, Vec<String>>,
+) -> Result<HashSet<String>, AppError> {
+    let available_nodes = items
+        .iter()
+        .filter(|item| {
+            item.kind == "node"
+                && item.enabled
+                && !item.filtered_out
+                && item
+                    .raw_json
+                    .as_deref()
+                    .is_some_and(|raw| serde_json::from_str::<serde_json::Value>(raw).is_ok())
+        })
+        .map(|item| item.name.clone())
+        .collect::<HashSet<_>>();
+    let enabled_group_members = items
+        .iter()
+        .filter(|item| item.kind == "group" && item.enabled && !item.filtered_out)
+        .map(|item| {
+            (
+                item.name.clone(),
+                group_members.get(&item.name).cloned().unwrap_or_default(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let available_groups = resolve_available_groups(&enabled_group_members, &available_nodes)?;
+    Ok(available_nodes
+        .into_iter()
+        .chain(available_groups)
+        .collect())
 }
 
 pub(crate) fn subscription_candidate_yaml(
@@ -262,7 +385,7 @@ pub(crate) fn subscription_candidate_yaml(
     }
 
     let member_map = group_members.iter().cloned().collect::<HashMap<_, _>>();
-    let (mut groups, _) = build_groups_from_members(items, member_map, &available_nodes)?;
+    let (mut groups, _) = build_groups_from_members(items, member_map, &available_nodes, false)?;
     groups.insert(0, builtin_proxy_group());
 
     let mut root = Mapping::new();
@@ -395,6 +518,16 @@ fn dns_mapping(config: &SystemConfig) -> Value {
         ]),
     );
     Value::Mapping(dns)
+}
+
+fn profile_mapping(config: &SystemConfig) -> Value {
+    let mut profile = Mapping::new();
+    insert(
+        &mut profile,
+        "store-selected",
+        yaml_value(config.store_selected),
+    );
+    Value::Mapping(profile)
 }
 
 fn tun_mapping() -> Value {
@@ -539,6 +672,76 @@ mod tests {
             .and_then(Value::as_str);
 
         assert_eq!(listen, Some("127.0.0.1:1053"));
+    }
+
+    #[test]
+    fn profile_respects_the_store_selected_setting() {
+        for expected in [false, true] {
+            let config = SystemConfig {
+                store_selected: expected,
+                ..SystemConfig::default()
+            };
+            let actual = profile_mapping(&config)
+                .as_mapping()
+                .and_then(|mapping| mapping.get(Value::String("store-selected".into())))
+                .and_then(Value::as_bool);
+
+            assert_eq!(actual, Some(expected));
+        }
+    }
+
+    #[test]
+    fn select_groups_only_restore_persisted_selection_when_enabled() {
+        let group = ProxyItemRecord {
+            name: "Strategy".into(),
+            kind: "group".into(),
+            subscription_id: None,
+            display_name: "Strategy".into(),
+            source: "custom".into(),
+            builtin: false,
+            source_name: None,
+            protocol: None,
+            country: None,
+            group_type: Some("select".into()),
+            raw_json: None,
+            content_hash: None,
+            latency_ms: None,
+            alive: true,
+            filtered_out: false,
+            filter_reason: None,
+            delay_ms: None,
+            tolerance_ms: None,
+            url: None,
+            interval_seconds: None,
+            strategy_json: serde_json::json!({ "now": "Node B" }).to_string(),
+            position: 1024,
+            enabled: true,
+        };
+        let member_map =
+            HashMap::from([("Strategy".into(), vec!["Node A".into(), "Node B".into()])]);
+        let available_nodes = HashSet::from(["Node A".into(), "Node B".into()]);
+
+        for (restore, expected) in [
+            (false, vec!["Node A", "Node B"]),
+            (true, vec!["Node B", "Node A"]),
+        ] {
+            let (groups, _) = build_groups_from_members(
+                std::slice::from_ref(&group),
+                member_map.clone(),
+                &available_nodes,
+                restore,
+            )
+            .expect("build select group");
+            let proxies = groups[0]
+                .as_mapping()
+                .and_then(|mapping| mapping.get(Value::String("proxies".into())))
+                .and_then(Value::as_sequence)
+                .expect("proxy members")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            assert_eq!(proxies, expected);
+        }
     }
 
     #[tokio::test]

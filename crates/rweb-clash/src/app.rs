@@ -45,6 +45,7 @@ struct AppInner {
     egress_probe: EgressProbe,
     config_update: Mutex<()>,
     runtime_operation: Mutex<()>,
+    rule_set_operation: Mutex<()>,
     background_started: OnceCell<()>,
     _data_root_lock: DataRootLock,
     _global_app_lock: GlobalAppLock,
@@ -115,6 +116,23 @@ impl App {
             "initializing rweb-clash app"
         );
         let storage = Storage::connect(&paths).await?;
+        let rule_service = RuleService::new(storage.clone(), paths.clone());
+        match rule_service.cleanup_orphan_snapshots().await {
+            Ok(report) if report.failed > 0 => warn!(
+                removed = report.removed,
+                failed = report.failed,
+                "rule-set snapshot startup cleanup completed with errors"
+            ),
+            Ok(report) if report.removed > 0 => info!(
+                removed = report.removed,
+                "removed orphan rule-set snapshots during startup"
+            ),
+            Ok(_) => {}
+            Err(error) => warn!(
+                %error,
+                "failed to run rule-set snapshot startup cleanup; a later startup will retry"
+            ),
+        }
         crate::bootstrap::bootstrap_runtime_assets(
             &paths,
             &storage,
@@ -131,12 +149,13 @@ impl App {
                 embedded_assets: options.embedded_assets,
                 subscription_syncer: SubscriptionSyncer::new(storage.clone(), paths.clone()),
                 proxy_service: ProxyService::new(storage.clone()),
-                rule_service: RuleService::new(storage.clone(), paths.clone()),
+                rule_service,
                 egress_probe: EgressProbe::new(),
                 storage,
                 core,
                 config_update: Mutex::new(()),
                 runtime_operation: Mutex::new(()),
+                rule_set_operation: Mutex::new(()),
                 background_started: OnceCell::new(),
                 _data_root_lock: data_root_lock,
                 _global_app_lock: global_app_lock,
@@ -171,6 +190,14 @@ impl App {
                 complete_system_proxy_recovery(&app.system_proxy_backup_path()).await?;
             }
         }
+        if config.system_proxy && !config.auto_start {
+            let mut disabled = config.clone();
+            disabled.system_proxy = false;
+            apply_system_proxy(&disabled, &app.system_proxy_backup_path()).await?;
+            app.inner.storage.save_config(&disabled).await?;
+            config = disabled;
+            info!("disabled persisted system proxy because automatic core start is off");
+        }
         info!(
             mode = %config.mode,
             mixed_port = config.mixed_port,
@@ -183,7 +210,7 @@ impl App {
             let _runtime_operation = app.inner.runtime_operation.lock().await;
             compile_runtime_yaml(&app.inner.storage, &app.inner.paths, &config).await?;
         }
-        if config.auto_start || config.system_proxy {
+        if config.auto_start {
             info!(
                 auto_start = config.auto_start,
                 system_proxy = config.system_proxy,
@@ -376,8 +403,15 @@ impl App {
         })
     }
 
-    pub async fn egress(&self) -> EgressResponse {
-        self.inner.egress_probe.probe().await
+    pub async fn egress(&self) -> Result<EgressResponse, AppError> {
+        let config = self.config().await?;
+        let core = self
+            .inner
+            .core
+            .snapshot(config.external_controller.clone())
+            .await;
+        let proxy_url = egress_proxy_url(&core.state, config.mixed_port);
+        self.inner.egress_probe.probe(proxy_url.as_deref()).await
     }
 
     pub async fn core_status(&self) -> Result<CoreStatusResponse, AppError> {
@@ -426,6 +460,7 @@ impl App {
                 };
             }
         }
+        self.synchronize_proxy_selections(&config, true).await?;
         Ok(status)
     }
 
@@ -439,6 +474,7 @@ impl App {
         );
         let mut disabled = config.clone();
         disabled.system_proxy = false;
+        disabled.auto_start = false;
         let proxy_disable = if config.system_proxy {
             self.inner.storage.save_config(&disabled).await?;
             begin_system_proxy_disable(&disabled, &self.system_proxy_backup_path()).await?
@@ -474,6 +510,9 @@ impl App {
         };
         if proxy_disable.is_some() {
             complete_system_proxy_recovery(&self.system_proxy_backup_path()).await?;
+        }
+        if config.auto_start && !config.system_proxy {
+            self.inner.storage.save_config(&disabled).await?;
         }
         Ok(status)
     }
@@ -538,6 +577,7 @@ impl App {
         } else if proxy_disable.is_some() {
             complete_system_proxy_recovery(&self.system_proxy_backup_path()).await?;
         }
+        self.synchronize_proxy_selections(&config, true).await?;
         Ok(status)
     }
 
@@ -557,6 +597,8 @@ impl App {
         input: SubscriptionInput,
     ) -> Result<Vec<SubscriptionResponse>, AppError> {
         validate_subscription_input(&input)?;
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
         let id = new_id("sub");
         info!(
             subscription_id = %id,
@@ -568,7 +610,7 @@ impl App {
         );
         self.inner
             .storage
-            .create_subscription(
+            .create_pending_subscription(
                 &id,
                 input.name.trim(),
                 input.url.trim(),
@@ -577,11 +619,47 @@ impl App {
                 &input.rules,
             )
             .await?;
-        if let Err(err) = self.inner.subscription_syncer.refresh(&id).await {
-            let _ = self.refresh_runtime().await;
-            return Err(err);
+        if let Err(err) = self
+            .inner
+            .subscription_syncer
+            .refresh(&id, core_was_running)
+            .await
+        {
+            return match self.inner.storage.delete_subscription(&id).await {
+                Ok(()) => Err(err),
+                Err(rollback_error) => Err(AppError::internal(format!(
+                    "initial subscription refresh failed ({err}); deleting the new subscription failed ({rollback_error})"
+                ))),
+            };
         }
-        self.refresh_runtime().await?;
+        if let Err(error) = self.refresh_runtime_locked(core_was_running).await {
+            let delete_result = self.inner.storage.delete_subscription(&id).await;
+            let runtime_restore = if delete_result.is_ok() {
+                self.refresh_runtime_locked(core_was_running).await
+            } else {
+                Ok(())
+            };
+            return match (delete_result, runtime_restore) {
+                (Ok(()), Ok(())) => Err(error),
+                (delete_result, runtime_restore) => Err(AppError::internal(format!(
+                    "activating a new subscription failed ({error}); deleting it: {delete_result:?}; restoring runtime: {runtime_restore:?}"
+                ))),
+            };
+        }
+        if let Err(error) = self.inner.storage.activate_subscription(&id).await {
+            let delete_result = self.inner.storage.delete_subscription(&id).await;
+            let runtime_restore = if delete_result.is_ok() {
+                self.refresh_runtime_locked(core_was_running).await
+            } else {
+                Ok(())
+            };
+            return match (delete_result, runtime_restore) {
+                (Ok(()), Ok(())) => Err(error),
+                (delete_result, runtime_restore) => Err(AppError::internal(format!(
+                    "finalizing a new subscription failed ({error}); deleting it: {delete_result:?}; restoring runtime: {runtime_restore:?}"
+                ))),
+            };
+        }
         self.list_subscriptions().await
     }
 
@@ -591,6 +669,8 @@ impl App {
         input: SubscriptionInput,
     ) -> Result<Vec<SubscriptionResponse>, AppError> {
         validate_subscription_input(&input)?;
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
         let refresh_guard = self.inner.subscription_syncer.lock_refresh(id).await;
         let previous = self
             .list_subscriptions()
@@ -622,7 +702,12 @@ impl App {
                 &input.rules,
             )
             .await?;
-        if let Err(err) = self.inner.subscription_syncer.refresh_locked(id).await {
+        if let Err(err) = self
+            .inner
+            .subscription_syncer
+            .refresh_locked(id, core_was_running)
+            .await
+        {
             let previous_rules = previous
                 .rules
                 .iter()
@@ -652,25 +737,60 @@ impl App {
                     "subscription refresh failed ({err}); restoring the previous subscription settings failed ({rollback_error})"
                 )));
             }
-            let _ = self.refresh_runtime().await;
             return Err(err);
         }
         drop(refresh_guard);
-        self.refresh_runtime().await?;
+        self.refresh_runtime_locked(core_was_running).await?;
         self.list_subscriptions().await
     }
 
     pub async fn delete_subscription(&self, id: &str) -> Result<(), AppError> {
         info!(subscription_id = %id, "deleting subscription");
-        self.inner.storage.delete_subscription(id).await?;
-        self.refresh_runtime().await?;
+        self.inner.storage.get_subscription_url(id).await?;
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
+        let _refresh_guard = self.inner.subscription_syncer.lock_refresh(id).await;
+        self.inner.storage.stage_subscription_deletion(id).await?;
+        if let Err(error) = self.refresh_runtime_locked(core_was_running).await {
+            let metadata_restore = self.inner.storage.restore_subscription_deletion(id).await;
+            let runtime_restore = if metadata_restore.is_ok() {
+                self.refresh_runtime_locked(core_was_running).await
+            } else {
+                Ok(())
+            };
+            return match (metadata_restore, runtime_restore) {
+                (Ok(()), Ok(())) => Err(error),
+                (metadata_restore, runtime_restore) => Err(AppError::internal(format!(
+                    "deactivating subscription {id} failed ({error}); restoring metadata: {metadata_restore:?}; restoring runtime: {runtime_restore:?}"
+                ))),
+            };
+        }
+        if let Err(error) = self.inner.storage.delete_subscription(id).await {
+            let metadata_restore = self.inner.storage.restore_subscription_deletion(id).await;
+            let runtime_restore = if metadata_restore.is_ok() {
+                self.refresh_runtime_locked(core_was_running).await
+            } else {
+                Ok(())
+            };
+            return match (metadata_restore, runtime_restore) {
+                (Ok(()), Ok(())) => Err(error),
+                (metadata_restore, runtime_restore) => Err(AppError::internal(format!(
+                    "committing subscription deletion {id} failed ({error}); restoring metadata: {metadata_restore:?}; restoring runtime: {runtime_restore:?}"
+                ))),
+            };
+        }
         Ok(())
     }
 
     pub async fn refresh_subscription(&self, id: &str) -> Result<(), AppError> {
         info!(subscription_id = %id, "refreshing subscription");
-        self.inner.subscription_syncer.refresh(id).await?;
-        self.refresh_runtime().await?;
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
+        self.inner
+            .subscription_syncer
+            .refresh(id, core_was_running)
+            .await?;
+        self.refresh_runtime_locked(core_was_running).await?;
         Ok(())
     }
 
@@ -682,6 +802,11 @@ impl App {
         &self,
         rules: Vec<FilterRuleInput>,
     ) -> Result<Vec<crate::types::FilterRule>, AppError> {
+        for rule in &rules {
+            validate_filter_rule_input(rule)?;
+        }
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
         info!(
             rules = rules.len(),
             "replacing global subscription filter rules"
@@ -698,7 +823,12 @@ impl App {
             .await?;
         let mut refresh_failures = Vec::new();
         for id in subscription_ids {
-            if let Err(error) = self.inner.subscription_syncer.refresh(&id).await {
+            if let Err(error) = self
+                .inner
+                .subscription_syncer
+                .refresh(&id, core_was_running)
+                .await
+            {
                 warn!(
                     subscription_id = %id,
                     error = %error,
@@ -707,7 +837,7 @@ impl App {
                 refresh_failures.push((id, error));
             }
         }
-        let runtime_result = self.refresh_runtime().await;
+        let runtime_result = self.refresh_runtime_locked(core_was_running).await;
         if let Some((first_id, mut first_error)) = refresh_failures.into_iter().next() {
             first_error.message = format!(
                 "global filters were saved, but refreshing inherited subscription {first_id} failed: {}",
@@ -725,6 +855,8 @@ impl App {
     }
 
     pub async fn create_proxy_group(&self, input: ProxyGroupRequest) -> Result<(), AppError> {
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
         info!(
             name = %input.name.trim(),
             group_type = %input.group_type,
@@ -732,7 +864,7 @@ impl App {
             "creating proxy group"
         );
         self.inner.proxy_service.create_group(input).await?;
-        self.refresh_runtime().await
+        self.refresh_runtime_locked(core_was_running).await
     }
 
     pub async fn update_proxy_group(
@@ -740,6 +872,8 @@ impl App {
         group: &str,
         input: ProxyGroupRequest,
     ) -> Result<(), AppError> {
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
         info!(
             group = %group,
             name = %input.name.trim(),
@@ -748,13 +882,15 @@ impl App {
             "updating proxy group"
         );
         self.inner.proxy_service.update_group(group, input).await?;
-        self.refresh_runtime().await
+        self.refresh_runtime_locked(core_was_running).await
     }
 
     pub async fn delete_proxy_group(&self, group: &str) -> Result<(), AppError> {
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
         info!(group = %group, "deleting proxy group");
         self.inner.storage.delete_custom_group(group).await?;
-        self.refresh_runtime().await
+        self.refresh_runtime_locked(core_was_running).await
     }
 
     pub async fn select_proxy(
@@ -763,13 +899,35 @@ impl App {
         request: SelectProxyRequest,
     ) -> Result<OperationResponse, AppError> {
         info!(group = %group, name = %request.name, "selecting proxy");
-        self.inner
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let controller = if self.inner.core.is_running().await {
+            Some(self.controller_client().await?)
+        } else {
+            None
+        };
+        let previous = self
+            .inner
             .storage
             .set_group_now(group, &request.name)
             .await?;
-        if self.inner.core.is_running().await {
-            let controller = self.controller_client().await?;
-            controller.select_proxy(group, &request.name).await?;
+        if let Some(controller) = controller {
+            if let Err(error) = controller.select_proxy(group, &request.name).await {
+                let controller_rollback = match previous.as_deref() {
+                    Some(previous) => controller.select_proxy(group, previous).await,
+                    None => Ok(()),
+                };
+                let storage_rollback = self
+                    .inner
+                    .storage
+                    .restore_group_now(group, previous.as_deref())
+                    .await;
+                return match (controller_rollback, storage_rollback) {
+                    (Ok(()), Ok(())) => Err(error),
+                    (controller_rollback, storage_rollback) => Err(AppError::internal(format!(
+                        "proxy selection failed ({error}); controller rollback: {controller_rollback:?}; persistence rollback: {storage_rollback:?}"
+                    ))),
+                };
+            }
         }
         Ok(OperationResponse::ok("proxy updated"))
     }
@@ -821,6 +979,8 @@ impl App {
     }
 
     pub async fn create_rule(&self, input: RuleInput) -> Result<RuleResponse, AppError> {
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
         info!(
             rule_type = %input.rule_type,
             policy = %input.policy,
@@ -828,11 +988,13 @@ impl App {
             "creating routing rule"
         );
         let rule = self.inner.rule_service.create_rule(input).await?;
-        self.refresh_runtime().await?;
+        self.refresh_runtime_locked(core_was_running).await?;
         Ok(rule)
     }
 
     pub async fn update_rule(&self, id: &str, input: RuleInput) -> Result<RuleResponse, AppError> {
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
         info!(
             rule_id = %id,
             rule_type = %input.rule_type,
@@ -841,17 +1003,20 @@ impl App {
             "updating routing rule"
         );
         let rule = self.inner.rule_service.update_rule(id, input).await?;
-        self.refresh_runtime().await?;
+        self.refresh_runtime_locked(core_was_running).await?;
         Ok(rule)
     }
 
     pub async fn delete_rule(&self, id: &str) -> Result<(), AppError> {
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
         info!(rule_id = %id, "deleting routing rule");
         self.inner.storage.delete_rule(id).await?;
-        self.refresh_runtime().await
+        self.refresh_runtime_locked(core_was_running).await
     }
 
     pub async fn test_rule(&self, input: RuleTestRequest) -> Result<RuleTestResponse, AppError> {
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
         self.inner.rule_service.test_rule(input).await
     }
 
@@ -860,6 +1025,9 @@ impl App {
     }
 
     pub async fn create_rule_set(&self, input: RuleSetInput) -> Result<RuleSetResponse, AppError> {
+        let _rule_set_operation = self.inner.rule_set_operation.lock().await;
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
         info!(
             name = %input.name.trim(),
             format = %input.format.as_deref().unwrap_or("text"),
@@ -867,20 +1035,149 @@ impl App {
             "creating rule set"
         );
         let rule_set = self.inner.rule_service.create_rule_set(input).await?;
-        self.refresh_runtime().await?;
+        if let Err(error) = self.refresh_runtime_locked(core_was_running).await {
+            let delete_result = self.inner.rule_service.delete_rule_set(&rule_set.id).await;
+            let runtime_restore = if delete_result.is_ok() {
+                self.refresh_runtime_locked(core_was_running).await
+            } else {
+                Ok(())
+            };
+            return match (delete_result, runtime_restore) {
+                (Ok(()), Ok(())) => Err(error),
+                (delete_result, runtime_restore) => Err(AppError::internal(format!(
+                    "activating a new rule set failed ({error}); deleting it: {delete_result:?}; restoring runtime: {runtime_restore:?}"
+                ))),
+            };
+        }
+        if let Err(error) = self.inner.storage.activate_rule_set(&rule_set.id).await {
+            let delete_result = self.inner.rule_service.delete_rule_set(&rule_set.id).await;
+            let runtime_restore = if delete_result.is_ok() {
+                self.refresh_runtime_locked(core_was_running).await
+            } else {
+                Ok(())
+            };
+            self.cleanup_rule_set_snapshots().await;
+            return match (delete_result, runtime_restore) {
+                (Ok(()), Ok(())) => Err(error),
+                (delete_result, runtime_restore) => Err(AppError::internal(format!(
+                    "finalizing a new rule set failed ({error}); deleting it: {delete_result:?}; restoring runtime: {runtime_restore:?}"
+                ))),
+            };
+        }
+        self.cleanup_rule_set_snapshots().await;
         Ok(rule_set)
     }
 
     pub async fn refresh_rule_set(&self, id: &str) -> Result<(), AppError> {
+        let _rule_set_operation = self.inner.rule_set_operation.lock().await;
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
         info!(rule_set_id = %id, "refreshing rule set");
-        self.inner.rule_service.refresh_rule_set(id).await?;
-        self.refresh_runtime().await
+        let previous = self.inner.rule_service.refresh_rule_set(id).await?;
+        if let Err(error) = self.refresh_runtime_locked(core_was_running).await {
+            let metadata_restore = self
+                .inner
+                .rule_service
+                .restore_rule_set_refresh(id, &previous)
+                .await;
+            let runtime_restore = if metadata_restore.is_ok() {
+                self.refresh_runtime_locked(core_was_running).await
+            } else {
+                Ok(())
+            };
+            if metadata_restore.is_ok() {
+                if let Err(mark_error) = self
+                    .inner
+                    .storage
+                    .mark_rule_set_refresh_error(id, &error.message)
+                    .await
+                {
+                    warn!(rule_set_id = %id, %mark_error, "failed to persist rule-set activation error");
+                }
+            }
+            self.cleanup_rule_set_snapshots().await;
+            return match (metadata_restore, runtime_restore) {
+                (Ok(()), Ok(())) => Err(error),
+                (metadata_restore, runtime_restore) => Err(AppError::internal(format!(
+                    "activating refreshed rule set {id} failed ({error}); restoring metadata: {metadata_restore:?}; restoring runtime: {runtime_restore:?}"
+                ))),
+            };
+        }
+        if let Err(error) = self.inner.storage.activate_rule_set(id).await {
+            let metadata_restore = self
+                .inner
+                .rule_service
+                .restore_rule_set_refresh(id, &previous)
+                .await;
+            let runtime_restore = if metadata_restore.is_ok() {
+                self.refresh_runtime_locked(core_was_running).await
+            } else {
+                Ok(())
+            };
+            if metadata_restore.is_ok() {
+                if let Err(mark_error) = self
+                    .inner
+                    .storage
+                    .mark_rule_set_refresh_error(id, &error.message)
+                    .await
+                {
+                    warn!(rule_set_id = %id, %mark_error, "failed to persist rule-set commit error");
+                }
+            }
+            self.cleanup_rule_set_snapshots().await;
+            return match (metadata_restore, runtime_restore) {
+                (Ok(()), Ok(())) => Err(error),
+                (metadata_restore, runtime_restore) => Err(AppError::internal(format!(
+                    "committing refreshed rule set {id} failed ({error}); restoring metadata: {metadata_restore:?}; restoring runtime: {runtime_restore:?}"
+                ))),
+            };
+        }
+        self.cleanup_rule_set_snapshots().await;
+        Ok(())
     }
 
     pub async fn delete_rule_set(&self, id: &str) -> Result<(), AppError> {
+        let _rule_set_operation = self.inner.rule_set_operation.lock().await;
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
         info!(rule_set_id = %id, "deleting rule set");
-        self.inner.storage.delete_rule_set(id).await?;
-        self.refresh_runtime().await
+        self.inner.storage.stage_rule_set_deletion(id).await?;
+        if let Err(error) = self.refresh_runtime_locked(core_was_running).await {
+            let metadata_restore = self.inner.storage.restore_rule_set_deletion(id).await;
+            let runtime_restore = if metadata_restore.is_ok() {
+                self.refresh_runtime_locked(core_was_running).await
+            } else {
+                Ok(())
+            };
+            return match (metadata_restore, runtime_restore) {
+                (Ok(()), Ok(())) => Err(error),
+                (metadata_restore, runtime_restore) => Err(AppError::internal(format!(
+                    "deactivating rule set {id} failed ({error}); restoring metadata: {metadata_restore:?}; restoring runtime: {runtime_restore:?}"
+                ))),
+            };
+        }
+        if let Err(error) = self.inner.rule_service.delete_rule_set(id).await {
+            let metadata_restore = self.inner.storage.restore_rule_set_deletion(id).await;
+            let runtime_restore = if metadata_restore.is_ok() {
+                self.refresh_runtime_locked(core_was_running).await
+            } else {
+                Ok(())
+            };
+            return match (metadata_restore, runtime_restore) {
+                (Ok(()), Ok(())) => Err(error),
+                (metadata_restore, runtime_restore) => Err(AppError::internal(format!(
+                    "committing rule-set deletion {id} failed ({error}); restoring metadata: {metadata_restore:?}; restoring runtime: {runtime_restore:?}"
+                ))),
+            };
+        }
+        self.cleanup_rule_set_snapshots().await;
+        Ok(())
+    }
+
+    async fn cleanup_rule_set_snapshots(&self) {
+        if let Err(error) = self.inner.rule_service.cleanup_orphan_snapshots().await {
+            warn!(%error, "failed to clean obsolete rule-set snapshots");
+        }
     }
 
     pub async fn logs(
@@ -978,10 +1275,14 @@ impl App {
 
     pub async fn flush_dns(&self) -> Result<(), AppError> {
         if self.inner.core.is_running().await {
-            let controller = self.controller_client().await?;
-            let _ = controller.flush_dns().await;
+            self.flush_controller_dns().await?;
         }
         Ok(())
+    }
+
+    async fn flush_controller_dns(&self) -> Result<(), AppError> {
+        let controller = self.controller_client().await?;
+        controller.flush_dns().await
     }
 
     pub async fn shutdown(&self) -> Result<(), AppError> {
@@ -1018,6 +1319,43 @@ impl App {
         ControllerClient::new(config.external_controller, Some(config.secret))
     }
 
+    async fn synchronize_proxy_selections(
+        &self,
+        config: &SystemConfig,
+        core_was_restarted: bool,
+    ) -> Result<(), AppError> {
+        if !config.store_selected {
+            if core_was_restarted {
+                self.inner.storage.clear_group_selections().await?;
+            }
+            return Ok(());
+        }
+        let controller = ControllerClient::new(
+            config.external_controller.clone(),
+            Some(config.secret.clone()),
+        )?;
+        let (groups, _) = self.inner.storage.proxy_topology().await?;
+        for group in groups
+            .into_iter()
+            .filter(|group| group.group_type == "select")
+        {
+            let Some(selected) = group.now else {
+                continue;
+            };
+            controller
+                .select_proxy(&group.name, &selected)
+                .await
+                .map_err(|mut error| {
+                    error.message = format!(
+                        "failed to replay persisted selection {selected} for group {}: {}",
+                        group.name, error.message
+                    );
+                    error
+                })?;
+        }
+        Ok(())
+    }
+
     fn core_start_config(&self, config: &SystemConfig, runtime_yaml: PathBuf) -> CoreStartConfig {
         CoreStartConfig {
             controller_addr: config.external_controller.clone(),
@@ -1029,11 +1367,9 @@ impl App {
         }
     }
 
-    async fn refresh_runtime(&self) -> Result<(), AppError> {
-        let _runtime_operation = self.inner.runtime_operation.lock().await;
+    async fn refresh_runtime_locked(&self, should_run: bool) -> Result<(), AppError> {
         let config = self.config().await?;
-        let core_is_running = self.inner.core.is_running().await;
-        self.activate_runtime_config(&config, &config, core_is_running)
+        self.activate_runtime_config(&config, &config, should_run)
             .await
             .map(|_| ())
             .map_err(|error| error.error)
@@ -1101,6 +1437,7 @@ impl App {
                 .await
                 .is_ok()
             {
+                self.synchronize_proxy_selections(config, false).await?;
                 return Ok(false);
             }
             warn!("controller reload failed, restarting mihomo");
@@ -1183,6 +1520,7 @@ impl App {
                         RuntimeActivationError::new(error, external_proxy_preserved)
                     })?;
             }
+            self.synchronize_proxy_selections(config, true).await?;
             return Ok(external_proxy_preserved);
         }
 
@@ -1196,6 +1534,7 @@ impl App {
         if config.system_proxy {
             apply_system_proxy(config, &self.system_proxy_backup_path()).await?;
         }
+        self.synchronize_proxy_selections(config, true).await?;
         Ok(false)
     }
 
@@ -1300,11 +1639,11 @@ impl App {
         if !due_subs.is_empty() {
             info!(
                 count = due_subs.len(),
-                "refreshing startup-due subscriptions before runtime compile"
+                "refreshing startup-due subscriptions"
             );
         }
         for id in due_subs {
-            if let Err(err) = self.inner.subscription_syncer.refresh(&id).await {
+            if let Err(err) = self.refresh_subscription(&id).await {
                 warn!("startup subscription refresh failed for {id}: {err}");
             }
         }
@@ -1317,7 +1656,7 @@ impl App {
             );
         }
         for id in ids {
-            if let Err(err) = self.inner.rule_service.refresh_rule_set(&id).await {
+            if let Err(err) = self.refresh_rule_set(&id).await {
                 warn!("startup rule set refresh failed for {id}: {err}");
             }
         }
@@ -1450,7 +1789,7 @@ impl App {
                 info!(count = due_subs.len(), "found due subscriptions");
             }
             for id in due_subs {
-                if let Err(err) = self.inner.subscription_syncer.refresh(&id).await {
+                if let Err(err) = self.refresh_subscription(&id).await {
                     warn!("subscription auto refresh failed for {id}: {err}");
                 }
             }
@@ -1464,11 +1803,10 @@ impl App {
                 info!(count = due_rule_sets.len(), "found due rule sets");
             }
             for id in due_rule_sets {
-                if let Err(err) = self.inner.rule_service.refresh_rule_set(&id).await {
+                if let Err(err) = self.refresh_rule_set(&id).await {
                     warn!("rule set auto refresh failed for {id}: {err}");
                 }
             }
-            let _ = self.refresh_runtime().await;
         }
     }
 
@@ -1495,6 +1833,10 @@ fn startup_recovery_disables_proxy_intent(
     recovery_failed: bool,
 ) -> bool {
     external_changes_preserved || recovery_failed
+}
+
+fn egress_proxy_url(core_state: &str, mixed_port: u16) -> Option<String> {
+    (core_state == "running").then(|| format!("http://127.0.0.1:{mixed_port}"))
 }
 
 fn requires_early_system_proxy_persist(current: &SystemConfig, attempted: &SystemConfig) -> bool {
@@ -1651,18 +1993,44 @@ fn validate_subscription_input(input: &SubscriptionInput) -> Result<(), AppError
         ));
     }
     for rule in &input.rules {
-        if rule.is_pattern_empty() {
-            return Err(AppError::bad_request(
-                "subscription_rule_invalid",
-                "subscription filter pattern cannot be empty",
-            ));
-        }
-        if rule.match_type == "regex" && regex::Regex::new(&rule.pattern).is_err() {
-            return Err(AppError::bad_request(
-                "subscription_rule_invalid_regex",
-                format!("invalid subscription filter regex {}", rule.pattern),
-            ));
-        }
+        validate_filter_rule_input(rule)?;
+    }
+    Ok(())
+}
+
+fn validate_filter_rule_input(rule: &FilterRuleInput) -> Result<(), AppError> {
+    if !matches!(rule.action.trim(), "keep" | "include" | "引入" | "discard") {
+        return Err(AppError::bad_request(
+            "subscription_rule_invalid",
+            format!("unsupported subscription filter action {}", rule.action),
+        ));
+    }
+    if !matches!(
+        rule.match_type.trim(),
+        "contains" | "not_contains" | "notContains" | "regex" | "in" | "equals"
+    ) {
+        return Err(AppError::bad_request(
+            "subscription_rule_invalid",
+            format!("unsupported subscription filter type {}", rule.match_type),
+        ));
+    }
+    let match_type = rule.match_type.trim();
+    let has_match_value = if matches!(match_type, "in" | "equals") {
+        !rule.is_pattern_empty()
+    } else {
+        !rule.pattern.trim().is_empty()
+    };
+    if !has_match_value {
+        return Err(AppError::bad_request(
+            "subscription_rule_invalid",
+            "subscription filter pattern cannot be empty",
+        ));
+    }
+    if rule.match_type.trim() == "regex" && regex::Regex::new(rule.pattern.trim()).is_err() {
+        return Err(AppError::bad_request(
+            "subscription_rule_invalid_regex",
+            format!("invalid subscription filter regex {}", rule.pattern),
+        ));
     }
     Ok(())
 }
@@ -1670,6 +2038,8 @@ fn validate_subscription_input(input: &SubscriptionInput) -> Result<(), AppError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::routing::post;
+    use axum::Router;
     use std::path::Path;
     use std::time::Duration;
 
@@ -1722,6 +2092,7 @@ mod tests {
                 core,
                 config_update: Mutex::new(()),
                 runtime_operation: Mutex::new(()),
+                rule_set_operation: Mutex::new(()),
                 background_started: OnceCell::new(),
                 _data_root_lock: data_root_lock,
                 _global_app_lock: global_app_lock,
@@ -1758,6 +2129,58 @@ mod tests {
         assert_eq!(error.code, "data_root_in_use");
         assert!(stale_candidate.is_file());
         assert!(!paths.database_file.exists());
+    }
+
+    #[tokio::test]
+    async fn initialize_retries_cleanup_of_an_orphan_rule_set_snapshot() {
+        let temp = TestDir::new("orphan-rule-set-startup-cleanup");
+        let paths = AppPaths::from_root(temp.path());
+        paths.ensure_dirs().expect("create app paths");
+        let orphan = paths.rule_sets_dir.join("rs_deleted.list");
+        std::fs::write(&orphan, b"example.com\n").expect("write orphan snapshot");
+        let global_lock_path = temp.path().join("test-global-app.lock");
+        let global_app_lock =
+            GlobalAppLock::acquire_at(&global_lock_path).expect("acquire test global lock");
+
+        let _app = App::initialize_with_global_lock(
+            AppOptions {
+                root_dir: Some(temp.path().to_path_buf()),
+                ..AppOptions::default()
+            },
+            paths,
+            global_app_lock,
+        )
+        .await
+        .expect("initialize app");
+
+        assert!(!orphan.exists());
+    }
+
+    #[tokio::test]
+    async fn initialize_keeps_core_stopped_when_auto_start_is_disabled() {
+        let temp = TestDir::new("initialize-core-stopped");
+        let paths = AppPaths::from_root(temp.path());
+        paths.ensure_dirs().expect("create app paths");
+        let global_lock_path = temp.path().join("test-global-app.lock");
+        let global_app_lock =
+            GlobalAppLock::acquire_at(&global_lock_path).expect("acquire test global lock");
+
+        let app = App::initialize_with_global_lock(
+            AppOptions {
+                root_dir: Some(temp.path().to_path_buf()),
+                ..AppOptions::default()
+            },
+            paths,
+            global_app_lock,
+        )
+        .await
+        .expect("initialize app");
+
+        assert!(!app.config().await.expect("load config").auto_start);
+        assert_eq!(
+            app.core_status().await.expect("load core status").state,
+            "not_running"
+        );
     }
 
     #[tokio::test]
@@ -1819,6 +2242,17 @@ mod tests {
     }
 
     #[test]
+    fn egress_uses_mihomo_only_while_the_core_is_running() {
+        assert_eq!(
+            egress_proxy_url("running", 7890).as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        for state in ["not_running", "starting", "stopping", "error"] {
+            assert_eq!(egress_proxy_url(state, 7890), None);
+        }
+    }
+
+    #[test]
     fn external_takeover_or_recovery_failure_disables_proxy_intent() {
         let mut config = SystemConfig {
             system_proxy: true,
@@ -1839,6 +2273,62 @@ mod tests {
         assert!(requires_early_system_proxy_persist(&disabled, &enabled));
         assert!(requires_early_system_proxy_persist(&enabled, &disabled));
         assert!(!requires_early_system_proxy_persist(&enabled, &enabled));
+    }
+
+    #[test]
+    fn subscription_filter_enums_reject_silent_fallbacks() {
+        let valid = FilterRuleInput {
+            action: "keep".into(),
+            match_type: "contains".into(),
+            pattern: "HK".into(),
+            ..FilterRuleInput::default()
+        };
+        assert!(validate_filter_rule_input(&valid).is_ok());
+
+        let mut invalid_action = valid.clone();
+        invalid_action.action = "kepe".into();
+        assert_eq!(
+            validate_filter_rule_input(&invalid_action)
+                .expect_err("reject an action typo")
+                .code,
+            "subscription_rule_invalid"
+        );
+
+        let mut invalid_type = valid;
+        invalid_type.match_type = "contain".into();
+        assert_eq!(
+            validate_filter_rule_input(&invalid_type)
+                .expect_err("reject a match type typo")
+                .code,
+            "subscription_rule_invalid"
+        );
+
+        for match_type in ["contains", "not_contains", "notContains", "regex"] {
+            let invalid_values_only = FilterRuleInput {
+                action: "keep".into(),
+                match_type: match_type.into(),
+                pattern: String::new(),
+                values: vec!["HK".into()],
+                ..FilterRuleInput::default()
+            };
+            assert_eq!(
+                validate_filter_rule_input(&invalid_values_only)
+                    .expect_err("unrelated values must not hide an empty pattern")
+                    .code,
+                "subscription_rule_invalid"
+            );
+        }
+
+        for match_type in ["in", "equals"] {
+            let valid_values_only = FilterRuleInput {
+                action: "keep".into(),
+                match_type: match_type.into(),
+                pattern: String::new(),
+                values: vec!["HK".into()],
+                ..FilterRuleInput::default()
+            };
+            assert!(validate_filter_rule_input(&valid_values_only).is_ok());
+        }
     }
 
     #[test]
@@ -1873,6 +2363,44 @@ mod tests {
         assert!(!proxy_safe_rollback_config(&previous, true, true).system_proxy);
         assert!(proxy_safe_rollback_config(&previous, false, true).system_proxy);
         assert!(!proxy_safe_rollback_config(&previous, false, false).system_proxy);
+    }
+
+    #[tokio::test]
+    async fn flush_dns_preserves_controller_errors() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake controller");
+        let address = listener.local_addr().expect("fake controller address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/cache/fakeip/flush",
+                    post(|| async { axum::http::StatusCode::BAD_GATEWAY }),
+                ),
+            )
+            .await
+        });
+
+        let temp = TestDir::new("flush-dns-controller-error");
+        let app = test_app(temp.path()).await;
+        let mut config = app.config().await.expect("load config");
+        config.external_controller = address.to_string();
+        config.secret.clear();
+        app.inner
+            .storage
+            .save_config(&config)
+            .await
+            .expect("save fake controller address");
+
+        let error = app
+            .flush_controller_dns()
+            .await
+            .expect_err("controller error must be returned");
+
+        assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(error.code, "controller_unexpected_status");
+        server.abort();
     }
 
     #[tokio::test]
@@ -1943,5 +2471,34 @@ mod tests {
         let after_rollback = app.list_subscriptions().await.expect("list subscriptions");
         assert_eq!(after_rollback[0].name, "Refreshed");
         assert_eq!(after_rollback[0].url, "http://127.0.0.1:1/refreshed");
+    }
+
+    #[tokio::test]
+    async fn failed_initial_subscription_refresh_rolls_back_the_new_record() {
+        let temp = TestDir::new("subscription-create-rollback");
+        let app = test_app(temp.path()).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.create_subscription(SubscriptionInput {
+                name: "Unreachable".into(),
+                url: "http://127.0.0.1:1/profile.yaml".into(),
+                interval_seconds: Some(3_600),
+                interval: None,
+                inherit_global: Some(true),
+                rules: Vec::new(),
+            }),
+        )
+        .await
+        .expect("initial refresh should fail promptly")
+        .expect_err("unreachable subscription must fail");
+        assert!(matches!(
+            result.code.as_str(),
+            "network_unreachable" | "remote_private_address_blocked" | "subscription_fetch_failed"
+        ));
+        assert!(app
+            .list_subscriptions()
+            .await
+            .expect("list subscriptions after rollback")
+            .is_empty());
     }
 }

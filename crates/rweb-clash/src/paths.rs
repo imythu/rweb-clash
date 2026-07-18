@@ -83,6 +83,10 @@ impl AppPaths {
         format!("data/profiles/rule-sets/{id}.list")
     }
 
+    pub fn rule_set_version_relative_path(&self, id: &str, version: &str) -> String {
+        format!("data/profiles/rule-sets/{id}.{version}.list")
+    }
+
     pub fn resolve_local_path(&self, local_path: &str) -> PathBuf {
         let normalized = local_path.replace('\\', "/");
         if let Some(file_name) = normalized.strip_prefix("data/rule-sets/") {
@@ -183,6 +187,10 @@ mod tests {
         assert_eq!(
             paths.rule_set_relative_path("rs_1"),
             "data/profiles/rule-sets/rs_1.list"
+        );
+        assert_eq!(
+            paths.rule_set_version_relative_path("rs_1", "abc123"),
+            "data/profiles/rule-sets/rs_1.abc123.list"
         );
     }
 

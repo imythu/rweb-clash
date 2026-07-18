@@ -29,6 +29,31 @@ import { usePageActivity } from '@/lib/usePageActivity';
 const REALTIME_POLL_MS = 5000;
 const STATUS_POLL_MS = 15000;
 const EGRESS_POLL_MS = 300000;
+const EGRESS_CACHE_KEY = 'rweb-clash:egress:v1';
+const EMPTY_EGRESS: Egress = { ip: null, provider: null, country: null, source: null };
+
+const readCachedEgress = (): Egress => {
+  try {
+    const cached = JSON.parse(localStorage.getItem(EGRESS_CACHE_KEY) ?? 'null') as Partial<Egress> | null;
+    if (!cached || typeof cached.ip !== 'string' || cached.ip.length === 0) return EMPTY_EGRESS;
+    return {
+      ip: cached.ip,
+      provider: typeof cached.provider === 'string' ? cached.provider : null,
+      country: typeof cached.country === 'string' ? cached.country : null,
+      source: typeof cached.source === 'string' ? cached.source : null,
+    };
+  } catch {
+    return EMPTY_EGRESS;
+  }
+};
+
+const writeCachedEgress = (value: Egress) => {
+  try {
+    localStorage.setItem(EGRESS_CACHE_KEY, JSON.stringify(value));
+  } catch {
+    // Storage may be unavailable in private or restricted webviews.
+  }
+};
 
 const DEFAULT_SYSTEM_CONFIG: SystemConfig = {
   allow_lan: false,
@@ -298,11 +323,14 @@ export const Dashboard = () => {
   const [config, setConfig] = useState<SystemConfig>(DEFAULT_SYSTEM_CONFIG);
   const [coreStatus, setCoreStatus] = useState<CoreStatus | null>(null);
   const [coreAction, setCoreAction] = useState<CoreAction | null>(null);
-  const [egress, setEgress] = useState<Egress>({ ip: null, provider: null, country: null });
+  const [egress, setEgress] = useState<Egress>(readCachedEgress);
+  const [egressLoading, setEgressLoading] = useState(false);
   const realtimeInFlight = useRef(false);
-  const statusInFlight = useRef(false);
-  const configInFlight = useRef(false);
-  const egressInFlight = useRef(false);
+  const statusRequest = useRef<{ controller: AbortController; generation: number } | null>(null);
+  const statusGeneration = useRef(0);
+  const egressRequest = useRef<{ controller: AbortController; generation: number } | null>(null);
+  const egressGeneration = useRef(0);
+  const previousEgressCoreState = useRef<CoreStatus['state'] | null>(null);
   const isPageActive = usePageActivity();
 
   const fetchRealtime = useCallback(async () => {
@@ -322,45 +350,56 @@ export const Dashboard = () => {
     }
   }, [isPageActive]);
 
-  const fetchStatus = useCallback(async () => {
-    if (!isPageActive || document.hidden || statusInFlight.current) return;
-    statusInFlight.current = true;
+  const fetchStatus = useCallback(async (force = false) => {
+    if (!isPageActive || document.hidden) return;
+    if (statusRequest.current && !force) return;
+    statusRequest.current?.controller.abort();
+    const generation = ++statusGeneration.current;
+    const controller = new AbortController();
+    statusRequest.current = { controller, generation };
     try {
-      const status = await api.systemStatus();
+      const status = await api.systemStatus(controller.signal);
+      if (statusRequest.current?.generation !== generation) return;
       setActiveMode(status.config.mode || 'rule');
       setConfig(status.config);
       setCoreStatus(status.core);
     } catch (e) {
-      console.error("Fetch status error:", e);
+      if (!(e instanceof DOMException && e.name === 'AbortError')) {
+        console.error("Fetch status error:", e);
+      }
     } finally {
-      statusInFlight.current = false;
+      if (statusRequest.current?.generation === generation) {
+        statusRequest.current = null;
+      }
     }
   }, [isPageActive]);
 
-  const fetchConfig = useCallback(async () => {
-    if (!isPageActive || document.hidden || configInFlight.current) return;
-    configInFlight.current = true;
+  const fetchEgress = useCallback(async (force = false) => {
+    if (!isPageActive || document.hidden) return;
+    if (egressRequest.current && !force) return;
+    egressRequest.current?.controller.abort();
+    const generation = ++egressGeneration.current;
+    const controller = new AbortController();
+    egressRequest.current = { controller, generation };
+    setEgressLoading(true);
     try {
-      const nextConfig = await api.getConfig();
-      setActiveMode(nextConfig.mode || 'rule');
-      setConfig(nextConfig);
+      const egressInfo = await api.systemEgress(controller.signal);
+      if (egressRequest.current?.generation !== generation) return;
+      if (egressInfo.ip) {
+        writeCachedEgress(egressInfo);
+        setEgress(egressInfo);
+      } else {
+        setEgress((current) => current.ip ? current : egressInfo);
+      }
     } catch (e) {
-      console.error("Fetch config error:", e);
+      if (!(e instanceof DOMException && e.name === 'AbortError')) {
+        console.error("Fetch egress error:", e);
+      }
     } finally {
-      configInFlight.current = false;
-    }
-  }, [isPageActive]);
-
-  const fetchEgress = useCallback(async () => {
-    if (!isPageActive || document.hidden || egressInFlight.current) return;
-    egressInFlight.current = true;
-    try {
-      const egressInfo = await api.systemEgress();
-      setEgress(egressInfo);
-    } catch (e) {
-      console.error("Fetch egress error:", e);
-    } finally {
-      egressInFlight.current = false;
+      if (egressRequest.current?.generation === generation) {
+        egressRequest.current = null;
+        setEgressLoading(false);
+      }
     }
   }, [isPageActive]);
 
@@ -370,7 +409,6 @@ export const Dashboard = () => {
     const fetchAll = () => {
       void fetchRealtime();
       void fetchStatus();
-      void fetchConfig();
       void fetchEgress();
     };
     const handleVisibilityChange = () => {
@@ -383,18 +421,35 @@ export const Dashboard = () => {
     const statusTimer = window.setInterval(fetchStatus, STATUS_POLL_MS);
     const egressTimer = window.setInterval(fetchEgress, EGRESS_POLL_MS);
     return () => {
+      statusGeneration.current += 1;
+      statusRequest.current?.controller.abort();
+      statusRequest.current = null;
+      egressGeneration.current += 1;
+      egressRequest.current?.controller.abort();
+      egressRequest.current = null;
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.clearInterval(realtimeTimer);
       window.clearInterval(statusTimer);
       window.clearInterval(egressTimer);
     };
-  }, [fetchRealtime, fetchStatus, fetchConfig, fetchEgress, isPageActive]);
+  }, [fetchRealtime, fetchStatus, fetchEgress, isPageActive]);
+
+  useEffect(() => {
+    const nextState = coreStatus?.state;
+    if (!nextState) return;
+    const previousState = previousEgressCoreState.current;
+    previousEgressCoreState.current = nextState;
+    if (previousState !== null && previousState !== nextState) {
+      void fetchEgress(true);
+    }
+  }, [coreStatus?.state, fetchEgress]);
 
   const updateConfig = async (updates: Partial<SystemConfig>) => {
     try {
       const nextConfig = await api.patchConfig(updates);
       setConfig(nextConfig);
       if (updates.mode) setActiveMode(updates.mode);
+      await Promise.all([fetchStatus(true), fetchEgress(true)]);
       toast('状态同步成功', 'success');
     } catch {
       toast('同步失败', 'error');
@@ -410,9 +465,10 @@ export const Dashboard = () => {
         : action === 'stop'
           ? await api.stopCore()
           : await api.restartCore();
+      previousEgressCoreState.current = nextCore.state;
       setCoreStatus(nextCore);
       toast(coreActionMessages[action], 'success');
-      await Promise.all([fetchRealtime(), fetchStatus(), fetchEgress()]);
+      await Promise.all([fetchRealtime(), fetchStatus(true), fetchEgress(true)]);
     } catch (e) {
       console.error("Core action error:", e);
       toast(e instanceof ApiError ? e.message : '内核操作失败', 'error');
@@ -487,8 +543,16 @@ export const Dashboard = () => {
                   Primary Ingress profiling
                </div>
                <div className="space-y-1">
-                  <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">出口 IP 地理画像</p>
-                  <p className="text-3xl md:text-6xl font-mono font-black tracking-tighter">{egress.ip ?? '未连接'}</p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">出口 IP 地理画像</p>
+                    {egress.source && (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-bold text-muted-foreground">
+                        <Radio className="size-3" />
+                        数据源 {egress.source}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-3xl md:text-6xl font-mono font-black tracking-tighter">{egress.ip ?? (egressLoading ? '检测中' : '未连接')}</p>
                </div>
                <div className="flex flex-wrap gap-4 pt-2">
                  <div className="flex items-center gap-2 text-sm font-black uppercase tracking-tight text-foreground bg-muted px-4 py-2 rounded-xl">

@@ -412,6 +412,8 @@ pub struct ProxyTopologyResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProxyGroupResponse {
     pub name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
     #[serde(rename = "type")]
     pub group_type: String,
     pub source: String,
@@ -427,6 +429,8 @@ pub struct ProxyGroupResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProxyNodeResponse {
     pub name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
     #[serde(rename = "type")]
     pub protocol: String,
     pub latency: i64,
@@ -607,11 +611,12 @@ pub struct SetupStatusResponse {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct EgressResponse {
     pub ip: Option<String>,
     pub provider: Option<String>,
     pub country: Option<String>,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

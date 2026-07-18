@@ -50,7 +50,8 @@ const isSystemBuiltinGroup = (group: Pick<ProxyGroup, 'builtin' | 'source'>) =>
 const isManagedGroup = (group: Pick<ProxyGroup, 'builtin' | 'source'>) =>
   isSystemBuiltinGroup(group) || group.source === 'subscription';
 
-const displayRuntimeName = (name: string) => name.split(SUB_DELIMITER)[0] || name;
+const displayRuntimeName = (name: string, displayName?: string | null) =>
+  displayName || name.split(SUB_DELIMITER)[0] || name;
 
 const COUNTRY_PRESET_PREFIX = '国家 · ';
 const COUNTRY_PRESET_DISABLED_KEY = 'rweb-clash.country-presets-disabled';
@@ -182,6 +183,7 @@ interface SemanticBlock {
   operator: string;
   value: string;
   values: string[];
+  enabled: boolean;
 }
 
 type NormalizableBlock = Partial<GroupFilter> & { field?: string };
@@ -189,8 +191,8 @@ type NormalizableBlock = Partial<GroupFilter> & { field?: string };
 const normalizeBlock = (block: NormalizableBlock): SemanticBlock => {
   const type = block.type || block.field || 'name';
   const rawOperator = block.operator || (type === 'latency' ? 'less_than' : (type === 'country' ? 'in' : 'contains'));
-  const rawValue = String(block.value || '');
-  const rawValues = Array.isArray(block.values) ? block.values.map(String).filter(Boolean) : [];
+  const rawValue = String(block.value || '').trim();
+  const rawValues = Array.isArray(block.values) ? block.values.map(String).map(value => value.trim()).filter(Boolean) : [];
   const values = rawValues.length > 0
     ? rawValues
     : rawOperator === 'in'
@@ -209,8 +211,14 @@ const normalizeBlock = (block: NormalizableBlock): SemanticBlock => {
     operator,
     value: operator === 'in' ? '' : rawValue,
     values,
+    enabled: block.enabled !== false,
   };
 };
+
+const hasBlockValue = (block: SemanticBlock) =>
+  block.type === 'status' || Boolean(block.value.trim()) || block.values.some(value => Boolean(value.trim()));
+
+const shouldPersistBlock = (block: SemanticBlock) => !block.enabled || hasBlockValue(block);
 
 interface CreateGroupDrawerProps {
   isOpen: boolean;
@@ -249,7 +257,7 @@ const CreateGroupDrawer = ({ isOpen, onClose, onSave, allNodes, initialData }: C
   };
 
   const nodeOptionLabel = (node: ProxyNode) => {
-    const nodeLabel = displayRuntimeName(node.name);
+    const nodeLabel = displayRuntimeName(node.name, node.displayName);
     const subLabel = node.subscriptionName;
     return subLabel ? `${nodeLabel} / ${subLabel}` : nodeLabel;
   };
@@ -269,65 +277,66 @@ const CreateGroupDrawer = ({ isOpen, onClose, onSave, allNodes, initialData }: C
   })), [uniqueTypes]);
 
   const previewNodes = useMemo(() => {
-    let result = [...allNodes];
-    blocks.forEach(block => {
+    const activeBlocks = blocks.filter(block => block.enabled && hasBlockValue(block));
+    const hasKeep = activeBlocks.some(block => block.action === 'keep');
+    return allNodes.filter(n => {
+      let included = !hasKeep;
+      activeBlocks.forEach(block => {
       const blockValues = block.values ?? [];
-      if (!block.value && blockValues.length === 0 && block.type !== 'status') return;
+      const blockValue = block.value.trim();
       let expression: RegExp | null = null;
       if (block.operator === 'regex') {
         try {
-          expression = new RegExp(block.value, 'i');
+          expression = new RegExp(blockValue);
         } catch {
           return;
         }
       }
-      result = result.filter(n => {
-          let targetValue: string | number = '';
-          const nodeLabel = displayRuntimeName(n.name);
-          if (block.type === 'name') targetValue = block.operator === 'equals' || block.operator === 'in' ? n.name : nodeLabel;
-          else if (block.type === 'protocol') targetValue = n.type;
-          else if (block.type === 'country') targetValue = n.country || '';
-          else if (block.type === 'subscription') targetValue = n.subscriptionName || 'LOCAL';
-          else if (block.type === 'latency') targetValue = n.latency;
-          else if (block.type === 'status') targetValue = n.latency > 0 ? 'online' : 'timeout';
+        let targetValue: string | number = '';
+        const nodeLabel = displayRuntimeName(n.name, n.displayName);
+        if (block.type === 'name') targetValue = block.operator === 'equals' || block.operator === 'in' ? n.name : nodeLabel;
+        else if (block.type === 'protocol') targetValue = n.type;
+        else if (block.type === 'country') targetValue = n.country || '';
+        else if (block.type === 'subscription') targetValue = n.subscriptionName || 'LOCAL';
+        else if (block.type === 'latency') targetValue = n.latency;
+        else if (block.type === 'status') targetValue = n.latency > 0 ? 'online' : 'timeout';
 
-          let match = false;
-          if (block.type === 'latency') {
-            const numVal = parseInt(block.value);
-            if (isNaN(numVal)) return true;
-            match = n.latency > 0 && n.latency < numVal;
-          } else if (block.type === 'status') {
-            match = targetValue === 'timeout';
-          } else {
-            const target = String(targetValue).toLowerCase();
-            const val = block.value.toLowerCase();
-            switch (block.operator) {
-              case 'contains': match = target.includes(val); break;
-              case 'equals': match = target === val; break;
-              case 'in': match = blockValues.map(item => item.trim().toLowerCase()).filter(Boolean).includes(target); break;
-              case 'regex': match = expression?.test(String(targetValue)) ?? false; break;
-              case 'is': match = target === val; break;
-            }
+        let matched = false;
+        if (block.type === 'latency') {
+          const threshold = Number.parseInt(blockValue, 10);
+          matched = threshold === -1 ? n.latency <= 0 : n.latency > 0 && n.latency < threshold;
+        } else {
+          const target = String(targetValue).toLowerCase();
+          const value = (block.type === 'status' && !blockValue ? 'timeout' : blockValue).toLowerCase();
+          switch (block.operator) {
+            case 'contains': matched = target.includes(value); break;
+            case 'equals':
+            case 'is': matched = target === value; break;
+            case 'in': matched = blockValues.map(item => item.trim().toLowerCase()).filter(Boolean).includes(target); break;
+            case 'regex': matched = expression?.test(String(targetValue)) ?? false; break;
+            case 'starts_with': matched = target.startsWith(value); break;
           }
-          return block.action === 'keep' ? match : !match;
+        }
+        if (matched) included = block.action === 'keep';
       });
+      return included;
     });
-    return result;
   }, [blocks, allNodes]);
 
   const handleSave = async () => {
     if (!name.trim()) return toast('请填写分组名称', 'error');
     if (blocks.length > 0 && previewNodes.length === 0) return toast('当前规则未命中任何节点', 'error');
-    const filter = blocks.map(block => {
+    const filter = blocks.filter(shouldPersistBlock).map(block => {
       const base = {
         id: block.id,
         action: block.action,
         type: block.type,
         operator: block.operator,
+        enabled: block.enabled,
       };
       return block.operator === 'in'
-        ? { ...base, values: block.values }
-        : { ...base, value: block.value };
+        ? { ...base, values: block.values.map(value => value.trim()).filter(Boolean) }
+        : { ...base, value: block.value.trim() };
     });
     setIsSaving(true);
     try {
@@ -343,8 +352,9 @@ const CreateGroupDrawer = ({ isOpen, onClose, onSave, allNodes, initialData }: C
       action: 'keep',
       type,
       operator: type === 'name' ? 'contains' : (type === 'latency' ? 'less_than' : (type === 'country' ? 'in' : 'is')),
-      value: '',
-      values: []
+      value: type === 'status' ? 'timeout' : '',
+      values: [],
+      enabled: true,
     };
     setBlocks([...blocks, newBlock]);
   };
@@ -477,7 +487,7 @@ const CreateGroupDrawer = ({ isOpen, onClose, onSave, allNodes, initialData }: C
              </div>
              <div className="bg-muted/10 rounded-[2rem] border-2 border-dashed p-4 min-h-[150px] max-h-[300px] overflow-y-auto space-y-1 custom-scrollbar text-foreground">
                 {previewNodes.slice(0, 100).map(node => {
-                  const dName = displayRuntimeName(node.name);
+                  const dName = displayRuntimeName(node.name, node.displayName);
                   const sName = node.subscriptionName;
                   return (
                     <div key={node.name} className="flex items-center justify-between p-2.5 bg-background rounded-xl border border-border/60 text-foreground animate-in fade-in zoom-in-95">
@@ -537,6 +547,10 @@ export const Proxies = () => {
   }, [fetchData]);
 
   const activeGroup = useMemo(() => groups.find(g => g.name === activeGroupName), [groups, activeGroupName]);
+  const displayNameByRuntimeName = useMemo(() => new Map<string, string>([
+    ...groups.map(group => [group.name, displayRuntimeName(group.name, group.displayName)] as const),
+    ...nodes.map(node => [node.name, displayRuntimeName(node.name, node.displayName)] as const),
+  ]), [groups, nodes]);
   const subscriptionByAsset = useMemo(() => new Map<string, string>([
     ...groups.flatMap(group => group.subscriptionName ? [[group.name, group.subscriptionName] as const] : []),
     ...nodes.flatMap(node => node.subscriptionName ? [[node.name, node.subscriptionName] as const] : []),
@@ -545,14 +559,21 @@ export const Proxies = () => {
   const getNodesForGroup = useCallback((groupName: string) => {
     const group = groups.find(g => g.name === groupName);
     if (!group) return [];
-    return nodes.filter(n => group.all.includes(n.name)).filter(n => n.name.toLowerCase().includes(searchNode.toLowerCase())).sort((a, b) => (group.type === 'select' ? 0 : (a.latency || 9999) - (b.latency || 9999)));
+    const query = searchNode.toLowerCase();
+    return nodes.filter(n => group.all.includes(n.name)).filter(n => [
+      displayRuntimeName(n.name, n.displayName),
+      n.subscriptionName ?? '',
+    ].some(value => value.toLowerCase().includes(query))).sort((a, b) => (group.type === 'select' ? 0 : (a.latency || 9999) - (b.latency || 9999)));
   }, [groups, nodes, searchNode]);
 
   const getGroupsForGroup = useCallback((groupName: string) => {
     const group = groups.find(item => item.name === groupName);
     if (!group) return [];
     const query = searchNode.toLowerCase();
-    return groups.filter(item => item.name !== groupName && group.all.includes(item.name) && displayRuntimeName(item.name).toLowerCase().includes(query));
+    return groups.filter(item => item.name !== groupName && group.all.includes(item.name) && [
+      displayRuntimeName(item.name, item.displayName),
+      item.subscriptionName ?? '',
+    ].some(value => value.toLowerCase().includes(query)));
   }, [groups, searchNode]);
 
   const activeNodes = useMemo(() => {
@@ -685,7 +706,7 @@ export const Proxies = () => {
   const filteredGroups = useMemo(() => {
     const query = searchGroup.toLowerCase();
     return groups.filter(group => [
-      displayRuntimeName(group.name),
+      displayRuntimeName(group.name, group.displayName),
       group.subscriptionName ?? '',
     ].some(value => value.toLowerCase().includes(query)));
   }, [groups, searchGroup]);
@@ -720,7 +741,7 @@ export const Proxies = () => {
               const isActive = activeGroupName === group.name;
               const isSystemBuiltin = isSystemBuiltinGroup(group);
               const isReadOnly = isManagedGroup(group);
-              const dName = displayRuntimeName(group.name);
+              const dName = displayRuntimeName(group.name, group.displayName);
               const sName = group.subscriptionName;
               return (
                 <div key={group.name} onClick={() => setActiveGroupName(group.name)} className={cn("relative flex flex-col p-4 rounded-[1.25rem] cursor-pointer transition-all border-2 text-left", isActive ? "bg-primary/10 border-primary/30 shadow-sm" : "bg-transparent border-transparent hover:bg-muted/50")}>
@@ -758,7 +779,7 @@ export const Proxies = () => {
                     </div>
                     <div className="min-w-0 text-left text-foreground">
                       <div className="flex items-center gap-3">
-                          <h3 className="text-xl md:text-2xl font-black truncate">{displayRuntimeName(activeGroup.name)}</h3>
+                          <h3 className="text-xl md:text-2xl font-black truncate">{displayRuntimeName(activeGroup.name, activeGroup.displayName)}</h3>
                           {activeGroup.subscriptionName && <SubBadge name={activeGroup.subscriptionName} />}
                          {isSystemBuiltinGroup(activeGroup) && <span className="px-2 py-1 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[10px] font-black text-amber-600 shrink-0">系统内置</span>}
                       </div>
@@ -766,7 +787,7 @@ export const Proxies = () => {
                         <div className={cn("size-2 rounded-full", activeGroup.now ? "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]" : "bg-muted")} />
                         <span className="text-xs md:text-sm font-semibold text-muted-foreground">当前出口:</span>
                         <div className="flex items-center gap-1.5 min-w-0">
-                           <span className="text-xs md:text-sm font-bold truncate">{displayRuntimeName(activeGroup.now || 'DIRECT')}</span>
+                           <span className="text-xs md:text-sm font-bold truncate">{displayNameByRuntimeName.get(activeGroup.now || 'DIRECT') ?? displayRuntimeName(activeGroup.now || 'DIRECT')}</span>
                            {activeGroup.now && subscriptionByAsset.get(activeGroup.now) && <SubBadge name={subscriptionByAsset.get(activeGroup.now)!} />}
                         </div>
                       </div>
@@ -786,17 +807,17 @@ export const Proxies = () => {
                       const isActive = activeGroup.now === member.name;
                       return (
                         <div key={member.name} className={cn("relative flex min-h-28 flex-col p-4 rounded-2xl border-2 transition-all duration-200 text-left overflow-hidden", isActive ? "bg-primary/10 border-primary shadow-sm text-foreground font-bold" : "bg-background border-border/50 hover:border-primary/40 text-muted-foreground hover:text-foreground")}>
-                          <button type="button" aria-label={`选择策略组 ${displayRuntimeName(member.name)}`} aria-pressed={isActive} onClick={() => handleSelectNode(activeGroup.name, member.name)} disabled={!!isSwitching} className="absolute inset-0 z-0 rounded-2xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" />
+                          <button type="button" aria-label={`选择策略组 ${displayRuntimeName(member.name, member.displayName)}`} aria-pressed={isActive} onClick={() => handleSelectNode(activeGroup.name, member.name)} disabled={!!isSwitching} className="absolute inset-0 z-0 rounded-2xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" />
                           <div className="relative z-10 pointer-events-none flex h-full flex-col justify-between gap-3">
                             <div className="flex items-center justify-between"><span className="inline-flex items-center gap-1 rounded-md bg-primary/10 px-2 py-1 text-[9px] font-black text-primary"><Layers className="size-3" /> 策略组</span>{isActive && <CheckCircle2 className="size-4 text-primary" />}</div>
-                            <div className="min-w-0"><p className="truncate text-sm font-bold">{displayRuntimeName(member.name)}</p><p className="mt-1 text-[9px] font-bold text-muted-foreground">{GROUP_STRATEGY_LABELS[member.type] ?? member.type} · {member.all.length} 成员</p></div>
+                            <div className="min-w-0"><p className="truncate text-sm font-bold">{displayRuntimeName(member.name, member.displayName)}</p><p className="mt-1 text-[9px] font-bold text-muted-foreground">{GROUP_STRATEGY_LABELS[member.type] ?? member.type} · {member.all.length} 成员</p></div>
                           </div>
                           {isSwitching === member.name && <div className="absolute inset-0 z-20 bg-background/50 flex items-center justify-center"><Loader2 className="size-5 animate-spin text-primary" /></div>}
                         </div>
                       );
                     })}
                     {activeNodes.map(node => {
-                      const dName = displayRuntimeName(node.name);
+                      const dName = displayRuntimeName(node.name, node.displayName);
                       const sName = node.subscriptionName;
                       return (
                         <div key={node.name} className={cn("relative flex flex-col p-4 rounded-2xl border-2 transition-all duration-200 text-left overflow-hidden group/node", activeGroup.now === node.name ? "bg-primary/10 border-primary shadow-sm text-foreground font-bold" : "bg-background border-border/50 hover:border-primary/40 text-muted-foreground hover:text-foreground")}>
@@ -822,12 +843,12 @@ export const Proxies = () => {
                     <div className="flex items-center gap-4 px-4 py-2 text-[10px] font-black uppercase text-muted-foreground border-b mb-4"><div className="w-12 text-center">Rank</div><div className="flex-1 text-left">Identity</div><div className="w-24 text-right">Latency</div></div>
                     {activeMemberGroups.map((member, idx) => (
                       <div key={member.name} className={cn("flex items-center justify-between p-3.5 rounded-2xl border transition-all text-foreground", activeGroup.now === member.name ? "bg-primary/10 border-primary shadow-sm font-bold" : "bg-background border-border/40 text-muted-foreground")}>
-                        <div className="flex items-center gap-5 flex-1 min-w-0"><div className="w-8 h-8 rounded-lg bg-primary/10 text-primary flex items-center justify-center"><Layers className="size-4" /></div><div className="min-w-0"><p className="text-sm font-bold truncate">{displayRuntimeName(member.name)}</p><p className="text-[10px] text-muted-foreground">策略组 · {GROUP_STRATEGY_LABELS[member.type] ?? member.type}</p></div></div>
+                        <div className="flex items-center gap-5 flex-1 min-w-0"><div className="w-8 h-8 rounded-lg bg-primary/10 text-primary flex items-center justify-center"><Layers className="size-4" /></div><div className="min-w-0"><p className="text-sm font-bold truncate">{displayRuntimeName(member.name, member.displayName)}</p><p className="text-[10px] text-muted-foreground">策略组 · {GROUP_STRATEGY_LABELS[member.type] ?? member.type}</p></div></div>
                         <span className="text-[10px] font-bold text-muted-foreground">#{idx + 1}</span>
                       </div>
                     ))}
                     {activeNodes.map((node, idx) => {
-                      const dName = displayRuntimeName(node.name);
+                      const dName = displayRuntimeName(node.name, node.displayName);
                       const sName = node.subscriptionName;
                       return (
                         <div key={node.name} className={cn("flex items-center justify-between p-3.5 rounded-2xl border transition-all text-foreground", activeGroup.now === node.name ? "bg-primary/10 border-primary shadow-sm font-bold" : "bg-background border-border/40 hover:bg-card hover:border-border text-muted-foreground")}>
@@ -853,7 +874,7 @@ export const Proxies = () => {
           const isExpanded = expandedGroupMobile === group.name;
           const isSystemBuiltin = isSystemBuiltinGroup(group);
           const isReadOnly = isManagedGroup(group);
-          const dName = displayRuntimeName(group.name);
+          const dName = displayRuntimeName(group.name, group.displayName);
           const sName = group.subscriptionName;
           return (
             <div key={group.name} className={cn("flex flex-col shrink-0 rounded-[1.25rem] border-2 transition-all overflow-hidden text-foreground", isExpanded ? "bg-card border-primary/30 shadow-md" : "bg-card border-border/50")}>
@@ -866,13 +887,13 @@ export const Proxies = () => {
                       const isActive = group.now === member.name;
                       return (
                         <button key={member.name} type="button" onClick={() => handleSelectNode(group.name, member.name)} disabled={!!isSwitching || group.type !== 'select'} className={cn("w-full flex items-center justify-between p-3 rounded-xl border text-left", isActive ? "bg-primary/10 border-primary" : "bg-card border-border/50")}>
-                          <span className="flex min-w-0 items-center gap-2"><Layers className="size-4 shrink-0 text-primary" /><span className="truncate text-xs font-bold">{displayRuntimeName(member.name)}</span></span><span className="text-[9px] font-black text-primary">策略组</span>
+                          <span className="flex min-w-0 items-center gap-2"><Layers className="size-4 shrink-0 text-primary" /><span className="truncate text-xs font-bold">{displayRuntimeName(member.name, member.displayName)}</span></span><span className="text-[9px] font-black text-primary">策略组</span>
                         </button>
                       );
                     })}
                     {getNodesForGroup(group.name).map(node => {
                        const isNodeActive = group.now === node.name;
-                       const dN = displayRuntimeName(node.name);
+                       const dN = displayRuntimeName(node.name, node.displayName);
                        const sN = node.subscriptionName;
                        return (
                           <div key={node.name} className={cn("relative w-full flex items-center justify-between p-3 rounded-xl border transition-all text-left", isNodeActive ? "bg-primary/10 border-primary shadow-sm text-foreground font-bold" : "bg-card border-border/50 text-muted-foreground")}>

@@ -174,6 +174,13 @@ async fn bootstrap_rule_sets(
     embedded_assets: Option<&'static EmbeddedAssets>,
 ) -> Result<(), AppError> {
     for rule_set in storage.rule_sets_for_runtime().await? {
+        if rule_set
+            .local_path
+            .as_deref()
+            .is_some_and(|path| paths.resolve_local_path(path).is_file())
+        {
+            continue;
+        }
         let resource_path = format!("rule-sets/{}.list", rule_set.id);
         let target = paths.rule_sets_dir.join(format!("{}.list", rule_set.id));
         let copied = if target.is_file() {
@@ -222,6 +229,7 @@ async fn update_rule_set_local_path(
             None,
         )
         .await
+        .map(|_| ())
 }
 
 async fn copy_packaged_file(
@@ -550,6 +558,49 @@ mod tests {
         assert!(
             !due.iter().any(|due_id| due_id == id),
             "restored update {restored_update} was unexpectedly due: {due:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_preserves_an_existing_online_rule_set_version() {
+        let temp = TestDir::new("rweb-clash-bootstrap-online-rule-set");
+        let paths = AppPaths::from_root(temp.path().join("runtime"));
+        paths.ensure_dirs().unwrap();
+        let storage = Storage::connect(&paths).await.unwrap();
+        let id = "rs_bootstrap_refresh_test";
+        storage
+            .create_rule_set(
+                id,
+                "bootstrap-online-test",
+                "https://example.com/rules",
+                86_400,
+                Some("domain"),
+                "text",
+            )
+            .await
+            .unwrap();
+        let relative = paths.rule_set_version_relative_path(id, "online");
+        let online = paths.resolve_local_path(&relative);
+        tokio::fs::write(&online, b"online.example").await.unwrap();
+        storage
+            .update_rule_set_refresh(id, &relative, 14, 1, "online", "text", None)
+            .await
+            .unwrap();
+
+        bootstrap_rule_sets(&paths, &storage, None, Some(&EMBEDDED_RULE_SET_ASSETS))
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(&online).await.unwrap(), b"online.example");
+        assert!(!paths.rule_sets_dir.join(format!("{id}.list")).exists());
+        assert_eq!(
+            storage
+                .rule_set_for_refresh(id)
+                .await
+                .unwrap()
+                .and_then(|rule_set| rule_set.local_path)
+                .as_deref(),
+            Some(relative.as_str())
         );
     }
 

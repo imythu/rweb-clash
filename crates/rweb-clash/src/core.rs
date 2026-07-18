@@ -16,6 +16,13 @@ const DEFAULT_MIHOMO_VALIDATION_TIMEOUT_SECS: u64 = 120;
 const MAX_MIHOMO_VALIDATION_TIMEOUT_SECS: u64 = 3_600;
 const MIHOMO_VALIDATION_TIMEOUT_ENV: &str = "RWEB_CLASH_MIHOMO_VALIDATION_TIMEOUT_SECS";
 
+fn mihomo_command(binary: &std::path::Path) -> Command {
+    let mut command = Command::new(binary);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(0x0800_0000);
+    command
+}
+
 #[derive(Debug, Clone)]
 pub struct CoreManager {
     inner: Arc<CoreInner>,
@@ -146,7 +153,7 @@ impl CoreManager {
         }
 
         let version = self.binary_version(&config.mihomo_binary).await;
-        let mut command = Command::new(&config.mihomo_binary);
+        let mut command = mihomo_command(&config.mihomo_binary);
         command
             .arg("-d")
             .arg(&config.runtime_dir)
@@ -352,7 +359,7 @@ impl CoreManager {
     async fn binary_version(&self, binary: &std::path::Path) -> Option<String> {
         let output = tokio::time::timeout(
             Duration::from_secs(5),
-            Command::new(binary).arg("-v").kill_on_drop(true).output(),
+            mihomo_command(binary).arg("-v").kill_on_drop(true).output(),
         )
         .await
         .ok()?
@@ -469,7 +476,7 @@ pub(crate) async fn validate_mihomo_config(
     let validation_timeout = mihomo_validation_timeout();
     let output = tokio::time::timeout(
         validation_timeout,
-        Command::new(mihomo_binary)
+        mihomo_command(mihomo_binary)
             .arg("-t")
             .arg("-d")
             .arg(runtime_dir)

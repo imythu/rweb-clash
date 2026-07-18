@@ -13,7 +13,7 @@ import { cn, SUB_DELIMITER } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useToast } from './toast-context';
-import { api, type ProxyGroup, type ProxyNode, type Rule, type RuleInput, type RuleSet, type RuleSetInput, type RuleTestResult } from '@/lib/api';
+import { api, type ProxyGroup, type ProxyNode, type Rule, type RuleInput, type RuleSet, type RuleSetBehavior, type RuleSetInput, type RuleTestResult } from '@/lib/api';
 
 // --- Nano Components ---
 
@@ -50,12 +50,13 @@ const SubBadge = ({ name }: { name: string }) => (
   </span>
 );
 
-const displayRuntimeName = (name: string) => name.split(SUB_DELIMITER)[0] || name;
+const displayRuntimeName = (name: string, displayName?: string | null) =>
+  displayName || name.split(SUB_DELIMITER)[0] || name;
 
-const ActionPill = ({ action, subscriptionName, className }: { action: string, subscriptionName?: string | null, className?: string }) => {
+const ActionPill = ({ action, displayName, subscriptionName, className }: { action: string, displayName?: string | null, subscriptionName?: string | null, className?: string }) => {
   const isProxy = !['DIRECT', 'REJECT'].includes(action.toUpperCase());
   const isDirect = action.toUpperCase() === 'DIRECT';
-  const displayName = displayRuntimeName(action);
+  const label = displayRuntimeName(action, displayName);
   
   return (
     <div className={cn(
@@ -67,7 +68,7 @@ const ActionPill = ({ action, subscriptionName, className }: { action: string, s
       )}>
       <div className={cn("size-1.5 rounded-full shrink-0", isDirect ? "bg-green-500" : isProxy ? "bg-primary" : "bg-rose-500")} />
       <div className="flex items-center min-w-0 overflow-hidden">
-        <span className="text-[11px] font-black uppercase truncate">{displayName}</span>
+        <span className="text-[11px] font-black uppercase truncate">{label}</span>
         {subscriptionName && <SubBadge name={subscriptionName} />}
       </div>
     </div>
@@ -93,6 +94,7 @@ const RuleSetDrawer = ({ isOpen, onClose, ruleSets, onRefresh, onDelete, onAdd }
   const [isAdding, setIsAdding] = useState(false);
   const [newName, setNewName] = useState('');
   const [newUrl, setNewUrl] = useState('');
+  const [newBehavior, setNewBehavior] = useState<RuleSetBehavior>('classical');
   const newInterval = '86400';
   const [syncing, setSyncing] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
@@ -105,11 +107,12 @@ const RuleSetDrawer = ({ isOpen, onClose, ruleSets, onRefresh, onDelete, onAdd }
     }
     setIsSaving(true);
     try {
-      const saved = await onAdd({ name: newName.trim(), url: newUrl.trim(), interval: parseInt(newInterval) });
+      const saved = await onAdd({ name: newName.trim(), url: newUrl.trim(), interval: parseInt(newInterval), behavior: newBehavior });
       if (saved) {
         setIsAdding(false);
         setNewName('');
         setNewUrl('');
+        setNewBehavior('classical');
       }
     } finally {
       setIsSaving(false);
@@ -132,6 +135,7 @@ const RuleSetDrawer = ({ isOpen, onClose, ruleSets, onRefresh, onDelete, onAdd }
             <div className="bg-muted/10 border-2 rounded-2xl p-5 space-y-4 animate-in slide-in-from-top-4">
                <div className="space-y-1.5"><label className="text-[10px] font-black uppercase text-muted-foreground">订阅名称</label><input value={newName} onChange={e => setNewName(e.target.value)} placeholder="e.g. gfw_list" className="w-full bg-background border-2 border-muted rounded-xl px-4 py-3 text-xs font-black" /></div>
                <div className="space-y-1.5"><label className="text-[10px] font-black uppercase text-muted-foreground">资源 URL</label><input value={newUrl} onChange={e => setNewUrl(e.target.value)} placeholder="https://..." className="w-full bg-background border-2 border-muted rounded-xl px-4 py-3 text-[10px] font-mono" /></div>
+               <div className="space-y-1.5"><label className="text-[10px] font-black uppercase text-muted-foreground">Behavior</label><select value={newBehavior} onChange={event => setNewBehavior(event.target.value as RuleSetBehavior)} className="w-full bg-background border-2 border-muted rounded-xl px-4 py-3 text-xs font-black outline-none"><option value="domain">Domain</option><option value="ipcidr">IP CIDR</option><option value="classical">Classical</option></select></div>
                <Button onClick={() => void handleAdd()} disabled={isSaving || !newName.trim() || !newUrl.trim()} className="w-full h-11 bg-primary text-primary-foreground rounded-xl font-black text-[10px]">{isSaving ? <Loader2 className="size-4 animate-spin" /> : '确认新增规则集'}</Button>
             </div>
           )}
@@ -163,8 +167,8 @@ const RuleDrawer = ({ isOpen, onClose, onSave, proxies, nodes, ruleSets, initial
     const list: RuleTarget[] = [
       { name: 'DIRECT', displayName: 'DIRECT', subscriptionName: null, type: 'system', icon: Zap },
       { name: 'REJECT', displayName: 'REJECT', subscriptionName: null, type: 'system', icon: ShieldAlert },
-      ...proxies.map((proxy) => ({ name: proxy.name, displayName: displayRuntimeName(proxy.name), subscriptionName: proxy.subscriptionName, type: 'group' as const, icon: Layers })),
-      ...nodes.map((node) => ({ name: node.name, displayName: displayRuntimeName(node.name), subscriptionName: node.subscriptionName, type: 'node' as const, icon: MousePointer2 }))
+      ...proxies.map((proxy) => ({ name: proxy.name, displayName: displayRuntimeName(proxy.name, proxy.displayName), subscriptionName: proxy.subscriptionName, type: 'group' as const, icon: Layers })),
+      ...nodes.map((node) => ({ name: node.name, displayName: displayRuntimeName(node.name, node.displayName), subscriptionName: node.subscriptionName, type: 'node' as const, icon: MousePointer2 }))
     ];
     const query = search.toLowerCase();
     return list.filter(target => [target.displayName, target.subscriptionName ?? ''].some(value => value.toLowerCase().includes(query)));
@@ -243,6 +247,10 @@ export const Rules = () => {
   const [isTesting, setIsTesting] = useState(false);
   const [draggedRuleId, setDraggedRuleId] = useState<string | null>(null);
   const [movingRuleId, setMovingRuleId] = useState<string | null>(null);
+  const displayNameByRuntimeName = useMemo(() => new Map<string, string>([
+    ...proxies.map(proxy => [proxy.name, displayRuntimeName(proxy.name, proxy.displayName)] as const),
+    ...nodes.map(node => [node.name, displayRuntimeName(node.name, node.displayName)] as const),
+  ]), [proxies, nodes]);
   const subscriptionByPolicy = useMemo(() => new Map<string, string>([
     ...proxies.flatMap(proxy => proxy.subscriptionName ? [[proxy.name, proxy.subscriptionName] as const] : []),
     ...nodes.flatMap(node => node.subscriptionName ? [[node.name, node.subscriptionName] as const] : []),
@@ -452,7 +460,7 @@ export const Rules = () => {
                 <div><div className="px-2 py-0.5 rounded bg-zinc-900 text-zinc-100 text-[9px] font-black uppercase tracking-wide inline-block border border-white/5">{rule.type}</div></div>
                 <div className="min-w-0"><h4 className="text-sm font-black truncate text-foreground">{rule.value}</h4><p className="text-[10px] font-bold text-muted-foreground uppercase truncate">{rule.desc || 'Active Dispatching'}</p></div>
                 <div className="flex justify-center"><LogicFlow policy={rule.policy} /></div>
-                <div className="flex justify-start min-w-0"><ActionPill action={rule.policy} subscriptionName={subscriptionByPolicy.get(rule.policy)} className="w-full max-w-[180px]" /></div>
+                <div className="flex justify-start min-w-0"><ActionPill action={rule.policy} displayName={displayNameByRuntimeName.get(rule.policy)} subscriptionName={subscriptionByPolicy.get(rule.policy)} className="w-full max-w-[180px]" /></div>
                 <div className="flex items-center justify-end gap-1.5 opacity-0 group-hover:opacity-100 transition-all pr-2">
                    <Button title="置顶" onClick={() => void handleMoveRule(rule, 1)} variant="ghost" size="icon" className="size-8 rounded-lg hover:bg-muted"><Pin className="size-3.5" /></Button>
                    <Button onClick={() => { setEditingRule(rule); setIsDrawerOpen(true); }} variant="ghost" size="icon" className="size-8 rounded-lg hover:bg-muted"><Edit3 className="size-3.5" /></Button>
@@ -469,7 +477,7 @@ export const Rules = () => {
                    </div>
                    <div className="flex gap-1 shrink-0"><select aria-label="设置规则顺序" value={sourcePosition(rule)} onChange={event => void handleMoveRule(rule, Number(event.target.value))} className="h-8 w-12 rounded-lg border bg-background text-center text-[10px] font-black">{Array.from({ length: sourceRuleCount(rule) }, (_, position) => <option key={position + 1} value={position + 1}>{position + 1}</option>)}</select><Button title="置顶" onClick={() => void handleMoveRule(rule, 1)} variant="ghost" size="icon" className="size-8 rounded-lg bg-muted/50"><Pin className="size-3.5" /></Button><Button onClick={() => { setEditingRule(rule); setIsDrawerOpen(true); }} variant="ghost" size="icon" className="size-8 rounded-lg bg-muted/50"><Edit3 className="size-3.5" /></Button><Button onClick={() => handleDeleteRule(rule.id)} variant="ghost" size="icon" className="size-8 rounded-lg text-red-500 bg-red-500/5"><Trash2 className="size-3.5" /></Button></div>
                 </div>
-                <div className="flex items-center gap-3 pt-3 border-t border-dashed border-muted/50"><div className="flex-1 min-w-0"><ActionPill action={rule.policy} subscriptionName={subscriptionByPolicy.get(rule.policy)} className="w-full" /></div></div>
+                <div className="flex items-center gap-3 pt-3 border-t border-dashed border-muted/50"><div className="flex-1 min-w-0"><ActionPill action={rule.policy} displayName={displayNameByRuntimeName.get(rule.policy)} subscriptionName={subscriptionByPolicy.get(rule.policy)} className="w-full" /></div></div>
              </div>
 
              {/* Dynamic Accent Accent - Fixed to clean thin line */}
@@ -501,8 +509,8 @@ export const Rules = () => {
                    <div className="pt-8 border-t border-white/5 space-y-8 text-left">
                       {[
                         { label: 'HIT RULE', display: `${testResult.hitRule.type}: ${testResult.hitRule.value}`, subscriptionName: null, icon: Shield, col: "text-zinc-500" },
-                        { label: 'TARGET POLICY', display: displayRuntimeName(testResult.hitRule.policy), subscriptionName: subscriptionByPolicy.get(testResult.hitRule.policy), icon: Layers, col: "text-primary" },
-                        { label: 'EXIT NODE', display: displayRuntimeName(testResult.finalProxy), subscriptionName: subscriptionByPolicy.get(testResult.finalProxy), icon: CheckCircle2, col: "text-green-500" }
+                        { label: 'TARGET POLICY', display: displayNameByRuntimeName.get(testResult.hitRule.policy) ?? displayRuntimeName(testResult.hitRule.policy), subscriptionName: subscriptionByPolicy.get(testResult.hitRule.policy), icon: Layers, col: "text-primary" },
+                        { label: 'EXIT NODE', display: displayNameByRuntimeName.get(testResult.finalProxy) ?? displayRuntimeName(testResult.finalProxy), subscriptionName: subscriptionByPolicy.get(testResult.finalProxy), icon: CheckCircle2, col: "text-green-500" }
                       ].map((step, i) => {
                          return (
                            <div key={i} className="flex items-center gap-6 text-left">

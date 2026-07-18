@@ -603,8 +603,10 @@ async fn setup_status(
     Ok(Json(app.setup_status().await?))
 }
 
-async fn system_egress(State(app): State<App>) -> Json<crate::types::EgressResponse> {
-    Json(app.egress().await)
+async fn system_egress(
+    State(app): State<App>,
+) -> Result<Json<crate::types::EgressResponse>, AppError> {
+    Ok(Json(app.egress().await?))
 }
 
 async fn core_status(

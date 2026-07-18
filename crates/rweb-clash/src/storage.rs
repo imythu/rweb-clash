@@ -6,19 +6,23 @@ use crate::types::{
     FilterRule, FilterRuleInput, GroupFilterInput, LogEntryResponse, ProxyGroupResponse,
     ProxyNodeResponse, RuleResponse, RuleSetResponse, SubscriptionMemberGroup,
     SubscriptionMemberNode, SubscriptionMemberSection, SubscriptionMembersResponse,
-    SubscriptionResponse, SystemConfig, TrafficQuota, BUILTIN_PROXY, SUB_DELIMITER,
+    SubscriptionResponse, SystemConfig, TrafficQuota, BUILTIN_DIRECT, BUILTIN_GLOBAL,
+    BUILTIN_PROXY, BUILTIN_REJECT, SUB_DELIMITER,
 };
 use crate::util::{bool_to_i64, display_log_time, i64_to_bool, new_id, normalize_status, now_iso};
 use serde_json::{Map, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct Storage {
     pool: SqlitePool,
+    topology_mutation: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +72,18 @@ pub struct RuleSetRecord {
     pub behavior: Option<String>,
     pub format: String,
     pub local_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuleSetRefreshState {
+    pub ready: bool,
+    pub local_path: Option<String>,
+    pub file_size_bytes: Option<i64>,
+    pub rule_count: i64,
+    pub content_hash: Option<String>,
+    pub format: String,
+    pub last_update_at: Option<String>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -293,8 +309,14 @@ impl Storage {
             .max_connections(5)
             .connect_with(options)
             .await?;
-        let storage = Self { pool };
+        let storage = Self {
+            pool,
+            topology_mutation: Arc::new(Mutex::new(())),
+        };
         storage.migrate().await?;
+        storage.normalize_routing_match_rules().await?;
+        storage.cleanup_pending_subscriptions().await?;
+        storage.cleanup_pending_rule_sets().await?;
         storage.ensure_default_settings().await?;
         storage.ensure_builtin_rule_sets().await?;
         storage.ensure_builtin_rules().await?;
@@ -326,6 +348,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   url TEXT NOT NULL,
+  ready INTEGER NOT NULL DEFAULT 1,
   source_format TEXT NOT NULL DEFAULT 'unknown',
   status TEXT NOT NULL DEFAULT 'online',
   interval_seconds INTEGER NOT NULL DEFAULT 21600,
@@ -459,6 +482,7 @@ CREATE TABLE IF NOT EXISTS rule_sets (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   url TEXT NOT NULL,
+  ready INTEGER NOT NULL DEFAULT 1,
   behavior TEXT,
   format TEXT NOT NULL DEFAULT 'text',
   local_path TEXT,
@@ -470,6 +494,13 @@ CREATE TABLE IF NOT EXISTS rule_sets (
   raw_etag TEXT,
   raw_last_modified TEXT,
   content_hash TEXT,
+  staged_local_path TEXT,
+  staged_file_size_bytes INTEGER,
+  staged_rule_count INTEGER,
+  staged_content_hash TEXT,
+  staged_format TEXT,
+  staged_update_at TEXT,
+  staged_last_error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 )"#,
@@ -509,7 +540,12 @@ CREATE TABLE IF NOT EXISTS log_entries (
         self.ensure_proxy_group_filter_values_column().await?;
         self.ensure_filter_rule_values_columns().await?;
         self.ensure_subscription_source_format_column().await?;
+        self.ensure_integer_column("subscriptions", "ready", "1")
+            .await?;
         self.ensure_proxy_item_builtin_column().await?;
+        self.ensure_integer_column("rule_sets", "ready", "1")
+            .await?;
+        self.ensure_rule_set_staging_columns().await?;
         self.normalize_rule_set_local_paths().await?;
         self.normalize_builtin_rule_set_formats().await?;
         sqlx::query(
@@ -519,6 +555,112 @@ CREATE TABLE IF NOT EXISTS log_entries (
         .execute(&self.pool)
         .await?;
         info!("database migrations applied");
+        Ok(())
+    }
+
+    async fn cleanup_pending_rule_sets(&self) -> Result<(), AppError> {
+        sqlx::query("UPDATE rule_sets SET ready = 1 WHERE ready = 3")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            r#"
+UPDATE rule_sets
+SET staged_local_path = NULL,
+    staged_file_size_bytes = NULL,
+    staged_rule_count = NULL,
+    staged_content_hash = NULL,
+    staged_format = NULL,
+    staged_update_at = NULL,
+    staged_last_error = NULL
+WHERE ready = 1
+"#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("DELETE FROM rule_sets WHERE ready <> 1")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn ensure_rule_set_staging_columns(&self) -> Result<(), AppError> {
+        for (column, sql_type) in [
+            ("staged_local_path", "TEXT"),
+            ("staged_file_size_bytes", "INTEGER"),
+            ("staged_rule_count", "INTEGER"),
+            ("staged_content_hash", "TEXT"),
+            ("staged_format", "TEXT"),
+            ("staged_update_at", "TEXT"),
+            ("staged_last_error", "TEXT"),
+        ] {
+            self.ensure_nullable_column("rule_sets", column, sql_type)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn cleanup_pending_subscriptions(&self) -> Result<(), AppError> {
+        sqlx::query("UPDATE subscriptions SET ready = 1 WHERE ready = 2")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM subscriptions WHERE ready = 0")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn normalize_routing_match_rules(&self) -> Result<(), AppError> {
+        let now = now_iso();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            r#"
+WITH ranked AS (
+  SELECT id,
+         ROW_NUMBER() OVER (
+           PARTITION BY source
+           ORDER BY position, created_at, id
+         ) AS match_rank
+  FROM routing_rules
+  WHERE rule_type = 'MATCH' AND enabled = 1
+)
+UPDATE routing_rules
+SET enabled = 0, updated_at = ?
+WHERE id IN (SELECT id FROM ranked WHERE match_rank > 1)
+"#,
+        )
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+WITH ordered AS (
+  SELECT id,
+         ROW_NUMBER() OVER (
+           PARTITION BY source
+           ORDER BY CASE WHEN rule_type = 'MATCH' THEN 1 ELSE 0 END,
+                    position, created_at, id
+         ) * 1024 AS normalized_position
+  FROM routing_rules
+)
+UPDATE routing_rules
+SET position = (SELECT normalized_position FROM ordered WHERE ordered.id = routing_rules.id),
+    updated_at = ?
+WHERE position <> (SELECT normalized_position FROM ordered WHERE ordered.id = routing_rules.id)
+"#,
+        )
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+CREATE UNIQUE INDEX IF NOT EXISTS idx_routing_rules_one_enabled_match_per_source
+ON routing_rules(source)
+WHERE rule_type = 'MATCH' AND enabled = 1
+"#,
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -622,6 +764,30 @@ WHERE local_path LIKE 'data/rule-sets/%'
         Ok(())
     }
 
+    async fn ensure_nullable_column(
+        &self,
+        table: &str,
+        column: &str,
+        sql_type: &str,
+    ) -> Result<(), AppError> {
+        let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(&self.pool)
+            .await?;
+        let has_column = rows.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .map(|name| name == column)
+                .unwrap_or(false)
+        });
+        if !has_column {
+            sqlx::query(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {sql_type}",
+            ))
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn ensure_default_settings(&self) -> Result<(), AppError> {
         let rows = sqlx::query("SELECT COUNT(*) AS count FROM app_settings WHERE scope = 'system'")
             .fetch_one(&self.pool)
@@ -653,7 +819,7 @@ WHERE local_path LIKE 'data/rule-sets/%'
 
     async fn seed_builtin_rule_sets(&self) -> Result<(), AppError> {
         let now = now_iso();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         for rule_set in BUILTIN_RULE_SETS {
             sqlx::query(
                 r#"
@@ -702,7 +868,7 @@ ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value, updated_at = exclu
 
     async fn seed_builtin_rules(&self) -> Result<(), AppError> {
         let now = now_iso();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         for (index, rule) in BUILTIN_RULES.iter().enumerate() {
             sqlx::query(
                 r#"
@@ -766,7 +932,7 @@ ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value, updated_at = exclu
             ));
         };
         let now = now_iso();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         for (key, value) in object {
             sqlx::query(
                 r#"
@@ -802,12 +968,12 @@ ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value, updated_at = exclu
         rules: &[FilterRuleInput],
     ) -> Result<Vec<FilterRule>, AppError> {
         let now = now_iso();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM global_filter_rules")
             .execute(&mut *tx)
             .await?;
         for (index, rule) in rules.iter().enumerate() {
-            let values = if rule.match_type.trim() == "in" || rule.has_values() {
+            let values = if matches!(rule.match_type.trim(), "in" | "equals") {
                 rule.effective_values()
                     .into_iter()
                     .map(str::to_string)
@@ -843,15 +1009,17 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
     }
 
     pub async fn subscription_ids_inheriting_global_rules(&self) -> Result<Vec<String>, AppError> {
-        let rows =
-            sqlx::query("SELECT id FROM subscriptions WHERE inherit_global_rules = 1 ORDER BY id")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows = sqlx::query(
+            "SELECT id FROM subscriptions WHERE inherit_global_rules = 1 AND ready = 1 ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter()
             .map(|row| row.try_get("id").map_err(AppError::from))
             .collect()
     }
 
+    #[cfg(test)]
     pub async fn create_subscription(
         &self,
         id: &str,
@@ -861,21 +1029,67 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
         inherit_global: bool,
         rules: &[FilterRuleInput],
     ) -> Result<(), AppError> {
+        self.create_subscription_with_ready(
+            id,
+            name,
+            url,
+            interval_seconds,
+            inherit_global,
+            rules,
+            true,
+        )
+        .await
+    }
+
+    pub async fn create_pending_subscription(
+        &self,
+        id: &str,
+        name: &str,
+        url: &str,
+        interval_seconds: u64,
+        inherit_global: bool,
+        rules: &[FilterRuleInput],
+    ) -> Result<(), AppError> {
+        self.create_subscription_with_ready(
+            id,
+            name,
+            url,
+            interval_seconds,
+            inherit_global,
+            rules,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_subscription_with_ready(
+        &self,
+        id: &str,
+        name: &str,
+        url: &str,
+        interval_seconds: u64,
+        inherit_global: bool,
+        rules: &[FilterRuleInput],
+        ready: bool,
+    ) -> Result<(), AppError> {
+        let interval_seconds = sqlite_i64(interval_seconds, "subscription interval_seconds")?;
         let now = now_iso();
         let next_sync_at = now.clone();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             r#"
 INSERT INTO subscriptions(
-  id, name, url, status, interval_seconds, inherit_global_rules, node_count,
+  id, name, url, ready, status, interval_seconds, inherit_global_rules, node_count,
   next_sync_at, created_at, updated_at
-) VALUES(?, ?, ?, 'syncing', ?, ?, 0, ?, ?, ?)
+) VALUES(?, ?, ?, ?, 'syncing', ?, ?, 0, ?, ?, ?)
 "#,
         )
         .bind(id)
         .bind(name)
         .bind(url)
-        .bind(interval_seconds as i64)
+        .bind(bool_to_i64(ready))
+        .bind(interval_seconds)
         .bind(bool_to_i64(inherit_global))
         .bind(next_sync_at)
         .bind(&now)
@@ -883,6 +1097,27 @@ INSERT INTO subscriptions(
         .execute(&mut *tx)
         .await?;
         insert_subscription_rules(&mut tx, id, rules, &now).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn activate_subscription(&self, id: &str) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
+        let now = now_iso();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result = sqlx::query(
+            "UPDATE subscriptions SET ready = 1, updated_at = ? WHERE id = ? AND ready = 0",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::not_found(
+                "subscription_not_found",
+                format!("pending subscription {id} not found"),
+            ));
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -896,8 +1131,9 @@ INSERT INTO subscriptions(
         inherit_global: bool,
         rules: &[FilterRuleInput],
     ) -> Result<(), AppError> {
+        let interval_seconds = sqlite_i64(interval_seconds, "subscription interval_seconds")?;
         let now = now_iso();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
             r#"
 UPDATE subscriptions
@@ -907,7 +1143,7 @@ WHERE id = ?
         )
         .bind(name)
         .bind(url)
-        .bind(interval_seconds as i64)
+        .bind(interval_seconds)
         .bind(bool_to_i64(inherit_global))
         .bind(&now)
         .bind(id)
@@ -929,9 +1165,30 @@ WHERE id = ?
     }
 
     pub async fn delete_subscription(&self, id: &str) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let available_before = available_policy_targets_in_transaction(&mut tx).await?;
+        let referenced_by = sqlx::query_scalar::<_, String>(
+            r#"
+SELECT rules.id
+FROM routing_rules rules
+JOIN proxy_items items ON items.name = rules.policy
+WHERE items.subscription_id = ?
+LIMIT 1
+"#,
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(rule_id) = referenced_by {
+            return Err(AppError::conflict(
+                "subscription_referenced",
+                format!("subscription assets are referenced by routing rule {rule_id}"),
+            ));
+        }
         let result = sqlx::query("DELETE FROM subscriptions WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
             return Err(AppError::not_found(
@@ -939,6 +1196,78 @@ WHERE id = ?
                 format!("subscription {id} not found"),
             ));
         }
+        validate_no_referenced_policy_became_unavailable(&mut tx, &available_before).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn stage_subscription_deletion(&self, id: &str) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
+        let now = now_iso();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let ready = sqlx::query_scalar::<_, i64>("SELECT ready FROM subscriptions WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                AppError::not_found(
+                    "subscription_not_found",
+                    format!("subscription {id} not found"),
+                )
+            })?;
+        if ready != 1 {
+            return Err(AppError::conflict(
+                "subscription_busy",
+                format!("subscription {id} is not active"),
+            ));
+        }
+        let available_before = available_policy_targets_in_transaction(&mut tx).await?;
+        let referenced_by = sqlx::query_scalar::<_, String>(
+            r#"
+SELECT rules.id
+FROM routing_rules rules
+JOIN proxy_items items ON items.name = rules.policy
+WHERE items.subscription_id = ?
+LIMIT 1
+"#,
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(rule_id) = referenced_by {
+            return Err(AppError::conflict(
+                "subscription_referenced",
+                format!("subscription assets are referenced by routing rule {rule_id}"),
+            ));
+        }
+        sqlx::query("UPDATE subscriptions SET ready = 2, updated_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        validate_no_referenced_policy_became_unavailable(&mut tx, &available_before).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn restore_subscription_deletion(&self, id: &str) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
+        let now = now_iso();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result = sqlx::query(
+            "UPDATE subscriptions SET ready = 1, updated_at = ? WHERE id = ? AND ready = 2",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::not_found(
+                "subscription_not_found",
+                format!("staged subscription deletion {id} not found"),
+            ));
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -949,6 +1278,7 @@ SELECT id, name, url, source_format, status, interval_seconds, inherit_global_ru
        upload_bytes, download_bytes, total_bytes, expire_at, node_count,
        last_update_at, last_error
 FROM subscriptions
+WHERE ready = 1
 ORDER BY created_at DESC
 "#,
         )
@@ -960,7 +1290,7 @@ ORDER BY created_at DESC
             let upload: Option<i64> = row.try_get("upload_bytes")?;
             let download: Option<i64> = row.try_get("download_bytes")?;
             let total: Option<i64> = row.try_get("total_bytes")?;
-            let interval_seconds: i64 = row.try_get("interval_seconds")?;
+            let interval_seconds = row.try_get::<i64, _>("interval_seconds")?.max(0);
             output.push(SubscriptionResponse {
                 id: id.clone(),
                 name: row.try_get("name")?,
@@ -969,7 +1299,11 @@ ORDER BY created_at DESC
                 nodes: row.try_get("node_count")?,
                 status: normalize_status(&row.try_get::<String, _>("status")?),
                 traffic: TrafficQuota {
-                    used: (upload.unwrap_or(0).saturating_add(download.unwrap_or(0))) as u64,
+                    used: upload
+                        .unwrap_or(0)
+                        .max(0)
+                        .saturating_add(download.unwrap_or(0).max(0))
+                        as u64,
                     total: total.unwrap_or(0).max(0) as u64,
                 },
                 expiry: row.try_get("expire_at")?,
@@ -1118,7 +1452,8 @@ ORDER BY position, display_name
             r#"
 SELECT id
 FROM subscriptions
-WHERE interval_seconds > 0
+WHERE ready = 1
+  AND interval_seconds > 0
   AND status != 'syncing'
   AND (
     last_update_at IS NULL
@@ -1139,7 +1474,8 @@ WHERE interval_seconds > 0
             r#"
 SELECT id
 FROM subscriptions
-WHERE interval_seconds > 0
+WHERE ready = 1
+  AND interval_seconds > 0
   AND (
     status = 'syncing'
     OR last_update_at IS NULL
@@ -1198,17 +1534,80 @@ WHERE id = ?
         group_members: &[(String, Vec<String>)],
         commit: SubscriptionSyncCommit,
     ) -> Result<(), AppError> {
-        if items
-            .iter()
-            .any(|item| item.subscription_id.as_deref() != Some(subscription_id))
-        {
-            return Err(AppError::internal(
-                "subscription asset batch contained an item owned by another subscription",
-            ));
+        let mut incoming_names = HashSet::with_capacity(items.len());
+        let mut incoming_groups = HashSet::new();
+        for item in items {
+            if item.subscription_id.as_deref() != Some(subscription_id) {
+                return Err(AppError::internal(
+                    "subscription asset batch contained an item owned by another subscription",
+                ));
+            }
+            if !incoming_names.insert(item.name.as_str()) {
+                return Err(AppError::internal(
+                    "subscription asset batch contained duplicate runtime names",
+                ));
+            }
+            if item.kind == "group" {
+                incoming_groups.insert(item.name.as_str());
+            }
         }
+        let mut member_groups = HashSet::with_capacity(group_members.len());
+        for (group_name, members) in group_members {
+            if !incoming_groups.contains(group_name.as_str())
+                || !member_groups.insert(group_name.as_str())
+            {
+                return Err(AppError::internal(
+                    "subscription group-member batch targeted an undeclared or duplicate group",
+                ));
+            }
+            if members.iter().any(|member| {
+                !incoming_names.contains(member.as_str()) && !is_builtin_policy(member)
+            }) {
+                return Err(AppError::internal(
+                    "subscription group-member batch referenced an undeclared asset",
+                ));
+            }
+        }
+        let candidate_member_map = group_members.iter().cloned().collect::<HashMap<_, _>>();
+        let candidate_policies =
+            crate::runtime::available_policy_targets_from_assets(items, &candidate_member_map)?;
 
+        let _mutation = self.topology_mutation.lock().await;
         let now = now_iso();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if !incoming_names.is_empty() {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "SELECT name, subscription_id FROM proxy_items WHERE name IN (",
+            );
+            let mut names = query.separated(", ");
+            for name in &incoming_names {
+                names.push_bind(name);
+            }
+            names.push_unseparated(")");
+            let existing = query.build().fetch_all(&mut *tx).await?;
+            for row in existing {
+                let name: String = row.try_get("name")?;
+                let owner: Option<String> = row.try_get("subscription_id")?;
+                if owner.as_deref() != Some(subscription_id) {
+                    return Err(AppError::conflict(
+                        "subscription_asset_conflict",
+                        format!("subscription asset name {name} is already in use"),
+                    ));
+                }
+            }
+        }
+        let available_before = available_policy_targets_in_transaction(&mut tx).await?;
+        let referenced_policies = sqlx::query_scalar::<_, String>(
+            r#"
+SELECT DISTINCT rules.policy
+FROM routing_rules rules
+JOIN proxy_items items ON items.name = rules.policy
+WHERE items.subscription_id = ?
+"#,
+        )
+        .bind(subscription_id)
+        .fetch_all(&mut *tx)
+        .await?;
         let migration = migrate_subscription_asset_references(
             &mut tx,
             subscription_id,
@@ -1217,6 +1616,19 @@ WHERE id = ?
             &now,
         )
         .await?;
+        if let Some(policy) = referenced_policies.into_iter().find(|policy| {
+            let candidate = migration
+                .name_migrations
+                .get(policy)
+                .map(String::as_str)
+                .unwrap_or(policy);
+            !candidate_policies.contains(candidate)
+        }) {
+            return Err(AppError::conflict(
+                "subscription_asset_referenced",
+                format!("subscription refresh would make referenced policy {policy} unavailable"),
+            ));
+        }
         sqlx::query("DELETE FROM proxy_items WHERE subscription_id = ?")
             .bind(subscription_id)
             .execute(&mut *tx)
@@ -1247,7 +1659,11 @@ WHERE id = ?
                 .await?;
             }
         }
-
+        validate_no_referenced_policy_became_unavailable(&mut tx, &available_before).await?;
+        let upload_bytes = optional_sqlite_i64(commit.upload_bytes, "subscription upload_bytes")?;
+        let download_bytes =
+            optional_sqlite_i64(commit.download_bytes, "subscription download_bytes")?;
+        let total_bytes = optional_sqlite_i64(commit.total_bytes, "subscription total_bytes")?;
         let result = sqlx::query(
             r#"
 UPDATE subscriptions
@@ -1268,9 +1684,9 @@ WHERE id = ?
 "#,
         )
         .bind(commit.subscription_name)
-        .bind(commit.upload_bytes.map(|value| value as i64))
-        .bind(commit.download_bytes.map(|value| value as i64))
-        .bind(commit.total_bytes.map(|value| value as i64))
+        .bind(upload_bytes)
+        .bind(download_bytes)
+        .bind(total_bytes)
         .bind(commit.expire_at)
         .bind(commit.node_count)
         .bind(&now)
@@ -1298,20 +1714,31 @@ WHERE id = ?
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn upsert_proxy_item(&self, item: &ProxyItemRecord) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
         let now = now_iso();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         upsert_proxy_item_in_transaction(&mut tx, item, &now).await?;
         tx.commit().await?;
         Ok(())
     }
 
     pub async fn sync_builtin_proxy_group(&self) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
         let mut members = self.valid_node_names().await?;
         let group_names = sqlx::query_scalar::<_, String>(
             r#"
 SELECT name FROM proxy_items
 WHERE kind = 'group' AND name <> ? AND enabled = 1 AND filtered_out = 0
+  AND (
+    subscription_id IS NULL
+    OR EXISTS (
+      SELECT 1 FROM subscriptions
+      WHERE subscriptions.id = proxy_items.subscription_id
+        AND subscriptions.ready = 1
+    )
+  )
 ORDER BY position, name
 "#,
         )
@@ -1339,138 +1766,215 @@ SELECT EXISTS(SELECT 1 FROM dependencies WHERE name = ?)
                 members.push(group_name);
             }
         }
-        let current_now = self
-            .current_group_now(BUILTIN_PROXY_GROUP_NAME)
+        let now = now_iso();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current_delay = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT delay_ms FROM proxy_items WHERE name = ? AND kind = 'group'",
+        )
+        .bind(BUILTIN_PROXY_GROUP_NAME)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        let current_now = current_group_now_in_transaction(&mut tx, BUILTIN_PROXY_GROUP_NAME)
             .await?
             .filter(|selected| members.iter().any(|member| member == selected));
         let selected = current_now.or_else(|| members.first().cloned());
-        self.upsert_proxy_item(&ProxyItemRecord {
-            name: BUILTIN_PROXY_GROUP_NAME.into(),
-            kind: "group".into(),
-            subscription_id: None,
-            display_name: BUILTIN_PROXY_GROUP_NAME.into(),
-            source: "system".into(),
-            builtin: true,
-            source_name: Some("system".into()),
-            protocol: None,
-            country: None,
-            group_type: Some("select".into()),
-            raw_json: None,
-            content_hash: None,
-            latency_ms: None,
-            alive: true,
-            filtered_out: false,
-            filter_reason: None,
-            delay_ms: None,
-            tolerance_ms: None,
-            url: None,
-            interval_seconds: None,
-            strategy_json: selected
-                .map(|name| serde_json::json!({ "now": name }).to_string())
-                .unwrap_or_else(|| "{}".to_string()),
-            position: -100_000,
-            enabled: true,
-        })
+        upsert_proxy_item_in_transaction(
+            &mut tx,
+            &ProxyItemRecord {
+                name: BUILTIN_PROXY_GROUP_NAME.into(),
+                kind: "group".into(),
+                subscription_id: None,
+                display_name: BUILTIN_PROXY_GROUP_NAME.into(),
+                source: "system".into(),
+                builtin: true,
+                source_name: Some("system".into()),
+                protocol: None,
+                country: None,
+                group_type: Some("select".into()),
+                raw_json: None,
+                content_hash: None,
+                latency_ms: None,
+                alive: true,
+                filtered_out: false,
+                filter_reason: None,
+                delay_ms: current_delay,
+                tolerance_ms: None,
+                url: None,
+                interval_seconds: None,
+                strategy_json: selected
+                    .as_ref()
+                    .map(|name| serde_json::json!({ "now": name }).to_string())
+                    .unwrap_or_else(|| "{}".to_string()),
+                position: -100_000,
+                enabled: true,
+            },
+            &now,
+        )
         .await?;
-        self.replace_group_members(BUILTIN_PROXY_GROUP_NAME, &members)
-            .await?;
+        replace_group_members_in_transaction(
+            &mut tx,
+            BUILTIN_PROXY_GROUP_NAME,
+            &members,
+            selected,
+            &now,
+        )
+        .await?;
         sqlx::query("DELETE FROM proxy_group_filters WHERE group_name = ?")
             .bind(BUILTIN_PROXY_GROUP_NAME)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn replace_group_members(
         &self,
         group_name: &str,
         members: &[String],
     ) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
         let now = now_iso();
-        let selected = self
-            .current_group_now(group_name)
-            .await?
-            .filter(|selected| members.contains(selected))
-            .or_else(|| members.first().cloned());
-        let strategy = selected
-            .map(|name| serde_json::json!({ "now": name }).to_string())
-            .unwrap_or_else(|| "{}".to_string());
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM proxy_group_members WHERE group_name = ?")
-            .bind(group_name)
-            .execute(&mut *tx)
-            .await?;
-        for (index, member) in members.iter().enumerate() {
-            sqlx::query(
-                "INSERT OR IGNORE INTO proxy_group_members(group_name, member_name, position, created_at) VALUES(?, ?, ?, ?)",
-            )
-            .bind(group_name)
-            .bind(member)
-            .bind(((index + 1) as i64) * 1024)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await?;
-        }
-        sqlx::query(
-            "UPDATE proxy_items SET strategy_json = ?, updated_at = ? WHERE name = ? AND kind = 'group'",
-        )
-        .bind(strategy)
-        .bind(&now)
-        .bind(group_name)
-        .execute(&mut *tx)
-        .await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        replace_group_members_in_transaction(&mut tx, group_name, members, None, &now).await?;
         tx.commit().await?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn replace_group_filters(
         &self,
         group_name: &str,
         filters: &[GroupFilterInput],
     ) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
         let now = now_iso();
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM proxy_group_filters WHERE group_name = ?")
-            .bind(group_name)
-            .execute(&mut *tx)
-            .await?;
-        for (index, filter) in filters.iter().enumerate() {
-            let values = if filter.operator.trim() == "in" || filter.has_values() {
-                filter
-                    .effective_values()
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            let values_json = serde_json::to_string(&values)?;
-            sqlx::query(
-                r#"
-INSERT INTO proxy_group_filters(id, group_name, position, action, field, operator, value, values_json, enabled, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-"#,
-            )
-            .bind(filter.id.clone().unwrap_or_else(|| new_id("pgf")))
-            .bind(group_name)
-            .bind(((index + 1) as i64) * 1024)
-            .bind(filter.action.trim())
-            .bind(filter.field.trim())
-            .bind(filter.operator.trim())
-            .bind(filter.value.trim())
-            .bind(values_json)
-            .bind(bool_to_i64(filter.enabled.unwrap_or(true)))
-            .bind(&now)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        replace_group_filters_in_transaction(&mut tx, group_name, filters, &now).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn save_custom_group(
+        &self,
+        old_name: Option<&str>,
+        item: &ProxyItemRecord,
+        filters: &[GroupFilterInput],
+    ) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
+        if item.kind != "group" || item.source != "custom" || item.builtin {
+            return Err(AppError::internal("invalid custom proxy group record"));
         }
+
+        let now = now_iso();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let previous_selection = if let Some(old_name) = old_name {
+            let source = sqlx::query_scalar::<_, String>(
+                "SELECT source FROM proxy_items WHERE name = ? AND kind = 'group'",
+            )
+            .bind(old_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            match source {
+                Some(source) if source == "custom" => {}
+                Some(_) => {
+                    return Err(AppError::conflict(
+                        "proxy_group_readonly",
+                        "system builtin and subscription managed proxy groups are read-only",
+                    ));
+                }
+                None => {
+                    return Err(AppError::not_found(
+                        "proxy_group_not_found",
+                        format!("proxy group {old_name} not found"),
+                    ));
+                }
+            }
+
+            let selection = current_group_now_in_transaction(&mut tx, old_name).await?;
+            if old_name != item.name {
+                let target_exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM proxy_items WHERE name = ?)",
+                )
+                .bind(&item.name)
+                .fetch_one(&mut *tx)
+                .await?;
+                if target_exists {
+                    return Err(AppError::conflict(
+                        "proxy_group_exists",
+                        format!("proxy group {} already exists", item.name),
+                    ));
+                }
+                let reference_count = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM routing_rules WHERE policy = ?",
+                )
+                .bind(old_name)
+                .fetch_one(&mut *tx)
+                .await?;
+                if reference_count > 0 {
+                    return Err(AppError::conflict(
+                        "proxy_group_referenced",
+                        "proxy groups referenced by routing rules cannot be renamed",
+                    ));
+                }
+                sqlx::query(
+                    "DELETE FROM proxy_items WHERE name = ? AND kind = 'group' AND source = 'custom'",
+                )
+                .bind(old_name)
+                .execute(&mut *tx)
+                .await?;
+            }
+            selection
+        } else {
+            let target_exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM proxy_items WHERE name = ?)",
+            )
+            .bind(&item.name)
+            .fetch_one(&mut *tx)
+            .await?;
+            if target_exists {
+                return Err(AppError::conflict(
+                    "proxy_group_exists",
+                    format!("proxy group {} already exists", item.name),
+                ));
+            }
+            None
+        };
+
+        let nodes = valid_node_records_in_transaction(&mut tx).await?;
+        let members = crate::proxy::calculate_members(&nodes, filters);
+        if members.is_empty() {
+            return Err(AppError::bad_request(
+                "proxy_group_empty",
+                "custom proxy group filters did not match any nodes",
+            ));
+        }
+
+        upsert_proxy_item_in_transaction(&mut tx, item, &now).await?;
+        replace_group_filters_in_transaction(&mut tx, &item.name, filters, &now).await?;
+        replace_group_members_in_transaction(
+            &mut tx,
+            &item.name,
+            &members,
+            previous_selection,
+            &now,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
 
     pub async fn delete_custom_group(&self, group_name: &str) -> Result<(), AppError> {
-        match self.group_source(group_name).await? {
+        let _mutation = self.topology_mutation.lock().await;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let source = sqlx::query_scalar::<_, String>(
+            "SELECT source FROM proxy_items WHERE name = ? AND kind = 'group'",
+        )
+        .bind(group_name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match source {
             Some(source) if source == "custom" => {}
             Some(_) => {
                 return Err(AppError::conflict(
@@ -1485,11 +1989,22 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ));
             }
         }
+        let reference_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM routing_rules WHERE policy = ?")
+                .bind(group_name)
+                .fetch_one(&mut *tx)
+                .await?;
+        if reference_count > 0 {
+            return Err(AppError::conflict(
+                "proxy_group_referenced",
+                "proxy groups referenced by routing rules cannot be deleted",
+            ));
+        }
         let result = sqlx::query(
             "DELETE FROM proxy_items WHERE name = ? AND kind = 'group' AND source = 'custom'",
         )
         .bind(group_name)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(AppError::not_found(
@@ -1497,18 +2012,88 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 format!("custom proxy group {group_name} not found"),
             ));
         }
+        tx.commit().await?;
         Ok(())
     }
 
-    pub async fn set_group_now(&self, group_name: &str, member_name: &str) -> Result<(), AppError> {
+    pub async fn set_group_now(
+        &self,
+        group_name: &str,
+        member_name: &str,
+    ) -> Result<Option<String>, AppError> {
+        let _mutation = self.topology_mutation.lock().await;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        validate_select_group_member_in_transaction(&mut tx, group_name, member_name).await?;
+        let previous = current_group_now_in_transaction(&mut tx, group_name).await?;
         let now = now_iso();
         let strategy = serde_json::json!({ "now": member_name }).to_string();
         sqlx::query("UPDATE proxy_items SET strategy_json = ?, updated_at = ? WHERE name = ? AND kind = 'group'")
             .bind(strategy)
             .bind(now)
             .bind(group_name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
+        Ok(previous)
+    }
+
+    pub async fn restore_group_now(
+        &self,
+        group_name: &str,
+        member_name: Option<&str>,
+    ) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let group_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM proxy_items WHERE name = ? AND kind = 'group')",
+        )
+        .bind(group_name)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !group_exists {
+            return Err(AppError::not_found(
+                "proxy_group_not_found",
+                format!("proxy group {group_name} not found"),
+            ));
+        }
+        if let Some(member_name) = member_name {
+            let member_exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM proxy_group_members WHERE group_name = ? AND member_name = ?)",
+            )
+            .bind(group_name)
+            .bind(member_name)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !member_exists {
+                return Err(AppError::bad_request(
+                    "proxy_group_member_not_found",
+                    format!("proxy {member_name} is not a member of group {group_name}"),
+                ));
+            }
+        }
+        let strategy = member_name
+            .map(|name| serde_json::json!({ "now": name }).to_string())
+            .unwrap_or_else(|| "{}".into());
+        sqlx::query(
+            "UPDATE proxy_items SET strategy_json = ?, updated_at = ? WHERE name = ? AND kind = 'group'",
+        )
+        .bind(strategy)
+        .bind(now_iso())
+        .bind(group_name)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn clear_group_selections(&self) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
+        sqlx::query(
+            "UPDATE proxy_items SET strategy_json = '{}', updated_at = ? WHERE kind = 'group' AND strategy_json <> '{}'",
+        )
+        .bind(now_iso())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1546,24 +2131,11 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             .map_err(AppError::from)
     }
 
-    pub async fn custom_group_names(&self) -> Result<Vec<String>, AppError> {
-        let rows = sqlx::query(
-            "SELECT name FROM proxy_items WHERE kind = 'group' AND source = 'custom' AND enabled = 1 ORDER BY position, name",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|row| row.try_get("name").map_err(AppError::from))
-            .collect()
-    }
-
     pub async fn policy_reference_count(&self, policy: &str) -> Result<i64, AppError> {
-        let row = sqlx::query(
-            "SELECT COUNT(*) AS count FROM routing_rules WHERE enabled = 1 AND policy = ?",
-        )
-        .bind(policy)
-        .fetch_one(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM routing_rules WHERE policy = ?")
+            .bind(policy)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row.try_get("count")?)
     }
 
@@ -1571,11 +2143,53 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         &self,
     ) -> Result<(Vec<ProxyGroupResponse>, Vec<ProxyNodeResponse>), AppError> {
         self.sync_builtin_proxy_group().await?;
+        let node_rows = sqlx::query(
+            r#"
+SELECT name, display_name, protocol, latency_ms, country, subscription_id, source_name
+FROM proxy_items
+WHERE kind = 'node' AND filtered_out = 0 AND enabled = 1
+  AND (
+    subscription_id IS NULL
+    OR EXISTS (
+      SELECT 1 FROM subscriptions
+      WHERE subscriptions.id = proxy_items.subscription_id
+        AND subscriptions.ready = 1
+    )
+  )
+ORDER BY subscription_id, display_name
+"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let nodes = node_rows
+            .into_iter()
+            .map(|row| {
+                Ok(ProxyNodeResponse {
+                    name: row.try_get("name")?,
+                    display_name: row.try_get("display_name")?,
+                    protocol: row
+                        .try_get::<Option<String>, _>("protocol")?
+                        .unwrap_or_else(|| "unknown".into()),
+                    latency: row.try_get::<Option<i64>, _>("latency_ms")?.unwrap_or(0),
+                    country: row.try_get("country")?,
+                    subscription_id: row.try_get("subscription_id")?,
+                    subscription_name: row.try_get("source_name")?,
+                })
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
         let groups_rows = sqlx::query(
             r#"
 SELECT name, display_name, source, builtin, source_name, group_type, delay_ms, strategy_json
 FROM proxy_items
-WHERE kind = 'group' AND enabled = 1
+WHERE kind = 'group' AND enabled = 1 AND filtered_out = 0
+  AND (
+    subscription_id IS NULL
+    OR EXISTS (
+      SELECT 1 FROM subscriptions
+      WHERE subscriptions.id = proxy_items.subscription_id
+        AND subscriptions.ready = 1
+    )
+  )
 ORDER BY position, created_at
 "#,
         )
@@ -1590,15 +2204,21 @@ ORDER BY position, created_at
             } else {
                 None
             };
-            let members = self.group_members(&name).await?;
             let filters = self.group_filters(&name).await?;
+            let members = if source == "custom" {
+                crate::proxy::calculate_members(&nodes, &filters)
+            } else {
+                self.group_members(&name).await?
+            };
             let strategy: String = row.try_get("strategy_json")?;
             let now = serde_json::from_str::<Value>(&strategy)
                 .ok()
                 .and_then(|value| value.get("now").and_then(Value::as_str).map(str::to_string))
+                .filter(|selected| members.contains(selected))
                 .or_else(|| members.first().cloned());
             groups.push(ProxyGroupResponse {
                 name,
+                display_name: row.try_get("display_name")?,
                 group_type: row
                     .try_get::<Option<String>, _>("group_type")?
                     .unwrap_or_else(|| "select".into()),
@@ -1612,31 +2232,6 @@ ORDER BY position, created_at
             });
         }
 
-        let node_rows = sqlx::query(
-            r#"
-SELECT name, protocol, latency_ms, country, subscription_id, source_name
-FROM proxy_items
-WHERE kind = 'node' AND filtered_out = 0 AND enabled = 1
-ORDER BY subscription_id, display_name
-"#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let nodes = node_rows
-            .into_iter()
-            .map(|row| {
-                Ok(ProxyNodeResponse {
-                    name: row.try_get("name")?,
-                    protocol: row
-                        .try_get::<Option<String>, _>("protocol")?
-                        .unwrap_or_else(|| "unknown".into()),
-                    latency: row.try_get::<Option<i64>, _>("latency_ms")?.unwrap_or(0),
-                    country: row.try_get("country")?,
-                    subscription_id: row.try_get("subscription_id")?,
-                    subscription_name: row.try_get("source_name")?,
-                })
-            })
-            .collect::<Result<Vec<_>, AppError>>()?;
         Ok((groups, nodes))
     }
 
@@ -1659,35 +2254,7 @@ ORDER BY subscription_id, display_name
         .bind(group_name)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                let operator: String = row.try_get("operator")?;
-                let mut value: String = row.try_get("value")?;
-                let values_json: String = row.try_get("values_json")?;
-                let mut values: Vec<String> =
-                    serde_json::from_str(&values_json).unwrap_or_default();
-                if values.is_empty() && operator == "in" && !value.trim().is_empty() {
-                    values = value
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string)
-                        .collect();
-                }
-                if operator == "in" && !values.is_empty() {
-                    value.clear();
-                }
-                Ok(GroupFilterInput {
-                    id: Some(row.try_get("id")?),
-                    action: row.try_get("action")?,
-                    field: row.try_get("field")?,
-                    operator,
-                    value,
-                    values,
-                    enabled: Some(i64_to_bool(row.try_get("enabled")?)),
-                })
-            })
-            .collect()
+        rows.into_iter().map(group_filter_from_row).collect()
     }
 
     async fn valid_node_names(&self) -> Result<Vec<String>, AppError> {
@@ -1696,6 +2263,14 @@ ORDER BY subscription_id, display_name
 SELECT name
 FROM proxy_items
 WHERE kind = 'node' AND enabled = 1 AND filtered_out = 0
+  AND (
+    subscription_id IS NULL
+    OR EXISTS (
+      SELECT 1 FROM subscriptions
+      WHERE subscriptions.id = proxy_items.subscription_id
+        AND subscriptions.ready = 1
+    )
+  )
 ORDER BY subscription_id, position, display_name, name
 "#,
         )
@@ -1706,6 +2281,7 @@ ORDER BY subscription_id, position, display_name, name
             .collect()
     }
 
+    #[cfg(test)]
     async fn current_group_now(&self, group_name: &str) -> Result<Option<String>, AppError> {
         let row =
             sqlx::query("SELECT strategy_json FROM proxy_items WHERE name = ? AND kind = 'group'")
@@ -1721,13 +2297,7 @@ ORDER BY subscription_id, position, display_name, name
             .and_then(|value| value.get("now").and_then(Value::as_str).map(str::to_string)))
     }
 
-    pub async fn all_node_records(&self) -> Result<Vec<ProxyNodeResponse>, AppError> {
-        let (_, nodes) = self.proxy_topology().await?;
-        Ok(nodes)
-    }
-
     pub async fn proxy_items_for_runtime(&self) -> Result<Vec<ProxyItemRecord>, AppError> {
-        self.sync_builtin_proxy_group().await?;
         let rows = sqlx::query(
             r#"
 SELECT name, kind, subscription_id, display_name, source, builtin, source_name, protocol, country,
@@ -1735,6 +2305,14 @@ SELECT name, kind, subscription_id, display_name, source, builtin, source_name, 
        delay_ms, tolerance_ms, url, interval_seconds, strategy_json, position, enabled
 FROM proxy_items
 WHERE enabled = 1
+  AND (
+    subscription_id IS NULL
+    OR EXISTS (
+      SELECT 1 FROM subscriptions
+      WHERE subscriptions.id = proxy_items.subscription_id
+        AND subscriptions.ready <> 2
+    )
+  )
 ORDER BY kind, position, created_at
 "#,
         )
@@ -1769,17 +2347,27 @@ ORDER BY CASE WHEN source = 'user' THEN 0 ELSE 1 END, position, created_at, id
         desc: Option<&str>,
         enabled: bool,
     ) -> Result<RuleResponse, AppError> {
+        let _mutation = self.topology_mutation.lock().await;
         let id = id.unwrap_or_else(|| new_id("rule"));
         let now = now_iso();
-        let mut tx = self.pool.begin().await?;
-        let exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM routing_rules WHERE id = ?)",
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        validate_rule_target_in_transaction(&mut tx, rule_type, value, policy).await?;
+        let existing_source =
+            sqlx::query_scalar::<_, String>("SELECT source FROM routing_rules WHERE id = ?")
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let source = existing_source.as_deref().unwrap_or("user");
+        validate_single_enabled_match_in_transaction(
+            &mut tx,
+            source,
+            Some(&id),
+            rule_type,
+            enabled,
         )
-        .bind(&id)
-        .fetch_one(&mut *tx)
         .await?;
 
-        if exists {
+        if existing_source.is_some() {
             sqlx::query(
                 r#"
 UPDATE routing_rules
@@ -1796,6 +2384,7 @@ WHERE id = ?
             .bind(&id)
             .execute(&mut *tx)
             .await?;
+            move_rule_in_transaction(&mut tx, &id, None, &now).await?;
         } else {
             let first_match_position = if rule_type == "MATCH" {
                 None
@@ -1838,12 +2427,14 @@ VALUES(?, ?, ?, ?, ?, 'user', ?, ?, ?, ?)
             .bind(&now)
             .bind(&now)
             .execute(&mut *tx)
-            .await?;
+                .await?;
         }
+        let rule = rule_by_id_in_transaction(&mut tx, &id).await?;
         tx.commit().await?;
-        self.rule_by_id(&id).await
+        Ok(rule)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_rule(
         &self,
         id: &str,
@@ -1852,8 +2443,28 @@ VALUES(?, ?, ?, ?, ?, 'user', ?, ?, ?, ?)
         policy: &str,
         desc: Option<&str>,
         enabled: bool,
+        target_position: Option<usize>,
     ) -> Result<RuleResponse, AppError> {
+        let _mutation = self.topology_mutation.lock().await;
         let now = now_iso();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let source =
+            sqlx::query_scalar::<_, String>("SELECT source FROM routing_rules WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    AppError::not_found("rule_not_found", format!("rule {id} not found"))
+                })?;
+        validate_rule_target_in_transaction(&mut tx, rule_type, value, policy).await?;
+        validate_single_enabled_match_in_transaction(
+            &mut tx,
+            &source,
+            Some(id),
+            rule_type,
+            enabled,
+        )
+        .await?;
         let result = sqlx::query(
             r#"
 UPDATE routing_rules
@@ -1868,7 +2479,7 @@ WHERE id = ?
         .bind(desc)
         .bind(&now)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(AppError::not_found(
@@ -1876,69 +2487,33 @@ WHERE id = ?
                 format!("rule {id} not found"),
             ));
         }
-        self.rule_by_id(id).await
+        move_rule_in_transaction(&mut tx, id, target_position, &now).await?;
+        let rule = rule_by_id_in_transaction(&mut tx, id).await?;
+        tx.commit().await?;
+        Ok(rule)
     }
 
+    #[cfg(test)]
     pub async fn move_rule(
         &self,
         id: &str,
         target_position: usize,
     ) -> Result<RuleResponse, AppError> {
-        let mut tx = self.pool.begin().await?;
-        let source =
-            sqlx::query_scalar::<_, String>("SELECT source FROM routing_rules WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or_else(|| {
-                    AppError::not_found("rule_not_found", format!("rule {id} not found"))
-                })?;
-        let rows = sqlx::query(
-            "SELECT id, rule_type FROM routing_rules WHERE source = ? ORDER BY position, created_at, id",
-        )
-        .bind(&source)
-        .fetch_all(&mut *tx)
-        .await?;
-        let mut ids = rows
-            .iter()
-            .map(|row| {
-                (
-                    row.get::<String, _>("id"),
-                    row.get::<String, _>("rule_type"),
-                )
-            })
-            .collect::<Vec<_>>();
-        let current = ids
-            .iter()
-            .position(|(rule_id, _)| rule_id == id)
-            .expect("rule was selected above");
-        let item = ids.remove(current);
-        let target = if item.1 == "MATCH" {
-            ids.len()
-        } else {
-            let max_target = ids
-                .iter()
-                .position(|(_, kind)| kind == "MATCH")
-                .unwrap_or(ids.len());
-            target_position.saturating_sub(1).min(max_target)
-        };
-        ids.insert(target, item);
-        for (index, (rule_id, _)) in ids.iter().enumerate() {
-            sqlx::query("UPDATE routing_rules SET position = ?, updated_at = ? WHERE id = ?")
-                .bind(((index + 1) as i64) * 1024)
-                .bind(now_iso())
-                .bind(rule_id)
-                .execute(&mut *tx)
-                .await?;
-        }
+        let _mutation = self.topology_mutation.lock().await;
+        let now = now_iso();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        move_rule_in_transaction(&mut tx, id, Some(target_position), &now).await?;
+        let rule = rule_by_id_in_transaction(&mut tx, id).await?;
         tx.commit().await?;
-        self.rule_by_id(id).await
+        Ok(rule)
     }
 
     pub async fn delete_rule(&self, id: &str) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query("DELETE FROM routing_rules WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
             return Err(AppError::not_found(
@@ -1946,12 +2521,13 @@ WHERE id = ?
                 format!("rule {id} not found"),
             ));
         }
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn list_rule_sets(&self) -> Result<Vec<RuleSetResponse>, AppError> {
         let rows = sqlx::query(
-            "SELECT id, name, url, behavior, format, rule_count, last_update_at, last_error FROM rule_sets ORDER BY name",
+            "SELECT id, name, url, behavior, format, rule_count, last_update_at, last_error FROM rule_sets WHERE ready = 1 ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1971,9 +2547,49 @@ WHERE id = ?
             .collect()
     }
 
+    pub async fn rule_set_including_staged(
+        &self,
+        id: &str,
+    ) -> Result<Option<RuleSetResponse>, AppError> {
+        let row = sqlx::query(
+            r#"
+SELECT id, name, url, behavior,
+       COALESCE(staged_format, format) AS format,
+       COALESCE(staged_rule_count, rule_count) AS rule_count,
+       COALESCE(staged_update_at, last_update_at) AS last_update_at,
+       COALESCE(staged_last_error, last_error) AS last_error
+FROM rule_sets
+WHERE id = ? AND (ready = 1 OR staged_local_path IS NOT NULL)
+"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(RuleSetResponse {
+                id: row.try_get("id")?,
+                name: row.try_get("name")?,
+                url: row.try_get("url")?,
+                behavior: row.try_get("behavior")?,
+                format: row.try_get("format")?,
+                rule_count: row.try_get("rule_count")?,
+                last_update: row.try_get("last_update_at")?,
+                last_error: row.try_get("last_error")?,
+            })
+        })
+        .transpose()
+    }
+
     pub async fn rule_sets_for_runtime(&self) -> Result<Vec<RuleSetRecord>, AppError> {
         let rows = sqlx::query(
-            "SELECT id, name, url, behavior, format, local_path FROM rule_sets ORDER BY name",
+            r#"
+SELECT id, name, url, behavior,
+       COALESCE(staged_format, format) AS format,
+       COALESCE(staged_local_path, local_path) AS local_path
+FROM rule_sets
+WHERE ready = 1 OR staged_local_path IS NOT NULL
+ORDER BY name
+"#,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1991,12 +2607,67 @@ WHERE id = ?
             .collect()
     }
 
+    pub async fn rule_set_snapshot_paths(&self) -> Result<Vec<String>, AppError> {
+        let rows = sqlx::query("SELECT local_path, staged_local_path FROM rule_sets")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut paths = Vec::with_capacity(rows.len() * 2);
+        for row in rows {
+            if let Some(path) = row.try_get::<Option<String>, _>("local_path")? {
+                paths.push(path);
+            }
+            if let Some(path) = row.try_get::<Option<String>, _>("staged_local_path")? {
+                paths.push(path);
+            }
+        }
+        Ok(paths)
+    }
+
+    pub async fn rule_set_snapshot_paths_for_id(&self, id: &str) -> Result<Vec<String>, AppError> {
+        let row = sqlx::query("SELECT local_path, staged_local_path FROM rule_sets WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(Vec::new());
+        };
+        let mut paths = Vec::with_capacity(2);
+        if let Some(path) = row.try_get::<Option<String>, _>("local_path")? {
+            paths.push(path);
+        }
+        if let Some(path) = row.try_get::<Option<String>, _>("staged_local_path")? {
+            paths.push(path);
+        }
+        Ok(paths)
+    }
+
+    pub async fn rule_set_for_refresh(&self, id: &str) -> Result<Option<RuleSetRecord>, AppError> {
+        let row = sqlx::query(
+            "SELECT id, name, url, behavior, format, local_path FROM rule_sets WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(RuleSetRecord {
+                id: row.try_get("id")?,
+                name: row.try_get("name")?,
+                url: row.try_get("url")?,
+                behavior: row.try_get("behavior")?,
+                format: row.try_get("format")?,
+                local_path: row.try_get("local_path")?,
+            })
+        })
+        .transpose()
+    }
+
     pub async fn due_rule_set_ids(&self) -> Result<Vec<String>, AppError> {
         let rows = sqlx::query(
             r#"
 SELECT id
 FROM rule_sets
-WHERE interval_seconds > 0
+WHERE ready = 1
+  AND interval_seconds > 0
   AND (
     last_update_at IS NULL
     OR CAST(strftime('%s', last_update_at) AS INTEGER) + interval_seconds
@@ -2011,6 +2682,7 @@ WHERE interval_seconds > 0
             .collect()
     }
 
+    #[cfg(test)]
     pub async fn create_rule_set(
         &self,
         id: &str,
@@ -2020,28 +2692,75 @@ WHERE interval_seconds > 0
         behavior: Option<&str>,
         format: &str,
     ) -> Result<(), AppError> {
+        self.create_rule_set_with_ready(id, name, url, interval_seconds, behavior, format, true)
+            .await
+    }
+
+    pub async fn create_pending_rule_set(
+        &self,
+        id: &str,
+        name: &str,
+        url: &str,
+        interval_seconds: u64,
+        behavior: Option<&str>,
+        format: &str,
+    ) -> Result<(), AppError> {
+        self.create_rule_set_with_ready(id, name, url, interval_seconds, behavior, format, false)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_rule_set_with_ready(
+        &self,
+        id: &str,
+        name: &str,
+        url: &str,
+        interval_seconds: u64,
+        behavior: Option<&str>,
+        format: &str,
+        ready: bool,
+    ) -> Result<(), AppError> {
+        let interval_seconds = sqlite_i64(interval_seconds, "rule set interval_seconds")?;
+        let _mutation = self.topology_mutation.lock().await;
         let now = now_iso();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let existing = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM rule_sets WHERE id = ? OR name = ? LIMIT 1",
+        )
+        .bind(id)
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if existing.is_some() {
+            return Err(AppError::conflict(
+                "ruleset_exists",
+                format!("rule set {name} already exists"),
+            ));
+        }
         sqlx::query(
             r#"
-INSERT INTO rule_sets(id, name, url, behavior, format, interval_seconds, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO rule_sets(id, name, url, ready, behavior, format, interval_seconds, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
         )
         .bind(id)
         .bind(name)
         .bind(url)
+        .bind(bool_to_i64(ready))
         .bind(behavior)
         .bind(format)
-        .bind(interval_seconds as i64)
+        .bind(interval_seconds)
         .bind(&now)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn delete_rule_set(&self, id: &str) -> Result<(), AppError> {
-        let mut tx = self.pool.begin().await?;
+        let _mutation = self.topology_mutation.lock().await;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query("SELECT name FROM rule_sets WHERE id = ?")
             .bind(id)
             .fetch_optional(&mut *tx)
@@ -2076,6 +2795,61 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)
         Ok(())
     }
 
+    pub async fn stage_rule_set_deletion(&self, id: &str) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query("SELECT name FROM rule_sets WHERE id = ? AND ready = 1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                AppError::not_found("ruleset_not_found", format!("rule set {id} not found"))
+            })?;
+        if BUILTIN_RULE_SETS.iter().any(|rule_set| rule_set.id == id) {
+            return Err(AppError::conflict(
+                "ruleset_readonly",
+                "builtin rule sets cannot be deleted",
+            ));
+        }
+        let name: String = row.try_get("name")?;
+        let referenced_by = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM routing_rules WHERE rule_type = 'RULE-SET' AND value = ? LIMIT 1",
+        )
+        .bind(&name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(rule_id) = referenced_by {
+            return Err(AppError::conflict(
+                "ruleset_in_use",
+                format!("rule set {name} is referenced by routing rule {rule_id}"),
+            ));
+        }
+        sqlx::query("UPDATE rule_sets SET ready = 3, updated_at = ? WHERE id = ?")
+            .bind(now_iso())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn restore_rule_set_deletion(&self, id: &str) -> Result<(), AppError> {
+        let result = sqlx::query(
+            "UPDATE rule_sets SET ready = 1, updated_at = ? WHERE id = ? AND ready = 3",
+        )
+        .bind(now_iso())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::not_found(
+                "ruleset_not_found",
+                format!("staged rule-set deletion {id} not found"),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn update_rule_set_refresh(
         &self,
@@ -2086,27 +2860,187 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)
         content_hash: &str,
         format: &str,
         last_error: Option<&str>,
-    ) -> Result<(), AppError> {
+    ) -> Result<RuleSetRefreshState, AppError> {
+        let previous = self
+            .stage_rule_set_refresh(
+                id,
+                local_path,
+                file_size_bytes,
+                rule_count,
+                content_hash,
+                format,
+                last_error,
+            )
+            .await?;
+        if let Err(error) = self.activate_rule_set(id).await {
+            let restore = self.restore_rule_set_refresh(id, &previous).await;
+            return Err(AppError::internal(format!(
+                "committing rule set {id} failed ({error}); restoring previous metadata: {restore:?}"
+            )));
+        }
+        Ok(previous)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stage_rule_set_refresh(
+        &self,
+        id: &str,
+        local_path: &str,
+        file_size_bytes: u64,
+        rule_count: u64,
+        content_hash: &str,
+        format: &str,
+        last_error: Option<&str>,
+    ) -> Result<RuleSetRefreshState, AppError> {
+        let file_size_bytes = sqlite_i64(file_size_bytes, "rule set file_size_bytes")?;
+        let rule_count = sqlite_i64(rule_count, "rule set rule_count")?;
+        let _mutation = self.topology_mutation.lock().await;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let previous = sqlx::query(
+            "SELECT ready, local_path, file_size_bytes, rule_count, content_hash, format, last_update_at, last_error FROM rule_sets WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::not_found("ruleset_not_found", format!("rule set {id} not found"))
+        })?;
+        let previous = RuleSetRefreshState {
+            ready: i64_to_bool(previous.try_get("ready")?),
+            local_path: previous.try_get("local_path")?,
+            file_size_bytes: previous.try_get("file_size_bytes")?,
+            rule_count: previous.try_get("rule_count")?,
+            content_hash: previous.try_get("content_hash")?,
+            format: previous.try_get("format")?,
+            last_update_at: previous.try_get("last_update_at")?,
+            last_error: previous.try_get("last_error")?,
+        };
         let now = now_iso();
-        sqlx::query(
+        let result = sqlx::query(
             r#"
 UPDATE rule_sets
-SET local_path = ?, file_size_bytes = ?, rule_count = ?, content_hash = ?,
-    format = ?, last_update_at = ?, last_error = ?, updated_at = ?
+SET staged_local_path = ?,
+    staged_file_size_bytes = ?,
+    staged_rule_count = ?,
+    staged_content_hash = ?,
+    staged_format = ?,
+    staged_update_at = ?,
+    staged_last_error = ?,
+    updated_at = ?
 WHERE id = ?
 "#,
         )
         .bind(local_path)
-        .bind(file_size_bytes as i64)
-        .bind(rule_count as i64)
+        .bind(file_size_bytes)
+        .bind(rule_count)
         .bind(content_hash)
         .bind(format)
         .bind(&now)
         .bind(last_error)
         .bind(&now)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::not_found(
+                "ruleset_not_found",
+                format!("rule set {id} not found"),
+            ));
+        }
+        tx.commit().await?;
+        Ok(previous)
+    }
+
+    pub async fn activate_rule_set(&self, id: &str) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result = sqlx::query(
+            r#"
+UPDATE rule_sets
+SET ready = 1,
+    local_path = staged_local_path,
+    file_size_bytes = staged_file_size_bytes,
+    rule_count = staged_rule_count,
+    content_hash = staged_content_hash,
+    format = staged_format,
+    last_update_at = staged_update_at,
+    last_error = staged_last_error,
+    staged_local_path = NULL,
+    staged_file_size_bytes = NULL,
+    staged_rule_count = NULL,
+    staged_content_hash = NULL,
+    staged_format = NULL,
+    staged_update_at = NULL,
+    staged_last_error = NULL,
+    updated_at = ?
+WHERE id = ? AND staged_local_path IS NOT NULL
+"#,
+        )
+        .bind(now_iso())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::not_found(
+                "ruleset_not_found",
+                format!("staged rule set {id} not found"),
+            ));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn restore_rule_set_refresh(
+        &self,
+        id: &str,
+        previous: &RuleSetRefreshState,
+    ) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result = sqlx::query(
+            r#"
+UPDATE rule_sets
+SET ready = ?, local_path = ?, file_size_bytes = ?, rule_count = ?, content_hash = ?,
+    format = ?, last_update_at = ?, last_error = ?,
+    staged_local_path = NULL, staged_file_size_bytes = NULL, staged_rule_count = NULL,
+    staged_content_hash = NULL, staged_format = NULL, staged_update_at = NULL,
+    staged_last_error = NULL, updated_at = ?
+WHERE id = ?
+"#,
+        )
+        .bind(bool_to_i64(previous.ready))
+        .bind(&previous.local_path)
+        .bind(previous.file_size_bytes)
+        .bind(previous.rule_count)
+        .bind(&previous.content_hash)
+        .bind(&previous.format)
+        .bind(&previous.last_update_at)
+        .bind(&previous.last_error)
+        .bind(now_iso())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::not_found(
+                "ruleset_not_found",
+                format!("rule set {id} not found"),
+            ));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn mark_rule_set_refresh_error(
+        &self,
+        id: &str,
+        message: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query("UPDATE rule_sets SET last_error = ?, updated_at = ? WHERE id = ?")
+            .bind(message)
+            .bind(now_iso())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -2218,17 +3152,6 @@ ORDER BY id ASC
             map.insert(protocol, Value::from(count));
         }
         Ok(map)
-    }
-
-    async fn rule_by_id(&self, id: &str) -> Result<RuleResponse, AppError> {
-        let row = sqlx::query(
-            "SELECT id, position, rule_type, value, policy, source, enabled, desc FROM routing_rules WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| AppError::not_found("rule_not_found", format!("rule {id} not found")))?;
-        rule_from_row(row)
     }
 }
 
@@ -2419,9 +3342,11 @@ WHERE member_name = ?
             .await?;
     }
 
-    let filter_rows = sqlx::query("SELECT id, value, values_json FROM proxy_group_filters")
-        .fetch_all(&mut **tx)
-        .await?;
+    let filter_rows = sqlx::query(
+        "SELECT id, value, values_json FROM proxy_group_filters WHERE field = 'name' AND operator IN ('equals', 'in')",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
     for row in filter_rows {
         let filter_id: String = row.try_get("id")?;
         let mut value: String = row.try_get("value")?;
@@ -2482,6 +3407,7 @@ WHERE member_name = ?
     Ok(SubscriptionAssetMigration {
         reference_count: migrations.len(),
         group_selections,
+        name_migrations: all_name_migrations,
     })
 }
 
@@ -2489,6 +3415,7 @@ WHERE member_name = ?
 struct SubscriptionAssetMigration {
     reference_count: usize,
     group_selections: HashMap<String, String>,
+    name_migrations: HashMap<String, String>,
 }
 
 fn legacy_asset_display_name(
@@ -2581,6 +3508,455 @@ WHERE proxy_items.builtin = 0 OR excluded.builtin = 1
     Ok(())
 }
 
+async fn valid_node_records_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<Vec<ProxyNodeResponse>, AppError> {
+    let rows = sqlx::query(
+        r#"
+SELECT name, display_name, protocol, latency_ms, country, subscription_id, source_name
+FROM proxy_items
+WHERE kind = 'node' AND filtered_out = 0 AND enabled = 1
+  AND (
+    subscription_id IS NULL
+    OR EXISTS (
+      SELECT 1 FROM subscriptions
+      WHERE subscriptions.id = proxy_items.subscription_id
+        AND subscriptions.ready = 1
+    )
+  )
+ORDER BY subscription_id, display_name
+"#,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(ProxyNodeResponse {
+                name: row.try_get("name")?,
+                display_name: row.try_get("display_name")?,
+                protocol: row
+                    .try_get::<Option<String>, _>("protocol")?
+                    .unwrap_or_else(|| "unknown".into()),
+                latency: row.try_get::<Option<i64>, _>("latency_ms")?.unwrap_or(0),
+                country: row.try_get("country")?,
+                subscription_id: row.try_get("subscription_id")?,
+                subscription_name: row.try_get("source_name")?,
+            })
+        })
+        .collect()
+}
+
+async fn group_filters_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    group_name: &str,
+) -> Result<Vec<GroupFilterInput>, AppError> {
+    let rows = sqlx::query(
+        "SELECT id, action, field, operator, value, values_json, enabled FROM proxy_group_filters WHERE group_name = ? ORDER BY position",
+    )
+    .bind(group_name)
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter().map(group_filter_from_row).collect()
+}
+
+fn group_filter_from_row(row: sqlx::sqlite::SqliteRow) -> Result<GroupFilterInput, AppError> {
+    let operator: String = row.try_get("operator")?;
+    let mut value: String = row.try_get("value")?;
+    let values_json: String = row.try_get("values_json")?;
+    let mut values: Vec<String> = serde_json::from_str(&values_json).unwrap_or_default();
+    if !matches!(operator.as_str(), "in" | "equals") {
+        values.clear();
+    }
+    if values.is_empty() && operator == "in" && !value.trim().is_empty() {
+        values = value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    if operator == "in" && !values.is_empty() {
+        value.clear();
+    }
+    Ok(GroupFilterInput {
+        id: Some(row.try_get("id")?),
+        action: row.try_get("action")?,
+        field: row.try_get("field")?,
+        operator,
+        value,
+        values,
+        enabled: Some(i64_to_bool(row.try_get("enabled")?)),
+    })
+}
+
+async fn current_group_now_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    group_name: &str,
+) -> Result<Option<String>, AppError> {
+    let strategy = sqlx::query_scalar::<_, String>(
+        "SELECT strategy_json FROM proxy_items WHERE name = ? AND kind = 'group'",
+    )
+    .bind(group_name)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(strategy.and_then(|strategy| {
+        serde_json::from_str::<Value>(&strategy)
+            .ok()
+            .and_then(|value| value.get("now").and_then(Value::as_str).map(str::to_string))
+    }))
+}
+
+async fn validate_select_group_member_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    group_name: &str,
+    member_name: &str,
+) -> Result<(), AppError> {
+    let group_type = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT group_type FROM proxy_items WHERE name = ? AND kind = 'group'",
+    )
+    .bind(group_name)
+    .fetch_optional(&mut **tx)
+    .await?
+    .flatten()
+    .ok_or_else(|| {
+        AppError::not_found(
+            "proxy_group_not_found",
+            format!("proxy group {group_name} not found"),
+        )
+    })?;
+    if group_type != "select" {
+        return Err(AppError::bad_request(
+            "proxy_group_not_selectable",
+            format!("proxy group {group_name} has type {group_type} and cannot be selected"),
+        ));
+    }
+    let member_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM proxy_group_members WHERE group_name = ? AND member_name = ?)",
+    )
+    .bind(group_name)
+    .bind(member_name)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !member_exists {
+        return Err(AppError::bad_request(
+            "proxy_group_member_not_found",
+            format!("proxy {member_name} is not a member of group {group_name}"),
+        ));
+    }
+    Ok(())
+}
+
+async fn replace_group_members_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    group_name: &str,
+    members: &[String],
+    preferred_selection: Option<String>,
+    now: &str,
+) -> Result<(), AppError> {
+    let selected = match preferred_selection {
+        Some(selected) => Some(selected),
+        None => current_group_now_in_transaction(tx, group_name).await?,
+    }
+    .filter(|selected| members.contains(selected))
+    .or_else(|| members.first().cloned());
+    let strategy = selected
+        .map(|name| serde_json::json!({ "now": name }).to_string())
+        .unwrap_or_else(|| "{}".to_string());
+
+    sqlx::query("DELETE FROM proxy_group_members WHERE group_name = ?")
+        .bind(group_name)
+        .execute(&mut **tx)
+        .await?;
+    for (index, member) in members.iter().enumerate() {
+        sqlx::query(
+            "INSERT OR IGNORE INTO proxy_group_members(group_name, member_name, position, created_at) VALUES(?, ?, ?, ?)",
+        )
+        .bind(group_name)
+        .bind(member)
+        .bind(((index + 1) as i64) * 1024)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+    }
+    sqlx::query(
+        "UPDATE proxy_items SET strategy_json = ?, updated_at = ? WHERE name = ? AND kind = 'group'",
+    )
+    .bind(strategy)
+    .bind(now)
+    .bind(group_name)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn replace_group_filters_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    group_name: &str,
+    filters: &[GroupFilterInput],
+    now: &str,
+) -> Result<(), AppError> {
+    sqlx::query("DELETE FROM proxy_group_filters WHERE group_name = ?")
+        .bind(group_name)
+        .execute(&mut **tx)
+        .await?;
+    for (index, filter) in filters.iter().enumerate() {
+        let operator = filter.operator.trim();
+        let values = if operator == "in" || (operator == "equals" && filter.has_values()) {
+            filter
+                .effective_values()
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let values_json = serde_json::to_string(&values)?;
+        sqlx::query(
+            r#"
+INSERT INTO proxy_group_filters(id, group_name, position, action, field, operator, value, values_json, enabled, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"#,
+        )
+        .bind(filter.id.clone().unwrap_or_else(|| new_id("pgf")))
+        .bind(group_name)
+        .bind(((index + 1) as i64) * 1024)
+        .bind(filter.action.trim())
+        .bind(filter.field.trim())
+        .bind(operator)
+        .bind(filter.value.trim())
+        .bind(values_json)
+        .bind(bool_to_i64(filter.enabled.unwrap_or(true)))
+        .bind(now)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn validate_rule_target_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    rule_type: &str,
+    value: &str,
+    policy: &str,
+) -> Result<(), AppError> {
+    if rule_type == "RULE-SET" {
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM rule_sets WHERE name = ? AND ready = 1)",
+        )
+        .bind(value)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !exists {
+            return Err(AppError::bad_request(
+                "rule_invalid_ruleset",
+                format!("rule set {value} does not exist"),
+            ));
+        }
+    }
+    if !is_builtin_policy(policy)
+        && !available_policy_targets_in_transaction(tx)
+            .await?
+            .contains(policy)
+    {
+        return Err(AppError::bad_request(
+            "rule_invalid_policy",
+            format!("rule policy {policy} is not available"),
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_single_enabled_match_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source: &str,
+    current_id: Option<&str>,
+    rule_type: &str,
+    enabled: bool,
+) -> Result<(), AppError> {
+    if rule_type != "MATCH" || !enabled {
+        return Ok(());
+    }
+    let existing = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM routing_rules WHERE source = ? AND rule_type = 'MATCH' AND enabled = 1 AND (? IS NULL OR id <> ?) LIMIT 1",
+    )
+    .bind(source)
+    .bind(current_id)
+    .bind(current_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(existing) = existing {
+        return Err(AppError::conflict(
+            "rule_match_exists",
+            format!("rule source {source} already has enabled MATCH rule {existing}"),
+        ));
+    }
+    Ok(())
+}
+
+async fn available_policy_targets_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<HashSet<String>, AppError> {
+    let items = sqlx::query(
+        r#"
+SELECT name, kind, subscription_id, display_name, source, builtin, source_name, protocol, country,
+       group_type, raw_json, content_hash, latency_ms, alive, filtered_out, filter_reason,
+       delay_ms, tolerance_ms, url, interval_seconds, strategy_json, position, enabled
+FROM proxy_items
+WHERE enabled = 1
+  AND (
+    subscription_id IS NULL
+    OR EXISTS (
+      SELECT 1 FROM subscriptions
+      WHERE subscriptions.id = proxy_items.subscription_id
+        AND subscriptions.ready = 1
+    )
+  )
+ORDER BY kind, position, created_at
+"#,
+    )
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .map(proxy_item_from_row)
+    .collect::<Result<Vec<_>, _>>()?;
+    let member_rows = sqlx::query(
+        "SELECT group_name, member_name FROM proxy_group_members ORDER BY group_name, position, member_name",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut member_map = HashMap::<String, Vec<String>>::new();
+    for row in member_rows {
+        member_map
+            .entry(row.try_get("group_name")?)
+            .or_default()
+            .push(row.try_get("member_name")?);
+    }
+    let nodes = items
+        .iter()
+        .filter(|item| item.kind == "node" && !item.filtered_out)
+        .map(|item| ProxyNodeResponse {
+            name: item.name.clone(),
+            display_name: item.display_name.clone(),
+            protocol: item.protocol.clone().unwrap_or_else(|| "unknown".into()),
+            latency: item.latency_ms.unwrap_or(0),
+            country: item.country.clone(),
+            subscription_id: item.subscription_id.clone(),
+            subscription_name: item.source_name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let custom_group_names = items
+        .iter()
+        .filter(|item| item.kind == "group" && item.source == "custom" && !item.filtered_out)
+        .map(|item| item.name.clone())
+        .collect::<Vec<_>>();
+    for group_name in custom_group_names {
+        let filters = group_filters_in_transaction(tx, &group_name).await?;
+        member_map.insert(
+            group_name,
+            crate::proxy::calculate_members(&nodes, &filters),
+        );
+    }
+    crate::runtime::available_policy_targets_from_assets(&items, &member_map)
+}
+
+async fn validate_no_referenced_policy_became_unavailable(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    available_before: &HashSet<String>,
+) -> Result<(), AppError> {
+    let available_after = available_policy_targets_in_transaction(tx).await?;
+    let referenced_policies =
+        sqlx::query_scalar::<_, String>("SELECT DISTINCT policy FROM routing_rules")
+            .fetch_all(&mut **tx)
+            .await?;
+    if let Some(policy) = referenced_policies
+        .into_iter()
+        .find(|policy| available_before.contains(policy) && !available_after.contains(policy))
+    {
+        return Err(AppError::conflict(
+            "subscription_asset_referenced",
+            format!("subscription mutation would make referenced policy {policy} unavailable"),
+        ));
+    }
+    Ok(())
+}
+
+fn is_builtin_policy(value: &str) -> bool {
+    matches!(
+        value,
+        BUILTIN_DIRECT | BUILTIN_REJECT | BUILTIN_GLOBAL | BUILTIN_PROXY
+    )
+}
+
+async fn move_rule_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    target_position: Option<usize>,
+    now: &str,
+) -> Result<(), AppError> {
+    let source = sqlx::query_scalar::<_, String>("SELECT source FROM routing_rules WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| AppError::not_found("rule_not_found", format!("rule {id} not found")))?;
+    let rows = sqlx::query(
+        "SELECT id, rule_type FROM routing_rules WHERE source = ? ORDER BY position, created_at, id",
+    )
+    .bind(&source)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut ids = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("id"),
+                row.get::<String, _>("rule_type"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let current = ids
+        .iter()
+        .position(|(rule_id, _)| rule_id == id)
+        .ok_or_else(|| AppError::not_found("rule_not_found", format!("rule {id} not found")))?;
+    let item = ids.remove(current);
+    let target = if item.1 == "MATCH" {
+        ids.len()
+    } else {
+        let max_target = ids
+            .iter()
+            .position(|(_, kind)| kind == "MATCH")
+            .unwrap_or(ids.len());
+        target_position
+            .map(|position| position.saturating_sub(1))
+            .unwrap_or(current)
+            .min(max_target)
+    };
+    ids.insert(target, item);
+    for (index, (rule_id, _)) in ids.iter().enumerate() {
+        sqlx::query("UPDATE routing_rules SET position = ?, updated_at = ? WHERE id = ?")
+            .bind(((index + 1) as i64) * 1024)
+            .bind(now)
+            .bind(rule_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn rule_by_id_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+) -> Result<RuleResponse, AppError> {
+    let row = sqlx::query(
+        "SELECT id, position, rule_type, value, policy, source, enabled, desc FROM routing_rules WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| AppError::not_found("rule_not_found", format!("rule {id} not found")))?;
+    rule_from_row(row)
+}
+
 fn merge_default_config(mut map: Map<String, Value>) -> Value {
     let defaults =
         serde_json::to_value(SystemConfig::default()).unwrap_or(Value::Object(Map::new()));
@@ -2597,6 +3973,9 @@ fn filter_rule_from_row(row: sqlx::sqlite::SqliteRow) -> Result<FilterRule, AppE
     let mut pattern: String = row.try_get("pattern")?;
     let values_json: String = row.try_get("values_json")?;
     let mut values: Vec<String> = serde_json::from_str(&values_json).unwrap_or_default();
+    if !matches!(match_type.as_str(), "in" | "equals") {
+        values.clear();
+    }
     if values.is_empty() && match_type == "in" && !pattern.trim().is_empty() {
         values = pattern
             .split(',')
@@ -2625,7 +4004,7 @@ async fn insert_subscription_rules(
     now: &str,
 ) -> Result<(), AppError> {
     for (index, rule) in rules.iter().enumerate() {
-        let values = if rule.match_type.trim() == "in" || rule.has_values() {
+        let values = if matches!(rule.match_type.trim(), "in" | "equals") {
             rule.effective_values()
                 .into_iter()
                 .map(str::to_string)
@@ -2686,6 +4065,19 @@ fn proxy_item_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ProxyItemRecord, 
         position: row.try_get("position")?,
         enabled: i64_to_bool(row.try_get("enabled")?),
     })
+}
+
+fn sqlite_i64(value: u64, field: &str) -> Result<i64, AppError> {
+    i64::try_from(value).map_err(|_| {
+        AppError::bad_request(
+            "numeric_value_out_of_range",
+            format!("{field} exceeds the supported maximum of {}", i64::MAX),
+        )
+    })
+}
+
+fn optional_sqlite_i64(value: Option<u64>, field: &str) -> Result<Option<i64>, AppError> {
+    value.map(|value| sqlite_i64(value, field)).transpose()
 }
 
 fn rule_from_row(row: sqlx::sqlite::SqliteRow) -> Result<RuleResponse, AppError> {
@@ -2819,6 +4211,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_normalizes_legacy_duplicate_match_rules_and_enforces_uniqueness() {
+        let temp = TestDir::new("normalize-legacy-match-rules");
+        let paths = AppPaths::from_root(temp.path());
+        let storage = Storage::connect(&paths)
+            .await
+            .expect("connect initial storage");
+        sqlx::query("DROP INDEX idx_routing_rules_one_enabled_match_per_source")
+            .execute(&storage.pool)
+            .await
+            .expect("simulate a database created before the unique index");
+        let now = now_iso();
+        for (id, position, rule_type) in [
+            ("legacy_match_first", 1024_i64, "MATCH"),
+            ("legacy_normal", 2048_i64, "DOMAIN"),
+            ("legacy_match_second", 3072_i64, "MATCH"),
+        ] {
+            sqlx::query(
+                r#"
+INSERT INTO routing_rules(
+  id, position, rule_type, value, policy, source, enabled, created_at, updated_at
+) VALUES(?, ?, ?, ?, 'DIRECT', 'legacy', 1, ?, ?)
+"#,
+            )
+            .bind(id)
+            .bind(position)
+            .bind(rule_type)
+            .bind(if rule_type == "MATCH" {
+                "ANY"
+            } else {
+                "legacy.example"
+            })
+            .bind(&now)
+            .bind(&now)
+            .execute(&storage.pool)
+            .await
+            .expect("insert legacy rule");
+        }
+        storage.pool.close().await;
+
+        let reopened = Storage::connect(&paths)
+            .await
+            .expect("reconnect and normalize storage");
+        let legacy = reopened
+            .list_rules()
+            .await
+            .expect("list normalized rules")
+            .into_iter()
+            .filter(|rule| rule.source == "legacy")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            legacy
+                .iter()
+                .map(|rule| (rule.id.as_str(), rule.enabled))
+                .collect::<Vec<_>>(),
+            vec![
+                ("legacy_normal", true),
+                ("legacy_match_first", true),
+                ("legacy_match_second", false),
+            ]
+        );
+        assert!(legacy
+            .windows(2)
+            .all(|pair| pair[0].position < pair[1].position));
+
+        let duplicate = sqlx::query(
+            r#"
+INSERT INTO routing_rules(
+  id, position, rule_type, value, policy, source, enabled, created_at, updated_at
+) VALUES('legacy_match_third', 4096, 'MATCH', 'ANY', 'DIRECT', 'legacy', 1, ?, ?)
+"#,
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(&reopened.pool)
+        .await;
+        assert!(
+            duplicate.is_err(),
+            "the partial unique index must reject a second enabled MATCH"
+        );
+    }
+
+    #[tokio::test]
     async fn moving_rules_uses_one_based_positions_and_keeps_match_last() {
         let temp = TestDir::new("move-rule");
         let storage = Storage::connect(&AppPaths::from_root(temp.path()))
@@ -2845,6 +4319,106 @@ mod tests {
             .map(|rule| rule.id)
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["two", "one", "match"]);
+    }
+
+    #[tokio::test]
+    async fn rule_updates_apply_fields_and_order_together_and_keep_match_last() {
+        let temp = TestDir::new("atomic-rule-update-order");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        for id in ["one", "two", "three"] {
+            storage
+                .upsert_rule(
+                    Some(format!("rule_{id}")),
+                    "DOMAIN",
+                    &format!("{id}.example.com"),
+                    "DIRECT",
+                    None,
+                    true,
+                )
+                .await
+                .expect("insert user rule");
+        }
+
+        let updated = storage
+            .update_rule(
+                "rule_three",
+                "DOMAIN-SUFFIX",
+                "updated.example.com",
+                "PROXY",
+                Some("updated fields and order"),
+                false,
+                Some(1),
+            )
+            .await
+            .expect("update fields and move in one transaction");
+        assert_eq!(updated.rule_type, "DOMAIN-SUFFIX");
+        assert_eq!(updated.value, "updated.example.com");
+        assert_eq!(updated.policy, "PROXY");
+        assert_eq!(updated.desc.as_deref(), Some("updated fields and order"));
+        assert!(!updated.enabled);
+        assert_eq!(updated.position, 1024);
+
+        let user_rules = storage
+            .list_rules()
+            .await
+            .expect("list updated rules")
+            .into_iter()
+            .filter(|rule| rule.source == "user")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            user_rules
+                .iter()
+                .map(|rule| rule.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rule_three", "rule_one", "rule_two"]
+        );
+        assert_eq!(user_rules[0].rule_type, "DOMAIN-SUFFIX");
+        assert_eq!(user_rules[0].value, "updated.example.com");
+
+        storage
+            .update_rule("rule_one", "MATCH", "ANY", "DIRECT", None, true, None)
+            .await
+            .expect("change an existing rule to MATCH without a position");
+        let after_update = storage
+            .list_rules()
+            .await
+            .expect("list rules after MATCH update")
+            .into_iter()
+            .filter(|rule| rule.source == "user")
+            .map(|rule| rule.id)
+            .collect::<Vec<_>>();
+        assert_eq!(after_update, vec!["rule_three", "rule_two", "rule_one"]);
+
+        let duplicate_match = storage
+            .upsert_rule(
+                Some("rule_two".into()),
+                "MATCH",
+                "ANY",
+                "DIRECT",
+                None,
+                true,
+            )
+            .await
+            .expect_err("reject a second enabled MATCH in one source");
+        assert_eq!(duplicate_match.code, "rule_match_exists");
+        let after_upsert = storage
+            .list_rules()
+            .await
+            .expect("list rules after MATCH upsert")
+            .into_iter()
+            .filter(|rule| rule.source == "user")
+            .map(|rule| (rule.id, rule.rule_type))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after_upsert,
+            vec![
+                ("rule_three".into(), "DOMAIN-SUFFIX".into()),
+                ("rule_two".into(), "DOMAIN".into()),
+                ("rule_one".into(), "MATCH".into()),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2920,6 +4494,18 @@ mod tests {
                         value: old_group.into(),
                         ..GroupFilterInput::default()
                     },
+                    GroupFilterInput {
+                        field: "country".into(),
+                        operator: "is".into(),
+                        value: old_node.into(),
+                        ..GroupFilterInput::default()
+                    },
+                    GroupFilterInput {
+                        field: "name".into(),
+                        operator: "contains".into(),
+                        value: old_node.into(),
+                        ..GroupFilterInput::default()
+                    },
                 ],
             )
             .await
@@ -2982,6 +4568,8 @@ mod tests {
         let filters = storage.group_filters("Custom").await.expect("list filters");
         assert_eq!(filters[0].values, vec![new_node.to_string()]);
         assert_eq!(filters[1].value, new_group);
+        assert_eq!(filters[2].value, old_node);
+        assert_eq!(filters[3].value, old_node);
         let custom_group = storage
             .proxy_items_for_runtime()
             .await
@@ -3140,6 +4728,352 @@ mod tests {
                 .and_then(Value::as_str),
             Some(node_a)
         );
+    }
+
+    #[tokio::test]
+    async fn subscription_asset_batches_cannot_overwrite_custom_group_members() {
+        let temp = TestDir::new("subscription-custom-group-conflict");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        storage
+            .upsert_proxy_item(&test_proxy_item("Custom", "group", None, "Custom", None))
+            .await
+            .expect("store custom group");
+        storage
+            .replace_group_members("Custom", &[BUILTIN_DIRECT.into()])
+            .await
+            .expect("store custom members");
+        storage
+            .create_subscription(
+                "sub_conflict",
+                "Provider",
+                "https://example.com/profile.yaml",
+                3600,
+                true,
+                &[],
+            )
+            .await
+            .expect("create subscription");
+        let node = test_proxy_item(
+            "Node^_^sub_conflict",
+            "node",
+            Some("sub_conflict"),
+            "Node",
+            Some("Provider"),
+        );
+
+        let undeclared = storage
+            .replace_subscription_assets(
+                "sub_conflict",
+                std::slice::from_ref(&node),
+                &[("Custom".into(), vec![node.name.clone()])],
+                test_sync_commit(),
+            )
+            .await
+            .expect_err("reject member writes to a group outside the batch");
+        assert_eq!(undeclared.code, "internal_error");
+
+        let incoming_group = test_proxy_item(
+            "Custom",
+            "group",
+            Some("sub_conflict"),
+            "Custom",
+            Some("Provider"),
+        );
+        let conflict = storage
+            .replace_subscription_assets(
+                "sub_conflict",
+                &[node.clone(), incoming_group],
+                &[("Custom".into(), vec![node.name])],
+                test_sync_commit(),
+            )
+            .await
+            .expect_err("reject taking ownership of a custom group");
+        assert_eq!(conflict.code, "subscription_asset_conflict");
+        assert_eq!(
+            storage.group_members("Custom").await.expect("load members"),
+            vec![BUILTIN_DIRECT.to_string()]
+        );
+        assert_eq!(
+            storage
+                .group_source("Custom")
+                .await
+                .expect("load source")
+                .as_deref(),
+            Some("custom")
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_asset_batches_cannot_take_another_subscriptions_name() {
+        let temp = TestDir::new("subscription-owner-conflict");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        for (id, name) in [("sub_owner", "Owner"), ("sub_other", "Other")] {
+            storage
+                .create_subscription(
+                    id,
+                    name,
+                    "https://example.com/profile.yaml",
+                    3600,
+                    true,
+                    &[],
+                )
+                .await
+                .expect("create subscription");
+        }
+        let shared_name = "Shared^_^runtime";
+        storage
+            .replace_subscription_assets(
+                "sub_owner",
+                &[test_proxy_item(
+                    shared_name,
+                    "node",
+                    Some("sub_owner"),
+                    "Shared",
+                    Some("Owner"),
+                )],
+                &[],
+                test_sync_commit(),
+            )
+            .await
+            .expect("store owned asset");
+        let error = storage
+            .replace_subscription_assets(
+                "sub_other",
+                &[test_proxy_item(
+                    shared_name,
+                    "node",
+                    Some("sub_other"),
+                    "Shared",
+                    Some("Other"),
+                )],
+                &[],
+                test_sync_commit(),
+            )
+            .await
+            .expect_err("reject taking another subscription asset");
+        assert_eq!(error.code, "subscription_asset_conflict");
+        let owner = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT subscription_id FROM proxy_items WHERE name = ?",
+        )
+        .bind(shared_name)
+        .fetch_one(&storage.pool)
+        .await
+        .expect("load preserved owner");
+        assert_eq!(owner.as_deref(), Some("sub_owner"));
+    }
+
+    #[tokio::test]
+    async fn referenced_subscription_node_cannot_be_refreshed_as_filtered_out() {
+        let temp = TestDir::new("referenced-filtered-subscription-node");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        let subscription_id = "sub_filtered";
+        let node_name = "Node^_^sub_filtered";
+        storage
+            .create_subscription(
+                subscription_id,
+                "Provider",
+                "https://example.com/profile.yaml",
+                3600,
+                true,
+                &[],
+            )
+            .await
+            .expect("create subscription");
+        let node = test_proxy_item(
+            node_name,
+            "node",
+            Some(subscription_id),
+            "Node",
+            Some("Provider"),
+        );
+        storage
+            .replace_subscription_assets(
+                subscription_id,
+                std::slice::from_ref(&node),
+                &[],
+                test_sync_commit(),
+            )
+            .await
+            .expect("store node");
+        storage
+            .upsert_rule(
+                Some("rule_filtered_node".into()),
+                "DOMAIN",
+                "filtered.example.com",
+                node_name,
+                None,
+                true,
+            )
+            .await
+            .expect("reference node");
+        let mut filtered = node;
+        filtered.filtered_out = true;
+        filtered.filter_reason = Some("test filter".into());
+        let error = storage
+            .replace_subscription_assets(subscription_id, &[filtered], &[], test_sync_commit())
+            .await
+            .expect_err("preserve referenced node availability");
+        assert_eq!(error.code, "subscription_asset_referenced");
+        let filtered_out =
+            sqlx::query_scalar::<_, bool>("SELECT filtered_out FROM proxy_items WHERE name = ?")
+                .bind(node_name)
+                .fetch_one(&storage.pool)
+                .await
+                .expect("load preserved node");
+        assert!(!filtered_out);
+    }
+
+    #[tokio::test]
+    async fn deleting_subscription_cannot_empty_a_referenced_custom_group() {
+        let temp = TestDir::new("referenced-custom-group-subscription-delete");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        let subscription_id = "sub_custom_member";
+        let node_name = "Node^_^sub_custom_member";
+        storage
+            .create_subscription(
+                subscription_id,
+                "Provider",
+                "https://example.com/profile.yaml",
+                3600,
+                true,
+                &[],
+            )
+            .await
+            .expect("create subscription");
+        storage
+            .replace_subscription_assets(
+                subscription_id,
+                &[test_proxy_item(
+                    node_name,
+                    "node",
+                    Some(subscription_id),
+                    "Node",
+                    Some("Provider"),
+                )],
+                &[],
+                test_sync_commit(),
+            )
+            .await
+            .expect("store node");
+        storage
+            .save_custom_group(
+                None,
+                &test_proxy_item("Custom", "group", None, "Custom", None),
+                &[GroupFilterInput {
+                    field: "name".into(),
+                    operator: "equals".into(),
+                    value: node_name.into(),
+                    ..GroupFilterInput::default()
+                }],
+            )
+            .await
+            .expect("create custom group");
+        storage
+            .upsert_rule(
+                Some("rule_custom".into()),
+                "DOMAIN",
+                "custom.example.com",
+                "Custom",
+                None,
+                true,
+            )
+            .await
+            .expect("reference custom group");
+        let error = storage
+            .delete_subscription(subscription_id)
+            .await
+            .expect_err("preserve the custom group's only member");
+        assert_eq!(error.code, "subscription_asset_referenced");
+        assert_eq!(
+            storage.group_members("Custom").await.expect("load members"),
+            vec![node_name.to_string()]
+        );
+        storage
+            .get_subscription_url(subscription_id)
+            .await
+            .expect("subscription deletion was rolled back");
+    }
+
+    #[tokio::test]
+    async fn subscription_mutations_preserve_assets_used_as_rule_policies() {
+        let temp = TestDir::new("referenced-subscription-assets");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        let subscription_id = "sub_referenced";
+        let node_name = "Node^_^sub_referenced";
+        storage
+            .create_subscription(
+                subscription_id,
+                "Provider",
+                "https://example.com/profile.yaml",
+                3_600,
+                true,
+                &[],
+            )
+            .await
+            .expect("create subscription");
+        storage
+            .replace_subscription_assets(
+                subscription_id,
+                &[test_proxy_item(
+                    node_name,
+                    "node",
+                    Some(subscription_id),
+                    "Node",
+                    Some("Provider"),
+                )],
+                &[],
+                test_sync_commit(),
+            )
+            .await
+            .expect("store subscription node");
+        let rule = storage
+            .upsert_rule(
+                Some("rule_subscription_node".into()),
+                "DOMAIN",
+                "node.example.com",
+                node_name,
+                None,
+                false,
+            )
+            .await
+            .expect("store disabled subscription-node reference");
+
+        let delete_error = storage
+            .delete_subscription(subscription_id)
+            .await
+            .expect_err("preserve a referenced subscription");
+        assert_eq!(delete_error.code, "subscription_referenced");
+        let refresh_error = storage
+            .replace_subscription_assets(subscription_id, &[], &[], test_sync_commit())
+            .await
+            .expect_err("preserve a referenced asset during refresh");
+        assert_eq!(refresh_error.code, "subscription_asset_referenced");
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM proxy_items WHERE name = ?)",
+        )
+        .bind(node_name)
+        .fetch_one(&storage.pool)
+        .await
+        .expect("check preserved asset"));
+
+        storage
+            .delete_rule(&rule.id)
+            .await
+            .expect("delete asset reference");
+        storage
+            .delete_subscription(subscription_id)
+            .await
+            .expect("delete unreferenced subscription");
     }
 
     #[tokio::test]
@@ -3346,6 +5280,241 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rule_set_names_are_unique_and_rule_writes_require_an_existing_name() {
+        let temp = TestDir::new("validated-rule-set-reference");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        storage
+            .create_rule_set(
+                "rs_unique_one",
+                "unique-name",
+                "https://example.com/one.list",
+                3600,
+                Some("domain"),
+                "text",
+            )
+            .await
+            .expect("create rule set");
+        let duplicate = storage
+            .create_rule_set(
+                "rs_unique_two",
+                "unique-name",
+                "https://example.com/two.list",
+                3600,
+                Some("domain"),
+                "text",
+            )
+            .await
+            .expect_err("reject a duplicate rule-set name");
+        assert_eq!(duplicate.code, "ruleset_exists");
+
+        let missing = storage
+            .upsert_rule(
+                Some("rule_missing_ruleset".into()),
+                "RULE-SET",
+                "missing-name",
+                "DIRECT",
+                None,
+                true,
+            )
+            .await
+            .expect_err("reject a missing rule-set reference");
+        assert_eq!(missing.code, "rule_invalid_ruleset");
+    }
+
+    #[tokio::test]
+    async fn pending_rule_sets_are_hidden_until_the_first_snapshot_is_ready() {
+        let temp = TestDir::new("pending-rule-set");
+        let paths = AppPaths::from_root(temp.path());
+        let storage = Storage::connect(&paths)
+            .await
+            .expect("connect test storage");
+        storage
+            .create_pending_rule_set(
+                "rs_pending",
+                "pending-name",
+                "https://example.com/pending.list",
+                3_600,
+                Some("domain"),
+                "text",
+            )
+            .await
+            .expect("create pending rule set");
+        assert!(storage
+            .list_rule_sets()
+            .await
+            .expect("list ready rule sets")
+            .into_iter()
+            .all(|rule_set| rule_set.id != "rs_pending"));
+        let pending_reference = storage
+            .upsert_rule(
+                Some("rule_pending".into()),
+                "RULE-SET",
+                "pending-name",
+                "DIRECT",
+                None,
+                true,
+            )
+            .await
+            .expect_err("pending rule set must not be referenceable");
+        assert_eq!(pending_reference.code, "rule_invalid_ruleset");
+
+        storage
+            .mark_rule_set_refresh_error("rs_pending", "temporary failure")
+            .await
+            .expect("store refresh error");
+        storage
+            .stage_rule_set_refresh(
+                "rs_pending",
+                "data/profiles/rule-sets/rs_pending.ready.list",
+                12,
+                1,
+                "ready",
+                "text",
+                None,
+            )
+            .await
+            .expect("stage first snapshot");
+        assert!(storage
+            .list_rule_sets()
+            .await
+            .expect("list rule sets while the snapshot is staged")
+            .into_iter()
+            .all(|rule_set| rule_set.id != "rs_pending"));
+        assert!(storage
+            .rule_sets_for_runtime()
+            .await
+            .expect("list candidate runtime rule sets")
+            .into_iter()
+            .any(|rule_set| rule_set.id == "rs_pending"));
+        let staged_reference = storage
+            .upsert_rule(
+                Some("rule_staged".into()),
+                "RULE-SET",
+                "pending-name",
+                "DIRECT",
+                None,
+                true,
+            )
+            .await
+            .expect_err("staged rule set must not be referenceable");
+        assert_eq!(staged_reference.code, "rule_invalid_ruleset");
+
+        storage
+            .activate_rule_set("rs_pending")
+            .await
+            .expect("commit the validated snapshot");
+        let ready = storage
+            .list_rule_sets()
+            .await
+            .expect("list activated rule set")
+            .into_iter()
+            .find(|rule_set| rule_set.id == "rs_pending")
+            .expect("ready rule set");
+        assert!(ready.last_error.is_none());
+        storage
+            .upsert_rule(
+                Some("rule_ready".into()),
+                "RULE-SET",
+                "pending-name",
+                "DIRECT",
+                None,
+                true,
+            )
+            .await
+            .expect("ready rule set can be referenced");
+        let referenced_delete = storage
+            .stage_rule_set_deletion("rs_pending")
+            .await
+            .expect_err("referenced rule set cannot enter deleting state");
+        assert_eq!(referenced_delete.code, "ruleset_in_use");
+        storage
+            .delete_rule("rule_ready")
+            .await
+            .expect("remove rule-set reference");
+        storage
+            .stage_rule_set_deletion("rs_pending")
+            .await
+            .expect("stage rule-set deletion");
+        assert!(storage
+            .list_rule_sets()
+            .await
+            .expect("hide deleting rule set")
+            .into_iter()
+            .all(|rule_set| rule_set.id != "rs_pending"));
+        assert!(storage
+            .rule_sets_for_runtime()
+            .await
+            .expect("compile deletion candidate")
+            .into_iter()
+            .all(|rule_set| rule_set.id != "rs_pending"));
+        storage
+            .restore_rule_set_deletion("rs_pending")
+            .await
+            .expect("restore staged deletion");
+
+        storage
+            .stage_rule_set_refresh(
+                "rs_pending",
+                "data/profiles/rule-sets/rs_pending.candidate.list",
+                99,
+                7,
+                "candidate",
+                "yaml",
+                None,
+            )
+            .await
+            .expect("stage replacement snapshot");
+        let still_active = storage
+            .list_rule_sets()
+            .await
+            .expect("keep active metadata while refresh is staged")
+            .into_iter()
+            .find(|rule_set| rule_set.id == "rs_pending")
+            .expect("active rule set");
+        assert_eq!(still_active.rule_count, 1);
+        assert_eq!(still_active.format, "text");
+        let candidate = storage
+            .rule_sets_for_runtime()
+            .await
+            .expect("compile staged candidate")
+            .into_iter()
+            .find(|rule_set| rule_set.id == "rs_pending")
+            .expect("candidate rule set");
+        assert_eq!(candidate.format, "yaml");
+        assert!(candidate
+            .local_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("rs_pending.candidate.list")));
+
+        storage.pool.close().await;
+        let reopened = Storage::connect(&paths)
+            .await
+            .expect("discard interrupted refresh on reconnect");
+        let restored = reopened
+            .list_rule_sets()
+            .await
+            .expect("list restored active rule set")
+            .into_iter()
+            .find(|rule_set| rule_set.id == "rs_pending")
+            .expect("restored rule set");
+        assert_eq!(restored.rule_count, 1);
+        assert_eq!(restored.format, "text");
+        let restored_runtime = reopened
+            .rule_sets_for_runtime()
+            .await
+            .expect("compile restored runtime")
+            .into_iter()
+            .find(|rule_set| rule_set.id == "rs_pending")
+            .expect("restored runtime rule set");
+        assert!(restored_runtime
+            .local_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("rs_pending.ready.list")));
+    }
+
+    #[tokio::test]
     async fn freshly_updated_remote_resources_are_not_immediately_due() {
         let temp = TestDir::new("fresh-resource-due-state");
         let storage = Storage::connect(&AppPaths::from_root(temp.path()))
@@ -3450,6 +5619,792 @@ mod tests {
         assert!(members.iter().any(|member| member == "Node"));
         assert!(members.iter().any(|member| member == "Regional"));
         assert!(!members.iter().any(|member| member == "Depends on PROXY"));
+    }
+
+    #[tokio::test]
+    async fn builtin_proxy_sync_preserves_the_last_delay() {
+        let temp = TestDir::new("builtin-proxy-delay");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        storage
+            .set_group_delay(BUILTIN_PROXY, 321)
+            .await
+            .expect("store proxy delay");
+        storage
+            .sync_builtin_proxy_group()
+            .await
+            .expect("synchronize builtin proxy");
+        let (groups, _) = storage.proxy_topology().await.expect("load topology");
+        assert_eq!(
+            groups
+                .into_iter()
+                .find(|group| group.name == BUILTIN_PROXY)
+                .expect("builtin proxy")
+                .delay,
+            321
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_unsigned_values_are_rejected_before_sqlite_writes() {
+        let temp = TestDir::new("oversized-unsigned-values");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+
+        let subscription_error = storage
+            .create_subscription(
+                "sub_oversized",
+                "Provider",
+                "https://example.com/subscription",
+                u64::MAX,
+                true,
+                &[],
+            )
+            .await
+            .expect_err("reject an interval that cannot fit in SQLite INTEGER");
+        assert_eq!(subscription_error.code, "numeric_value_out_of_range");
+        assert!(!storage
+            .list_subscriptions()
+            .await
+            .expect("list subscriptions")
+            .iter()
+            .any(|subscription| subscription.id == "sub_oversized"));
+
+        let rule_set_error = storage
+            .create_rule_set(
+                "rs_oversized",
+                "oversized",
+                "https://example.com/rules",
+                u64::MAX,
+                None,
+                "text",
+            )
+            .await
+            .expect_err("reject an oversized rule-set interval");
+        assert_eq!(rule_set_error.code, "numeric_value_out_of_range");
+
+        storage
+            .create_subscription(
+                "sub_quota",
+                "Provider",
+                "https://example.com/subscription",
+                3_600,
+                true,
+                &[],
+            )
+            .await
+            .expect("create quota test subscription");
+        let mut commit = test_sync_commit();
+        commit.upload_bytes = Some(u64::MAX);
+        let quota_error = storage
+            .replace_subscription_assets("sub_quota", &[], &[], commit)
+            .await
+            .expect_err("reject quota metadata that cannot fit in SQLite INTEGER");
+        assert_eq!(quota_error.code, "numeric_value_out_of_range");
+
+        sqlx::query(
+            "UPDATE subscriptions SET interval_seconds = -1, upload_bytes = -1, download_bytes = 42, total_bytes = -1 WHERE id = ?",
+        )
+        .bind("sub_quota")
+        .execute(&storage.pool)
+        .await
+        .expect("simulate legacy wrapped values");
+        let recovered = storage
+            .list_subscriptions()
+            .await
+            .expect("list hardened subscription values")
+            .into_iter()
+            .find(|subscription| subscription.id == "sub_quota")
+            .expect("quota test subscription");
+        assert_eq!(recovered.interval_seconds, 0);
+        assert_eq!(recovered.interval, 0);
+        assert_eq!(recovered.traffic.used, 42);
+        assert_eq!(recovered.traffic.total, 0);
+    }
+
+    #[tokio::test]
+    async fn custom_group_deletion_preserves_all_rule_targets() {
+        let temp = TestDir::new("referenced-custom-group");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        storage
+            .upsert_proxy_item(&test_proxy_item("Node", "node", None, "Node", None))
+            .await
+            .expect("store available custom-group member");
+        for (suffix, enabled) in [("enabled", true), ("disabled", false)] {
+            let group_name = format!("Strategy {suffix}");
+            storage
+                .upsert_proxy_item(&test_proxy_item(
+                    &group_name,
+                    "group",
+                    None,
+                    &group_name,
+                    None,
+                ))
+                .await
+                .expect("store custom group");
+            storage
+                .upsert_rule(
+                    Some(format!("rule_strategy_{suffix}")),
+                    "DOMAIN",
+                    &format!("{suffix}.example.com"),
+                    &group_name,
+                    None,
+                    enabled,
+                )
+                .await
+                .expect("store group reference");
+
+            assert_eq!(
+                storage
+                    .policy_reference_count(&group_name)
+                    .await
+                    .expect("count all references"),
+                1
+            );
+            let error = storage
+                .delete_custom_group(&group_name)
+                .await
+                .expect_err("keep a group referenced by any rule");
+            assert_eq!(error.code, "proxy_group_referenced");
+            assert_eq!(
+                storage
+                    .group_source(&group_name)
+                    .await
+                    .expect("read group source")
+                    .as_deref(),
+                Some("custom")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_subscription_assets_are_runtime_only_until_activation() {
+        let temp = TestDir::new("pending-subscription-activation");
+        let paths = AppPaths::from_root(temp.path());
+        let storage = Storage::connect(&paths)
+            .await
+            .expect("connect test storage");
+        let subscription_id = "sub_pending";
+        let asset_name = "Pending Node";
+        storage
+            .create_pending_subscription(
+                subscription_id,
+                "Pending Provider",
+                "https://example.com/pending.yaml",
+                3_600,
+                true,
+                &[],
+            )
+            .await
+            .expect("create pending subscription");
+        storage
+            .replace_subscription_assets(
+                subscription_id,
+                &[test_proxy_item(
+                    asset_name,
+                    "node",
+                    Some(subscription_id),
+                    asset_name,
+                    Some("Pending Provider"),
+                )],
+                &[],
+                test_sync_commit(),
+            )
+            .await
+            .expect("stage subscription assets");
+
+        assert!(storage
+            .list_subscriptions()
+            .await
+            .expect("list visible subscriptions")
+            .into_iter()
+            .all(|subscription| subscription.id != subscription_id));
+        assert!(!storage
+            .due_subscription_ids()
+            .await
+            .expect("list due subscriptions")
+            .contains(&subscription_id.to_string()));
+        assert!(storage
+            .proxy_items_for_runtime()
+            .await
+            .expect("compile candidate runtime assets")
+            .into_iter()
+            .any(|item| item.name == asset_name));
+        let pending_reference = storage
+            .upsert_rule(
+                Some("rule_pending_subscription".into()),
+                "DOMAIN",
+                "pending.example.com",
+                asset_name,
+                None,
+                true,
+            )
+            .await
+            .expect_err("pending subscription asset must not be referenceable");
+        assert_eq!(pending_reference.code, "rule_invalid_policy");
+
+        storage
+            .activate_subscription(subscription_id)
+            .await
+            .expect("activate subscription");
+        assert!(storage
+            .list_subscriptions()
+            .await
+            .expect("list activated subscriptions")
+            .into_iter()
+            .any(|subscription| subscription.id == subscription_id));
+        storage
+            .upsert_rule(
+                Some("rule_active_subscription".into()),
+                "DOMAIN",
+                "active.example.com",
+                asset_name,
+                None,
+                true,
+            )
+            .await
+            .expect("activated subscription asset can be referenced");
+        let referenced_delete = storage
+            .stage_subscription_deletion(subscription_id)
+            .await
+            .expect_err("referenced subscription cannot enter deleting state");
+        assert_eq!(referenced_delete.code, "subscription_referenced");
+        storage
+            .delete_rule("rule_active_subscription")
+            .await
+            .expect("remove subscription reference");
+        storage
+            .stage_subscription_deletion(subscription_id)
+            .await
+            .expect("stage subscription deletion");
+        assert!(storage
+            .list_subscriptions()
+            .await
+            .expect("hide deleting subscription")
+            .into_iter()
+            .all(|subscription| subscription.id != subscription_id));
+        assert!(storage
+            .proxy_items_for_runtime()
+            .await
+            .expect("compile deletion candidate")
+            .into_iter()
+            .all(|item| item.name != asset_name));
+        let deleting_reference = storage
+            .upsert_rule(
+                Some("rule_deleting_subscription".into()),
+                "DOMAIN",
+                "deleting.example.com",
+                asset_name,
+                None,
+                true,
+            )
+            .await
+            .expect_err("deleting subscription asset must not be referenceable");
+        assert_eq!(deleting_reference.code, "rule_invalid_policy");
+
+        storage
+            .create_pending_subscription(
+                "sub_crashed",
+                "Crashed Provider",
+                "https://example.com/crashed.yaml",
+                3_600,
+                true,
+                &[],
+            )
+            .await
+            .expect("create interrupted subscription");
+        storage.pool.close().await;
+        let reopened = Storage::connect(&paths)
+            .await
+            .expect("clean interrupted subscription on reconnect");
+        assert!(reopened.get_subscription_url("sub_crashed").await.is_err());
+        assert!(reopened
+            .list_subscriptions()
+            .await
+            .expect("restore interrupted deletion")
+            .into_iter()
+            .any(|subscription| subscription.id == subscription_id));
+        assert!(reopened
+            .proxy_items_for_runtime()
+            .await
+            .expect("restore interrupted subscription assets")
+            .into_iter()
+            .any(|item| item.name == asset_name));
+    }
+
+    #[tokio::test]
+    async fn routing_rule_writes_require_an_available_policy_target() {
+        let temp = TestDir::new("validated-rule-policy");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        let missing_error = storage
+            .upsert_rule(
+                Some("rule_missing_policy".into()),
+                "DOMAIN",
+                "missing.example.com",
+                "Missing Group",
+                None,
+                true,
+            )
+            .await
+            .expect_err("reject a missing policy target");
+        assert_eq!(missing_error.code, "rule_invalid_policy");
+
+        storage
+            .upsert_proxy_item(&test_proxy_item("Node", "node", None, "Node", None))
+            .await
+            .expect("store available custom-group member");
+        storage
+            .upsert_proxy_item(&test_proxy_item(
+                "Strategy", "group", None, "Strategy", None,
+            ))
+            .await
+            .expect("store policy target");
+        let rule = storage
+            .upsert_rule(
+                Some("rule_valid_policy".into()),
+                "DOMAIN",
+                "valid.example.com",
+                "Strategy",
+                None,
+                true,
+            )
+            .await
+            .expect("store valid policy target");
+        let update_error = storage
+            .update_rule(
+                &rule.id,
+                "DOMAIN",
+                "valid.example.com",
+                "Missing Group",
+                None,
+                true,
+                None,
+            )
+            .await
+            .expect_err("reject an update to a missing policy target");
+        assert_eq!(update_error.code, "rule_invalid_policy");
+        assert_eq!(
+            storage
+                .list_rules()
+                .await
+                .expect("list preserved rules")
+                .into_iter()
+                .find(|item| item.id == rule.id)
+                .expect("find preserved rule")
+                .policy,
+            "Strategy"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_group_rename_preserves_disabled_rule_targets() {
+        let temp = TestDir::new("rename-referenced-custom-group");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        storage
+            .upsert_proxy_item(&test_proxy_item("Node", "node", None, "Node", None))
+            .await
+            .expect("store available custom-group member");
+        storage
+            .upsert_proxy_item(&test_proxy_item(
+                "Strategy", "group", None, "Strategy", None,
+            ))
+            .await
+            .expect("store custom group");
+        storage
+            .upsert_rule(
+                Some("rule_disabled_strategy".into()),
+                "DOMAIN",
+                "disabled.example.com",
+                "Strategy",
+                None,
+                false,
+            )
+            .await
+            .expect("store disabled group reference");
+
+        let service = crate::proxy::ProxyService::new(storage.clone());
+        let error = service
+            .update_group(
+                "Strategy",
+                crate::types::ProxyGroupRequest {
+                    name: "Renamed Strategy".into(),
+                    group_type: "select".into(),
+                    filter: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("reject renaming a group referenced by a disabled rule");
+
+        assert_eq!(error.code, "proxy_group_referenced");
+        assert_eq!(
+            storage
+                .group_source("Strategy")
+                .await
+                .expect("read original group")
+                .as_deref(),
+            Some("custom")
+        );
+        assert_eq!(
+            storage
+                .group_source("Renamed Strategy")
+                .await
+                .expect("check target group"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_group_rename_is_atomic_and_preserves_filter_ids_and_selection() {
+        let temp = TestDir::new("atomic-custom-group-rename");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        for item in [
+            test_proxy_item("Strategy", "group", None, "Strategy", None),
+            test_proxy_item("Node A", "node", None, "Node A", None),
+            test_proxy_item("Node B", "node", None, "Node B", None),
+        ] {
+            storage
+                .upsert_proxy_item(&item)
+                .await
+                .expect("store proxy item");
+        }
+        storage
+            .replace_group_members("Strategy", &["Node A".into(), "Node B".into()])
+            .await
+            .expect("store initial members");
+        storage
+            .set_group_now("Strategy", "Node B")
+            .await
+            .expect("select second member");
+        let filter = GroupFilterInput {
+            id: Some("filter_strategy".into()),
+            action: "keep".into(),
+            field: "name".into(),
+            operator: "starts_with".into(),
+            value: "Node".into(),
+            ..GroupFilterInput::default()
+        };
+        storage
+            .replace_group_filters("Strategy", std::slice::from_ref(&filter))
+            .await
+            .expect("store initial filter");
+
+        crate::proxy::ProxyService::new(storage.clone())
+            .update_group(
+                "Strategy",
+                crate::types::ProxyGroupRequest {
+                    name: "Renamed Strategy".into(),
+                    group_type: "select".into(),
+                    filter: vec![filter],
+                },
+            )
+            .await
+            .expect("rename custom group atomically");
+
+        assert_eq!(
+            storage
+                .group_source("Strategy")
+                .await
+                .expect("check old group"),
+            None
+        );
+        assert_eq!(
+            storage
+                .group_source("Renamed Strategy")
+                .await
+                .expect("check renamed group")
+                .as_deref(),
+            Some("custom")
+        );
+        assert_eq!(
+            storage
+                .group_filters("Renamed Strategy")
+                .await
+                .expect("load renamed filters")[0]
+                .id
+                .as_deref(),
+            Some("filter_strategy")
+        );
+        assert_eq!(
+            storage
+                .current_group_now("Renamed Strategy")
+                .await
+                .expect("read renamed selection")
+                .as_deref(),
+            Some("Node B")
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_group_rename_and_rule_creation_cannot_leave_a_dangling_policy() {
+        let temp = TestDir::new("concurrent-group-rename-rule");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        for item in [
+            test_proxy_item("Strategy", "group", None, "Strategy", None),
+            test_proxy_item("Node A", "node", None, "Node A", None),
+        ] {
+            storage
+                .upsert_proxy_item(&item)
+                .await
+                .expect("store proxy item");
+        }
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let rename_service = crate::proxy::ProxyService::new(storage.clone());
+        let rename_barrier = barrier.clone();
+        let rename = tokio::spawn(async move {
+            rename_barrier.wait().await;
+            rename_service
+                .update_group(
+                    "Strategy",
+                    crate::types::ProxyGroupRequest {
+                        name: "Renamed Strategy".into(),
+                        group_type: "select".into(),
+                        filter: vec![GroupFilterInput {
+                            action: "keep".into(),
+                            field: "name".into(),
+                            operator: "starts_with".into(),
+                            value: "Node".into(),
+                            ..GroupFilterInput::default()
+                        }],
+                    },
+                )
+                .await
+        });
+        let rule_storage = storage.clone();
+        let rule_barrier = barrier.clone();
+        let rule = tokio::spawn(async move {
+            rule_barrier.wait().await;
+            rule_storage
+                .upsert_rule(
+                    Some("rule_concurrent_strategy".into()),
+                    "DOMAIN",
+                    "concurrent.example.com",
+                    "Strategy",
+                    None,
+                    true,
+                )
+                .await
+        });
+        barrier.wait().await;
+        let rename_result = rename.await.expect("join rename task");
+        let rule_result = rule.await.expect("join rule task");
+
+        assert_ne!(rename_result.is_ok(), rule_result.is_ok());
+        if rename_result.is_ok() {
+            assert_eq!(
+                rule_result.expect_err("old policy must disappear").code,
+                "rule_invalid_policy"
+            );
+            assert!(storage
+                .group_source("Strategy")
+                .await
+                .expect("check old group")
+                .is_none());
+            assert_eq!(
+                storage
+                    .group_source("Renamed Strategy")
+                    .await
+                    .expect("check renamed group")
+                    .as_deref(),
+                Some("custom")
+            );
+        } else {
+            assert_eq!(
+                rename_result
+                    .expect_err("referenced group cannot be renamed")
+                    .code,
+                "proxy_group_referenced"
+            );
+            assert_eq!(
+                rule_result.expect("rule creation should win").policy,
+                "Strategy"
+            );
+            assert_eq!(
+                storage
+                    .group_source("Strategy")
+                    .await
+                    .expect("check preserved group")
+                    .as_deref(),
+                Some("custom")
+            );
+            assert!(storage
+                .group_source("Renamed Strategy")
+                .await
+                .expect("check absent target")
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn scalar_group_filter_values_stay_scalar_after_storage_round_trip() {
+        let temp = TestDir::new("scalar-group-filter");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        storage
+            .upsert_proxy_item(&test_proxy_item(
+                "Strategy", "group", None, "Strategy", None,
+            ))
+            .await
+            .expect("store custom group");
+        storage
+            .replace_group_filters(
+                "Strategy",
+                &[GroupFilterInput {
+                    field: "protocol".into(),
+                    operator: "is".into(),
+                    value: "trojan".into(),
+                    ..GroupFilterInput::default()
+                }],
+            )
+            .await
+            .expect("store scalar filter");
+
+        let filters = storage
+            .group_filters("Strategy")
+            .await
+            .expect("reload scalar filter");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].operator, "is");
+        assert_eq!(filters[0].value, "trojan");
+        assert!(filters[0].values.is_empty());
+    }
+
+    #[tokio::test]
+    async fn group_selection_requires_an_existing_group_member() {
+        let temp = TestDir::new("validated-group-selection");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        storage
+            .upsert_proxy_item(&test_proxy_item(
+                "Strategy", "group", None, "Strategy", None,
+            ))
+            .await
+            .expect("store custom group");
+        storage
+            .replace_group_members("Strategy", &["Node A".into(), "Node B".into()])
+            .await
+            .expect("store group members");
+
+        let missing_group = storage
+            .set_group_now("Missing", "Node A")
+            .await
+            .expect_err("reject a missing group");
+        assert_eq!(missing_group.code, "proxy_group_not_found");
+        let missing_member = storage
+            .set_group_now("Strategy", "Unknown")
+            .await
+            .expect_err("reject a non-member selection");
+        assert_eq!(missing_member.code, "proxy_group_member_not_found");
+        let mut automatic = test_proxy_item("Automatic", "group", None, "Automatic", None);
+        automatic.group_type = Some("url-test".into());
+        storage
+            .upsert_proxy_item(&automatic)
+            .await
+            .expect("store automatic group");
+        storage
+            .replace_group_members("Automatic", &["Node A".into()])
+            .await
+            .expect("store automatic group members");
+        let automatic_selection = storage
+            .set_group_now("Automatic", "Node A")
+            .await
+            .expect_err("automatic groups cannot persist manual selections");
+        assert_eq!(automatic_selection.code, "proxy_group_not_selectable");
+        assert_eq!(
+            storage
+                .current_group_now("Strategy")
+                .await
+                .expect("read preserved selection")
+                .as_deref(),
+            Some("Node A")
+        );
+
+        storage
+            .set_group_now("Strategy", "Node B")
+            .await
+            .expect("select a valid member");
+        assert_eq!(
+            storage
+                .current_group_now("Strategy")
+                .await
+                .expect("read updated selection")
+                .as_deref(),
+            Some("Node B")
+        );
+    }
+
+    #[tokio::test]
+    async fn group_selection_returns_and_restores_the_previous_value() {
+        let temp = TestDir::new("group-selection-rollback");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        storage
+            .upsert_proxy_item(&test_proxy_item(
+                "Strategy", "group", None, "Strategy", None,
+            ))
+            .await
+            .expect("store group");
+        storage
+            .replace_group_members("Strategy", &["Node A".into(), "Node B".into()])
+            .await
+            .expect("store members");
+
+        let previous = storage
+            .set_group_now("Strategy", "Node B")
+            .await
+            .expect("select second member");
+        assert_eq!(previous.as_deref(), Some("Node A"));
+        storage
+            .restore_group_now("Strategy", previous.as_deref())
+            .await
+            .expect("restore previous member");
+        assert_eq!(
+            storage
+                .current_group_now("Strategy")
+                .await
+                .expect("load selection")
+                .as_deref(),
+            Some("Node A")
+        );
+
+        storage
+            .restore_group_now("Strategy", None)
+            .await
+            .expect("clear selection");
+        assert!(storage
+            .current_group_now("Strategy")
+            .await
+            .expect("load cleared selection")
+            .is_none());
+        let previous = storage
+            .set_group_now("Strategy", "Node B")
+            .await
+            .expect("select from an empty prior state");
+        assert!(previous.is_none());
+        storage
+            .restore_group_now("Strategy", previous.as_deref())
+            .await
+            .expect("restore empty prior state");
+        assert!(storage
+            .current_group_now("Strategy")
+            .await
+            .expect("load restored empty selection")
+            .is_none());
     }
 
     fn test_proxy_item(

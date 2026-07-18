@@ -26,6 +26,8 @@ jobs:
       - name: Check release workflow structure
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/verify-release-workflow.ps1
+      - name: Check Linux packaging scripts
+        run: bash -n packaging/linux/install.sh packaging/linux/install-systemd.sh scripts/package-local.sh scripts/verify-linux-archive.sh scripts/release-smoke.sh
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable

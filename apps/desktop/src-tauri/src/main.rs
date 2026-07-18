@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use rweb_clash::{App, AppOptions};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::net::SocketAddr;

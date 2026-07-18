@@ -90,7 +90,7 @@ export const Onboarding = () => {
   const enableProxyAndStart = async () => {
     setBusy('start');
     try {
-      await api.patchConfig({ system_proxy: true, auto_start: true });
+      await api.patchConfig({ system_proxy: true });
       await api.startCore();
       toast('代理已启动', 'success');
       localStorage.setItem(dismissedKey, '1');

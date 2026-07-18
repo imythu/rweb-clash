@@ -46,6 +46,7 @@ export type Egress = {
   ip: string | null;
   provider: string | null;
   country: string | null;
+  source: string | null;
 };
 
 export type Traffic = {
@@ -150,6 +151,7 @@ export type GroupFilter = {
 
 export type ProxyGroup = {
   name: string;
+  displayName: string;
   type: string;
   source: string;
   builtin: boolean;
@@ -162,6 +164,7 @@ export type ProxyGroup = {
 
 export type ProxyNode = {
   name: string;
+  displayName: string;
   type: string;
   latency: number;
   country: string | null;
@@ -223,6 +226,7 @@ export type RuleSetInput = {
   url: string;
   interval?: number;
   intervalSeconds?: number;
+  behavior?: RuleSetBehavior;
   format?: string;
 };
 
@@ -395,8 +399,8 @@ export const api = {
     request<SystemConfig>('/configs', { method: 'PATCH', json: patch }),
 
   setupStatus: () => request<SetupStatus>('/setup/status'),
-  systemStatus: () => request<SystemStatus>('/system/status'),
-  systemEgress: () => request<Egress>('/system/egress'),
+  systemStatus: (signal?: AbortSignal) => request<SystemStatus>('/system/status', { signal }),
+  systemEgress: (signal?: AbortSignal) => request<Egress>('/system/egress', { signal }),
   coreStatus: () => request<CoreStatus>('/core/status'),
   startCore: () => request<CoreStatus>('/core/start', { method: 'POST' }),
   stopCore: () => request<CoreStatus>('/core/stop', { method: 'POST' }),

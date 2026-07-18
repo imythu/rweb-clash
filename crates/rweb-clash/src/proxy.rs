@@ -1,9 +1,11 @@
 use crate::error::AppError;
 use crate::storage::{ProxyItemRecord, Storage};
-use crate::types::{GroupFilterInput, ProxyGroupRequest, ProxyNodeResponse, BUILTIN_PROXY};
-use crate::util::content_hash;
+use crate::types::{
+    GroupFilterInput, ProxyGroupRequest, ProxyNodeResponse, BUILTIN_DIRECT, BUILTIN_GLOBAL,
+    BUILTIN_PROXY, BUILTIN_REJECT,
+};
+use crate::util::{contains_rule_delimiter_or_control, content_hash};
 use regex::Regex;
-use serde_json::json;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
@@ -16,7 +18,8 @@ impl ProxyService {
         Self { storage }
     }
 
-    pub async fn create_group(&self, request: ProxyGroupRequest) -> Result<(), AppError> {
+    pub async fn create_group(&self, mut request: ProxyGroupRequest) -> Result<(), AppError> {
+        normalize_group_request(&mut request);
         validate_group_request(&request)?;
         if self.storage.group_source(&request.name).await?.is_some() {
             warn!(group = %request.name, "proxy group create rejected because it already exists");
@@ -31,8 +34,9 @@ impl ProxyService {
     pub async fn update_group(
         &self,
         current_name: &str,
-        request: ProxyGroupRequest,
+        mut request: ProxyGroupRequest,
     ) -> Result<(), AppError> {
+        normalize_group_request(&mut request);
         validate_group_request(&request)?;
         match self.storage.group_source(current_name).await? {
             Some(source) if source == "custom" => {}
@@ -64,7 +68,7 @@ impl ProxyService {
         {
             return Err(AppError::conflict(
                 "proxy_group_referenced",
-                "proxy groups referenced by enabled routing rules cannot be renamed",
+                "proxy groups referenced by routing rules cannot be renamed",
             ));
         }
         self.save_custom_group(Some(current_name.to_string()), request)
@@ -76,88 +80,44 @@ impl ProxyService {
         old_name: Option<String>,
         request: ProxyGroupRequest,
     ) -> Result<(), AppError> {
-        let nodes = self.storage.all_node_records().await?;
-        let members = calculate_members(&nodes, &request.filter);
-        if members.is_empty() {
-            warn!(
-                group = %request.name,
-                filters = request.filter.len(),
-                nodes = nodes.len(),
-                "proxy group filters matched no nodes"
-            );
-            return Err(AppError::bad_request(
-                "proxy_group_empty",
-                "custom proxy group filters did not match any nodes",
-            ));
-        }
         info!(
             group = %request.name,
             group_type = %request.group_type,
             filters = request.filter.len(),
-            members = members.len(),
             "saving custom proxy group"
         );
-        let strategy = json!({ "now": members.first() }).to_string();
+        let item = ProxyItemRecord {
+            name: request.name.clone(),
+            kind: "group".into(),
+            subscription_id: None,
+            display_name: request.name.clone(),
+            source: "custom".into(),
+            builtin: false,
+            source_name: None,
+            protocol: None,
+            country: None,
+            group_type: Some(request.group_type.clone()),
+            raw_json: None,
+            content_hash: Some(content_hash(format!(
+                "{}:{:?}",
+                request.name, request.filter
+            ))),
+            latency_ms: None,
+            alive: true,
+            filtered_out: false,
+            filter_reason: None,
+            delay_ms: None,
+            tolerance_ms: Some(50),
+            url: Some(crate::types::DEFAULT_DELAY_TEST_URL.into()),
+            interval_seconds: Some(300),
+            strategy_json: "{}".into(),
+            position: 100_000,
+            enabled: true,
+        };
         self.storage
-            .upsert_proxy_item(&ProxyItemRecord {
-                name: request.name.clone(),
-                kind: "group".into(),
-                subscription_id: None,
-                display_name: request.name.clone(),
-                source: "custom".into(),
-                builtin: false,
-                source_name: None,
-                protocol: None,
-                country: None,
-                group_type: Some(request.group_type.clone()),
-                raw_json: None,
-                content_hash: Some(content_hash(format!(
-                    "{}:{:?}",
-                    request.name, request.filter
-                ))),
-                latency_ms: None,
-                alive: true,
-                filtered_out: false,
-                filter_reason: None,
-                delay_ms: None,
-                tolerance_ms: Some(50),
-                url: Some(crate::types::DEFAULT_DELAY_TEST_URL.into()),
-                interval_seconds: Some(300),
-                strategy_json: strategy,
-                position: 100_000,
-                enabled: true,
-            })
-            .await?;
-        self.storage
-            .replace_group_filters(&request.name, &request.filter)
-            .await?;
-        self.storage
-            .replace_group_members(&request.name, &members)
-            .await?;
-        if let Some(old_name) = old_name.as_deref() {
-            if old_name != request.name {
-                self.storage.delete_custom_group(old_name).await?;
-            }
-        }
-        Ok(())
+            .save_custom_group(old_name.as_deref(), &item, &request.filter)
+            .await
     }
-}
-
-pub async fn reconcile_custom_groups(storage: &Storage) -> Result<(), AppError> {
-    let group_names = storage.custom_group_names().await?;
-    if group_names.is_empty() {
-        return Ok(());
-    }
-    let nodes = storage.all_node_records().await?;
-    for group_name in group_names {
-        let filters = storage.group_filters(&group_name).await?;
-        let members = calculate_members(&nodes, &filters);
-        if members.is_empty() {
-            warn!(group = %group_name, "custom proxy group has no members after reconciliation");
-        }
-        storage.replace_group_members(&group_name, &members).await?;
-    }
-    Ok(())
 }
 
 pub fn calculate_members(nodes: &[ProxyNodeResponse], filters: &[GroupFilterInput]) -> Vec<String> {
@@ -206,30 +166,42 @@ fn matches_group_filter(node: &ProxyNodeResponse, filter: &GroupFilterInput) -> 
                 "timeout".into()
             }
         }
-        _ => node.name.clone(),
+        _ => {
+            if matches!(filter.operator.as_str(), "equals" | "in") {
+                node.name.clone()
+            } else {
+                node.display_name.clone()
+            }
+        }
+    };
+    let filter_value = if filter.field == "status" && filter.value.trim().is_empty() {
+        "timeout"
+    } else {
+        &filter.value
     };
     match filter.operator.as_str() {
-        "equals" | "is" => {
+        "equals" => {
             if filter.has_values() {
                 filter
                     .effective_values()
                     .into_iter()
                     .any(|value| target.eq_ignore_ascii_case(value))
             } else {
-                target.eq_ignore_ascii_case(&filter.value)
+                target.eq_ignore_ascii_case(filter_value)
             }
         }
+        "is" => target.eq_ignore_ascii_case(filter_value),
         "in" => filter
             .effective_values()
             .into_iter()
             .any(|value| target.eq_ignore_ascii_case(value)),
-        "regex" => Regex::new(&filter.value)
+        "regex" => Regex::new(filter_value)
             .map(|regex| regex.is_match(&target))
             .unwrap_or(false),
         "less_than" => target
             .parse::<i64>()
             .ok()
-            .zip(filter.value.parse::<i64>().ok())
+            .zip(filter_value.parse::<i64>().ok())
             .map(|(left, right)| {
                 if right == -1 {
                     left <= 0
@@ -240,10 +212,10 @@ fn matches_group_filter(node: &ProxyNodeResponse, filter: &GroupFilterInput) -> 
             .unwrap_or(false),
         "starts_with" => target
             .to_ascii_lowercase()
-            .starts_with(&filter.value.to_ascii_lowercase()),
+            .starts_with(&filter_value.to_ascii_lowercase()),
         _ => target
             .to_ascii_lowercase()
-            .contains(&filter.value.to_ascii_lowercase()),
+            .contains(&filter_value.to_ascii_lowercase()),
     }
 }
 
@@ -254,10 +226,19 @@ fn validate_group_request(request: &ProxyGroupRequest) -> Result<(), AppError> {
             "proxy group name cannot be empty",
         ));
     }
-    if request.name.trim() == BUILTIN_PROXY {
+    if matches!(
+        request.name.to_ascii_uppercase().as_str(),
+        BUILTIN_DIRECT | BUILTIN_REJECT | BUILTIN_GLOBAL | BUILTIN_PROXY
+    ) {
         return Err(AppError::conflict(
             "proxy_group_reserved",
-            "PROXY is a system builtin proxy group",
+            format!("{} is a reserved proxy policy name", request.name),
+        ));
+    }
+    if contains_rule_delimiter_or_control(&request.name) {
+        return Err(AppError::bad_request(
+            "proxy_group_invalid",
+            "proxy group name cannot contain commas or control characters",
         ));
     }
     if !matches!(
@@ -270,8 +251,43 @@ fn validate_group_request(request: &ProxyGroupRequest) -> Result<(), AppError> {
         ));
     }
     for filter in &request.filter {
-        if filter.id.is_none() && filter.is_value_empty() && filter.field != "status" {
+        if !matches!(filter.action.trim(), "keep" | "discard") {
+            return Err(AppError::bad_request(
+                "proxy_group_invalid_filter",
+                format!("unsupported proxy group filter action {}", filter.action),
+            ));
+        }
+        if !matches!(
+            filter.field.trim(),
+            "name" | "country" | "protocol" | "latency" | "status" | "subscription"
+        ) {
+            return Err(AppError::bad_request(
+                "proxy_group_invalid_filter",
+                format!("unsupported proxy group filter field {}", filter.field),
+            ));
+        }
+        if !matches!(
+            filter.operator.trim(),
+            "contains" | "equals" | "in" | "regex" | "is" | "less_than" | "starts_with"
+        ) {
+            return Err(AppError::bad_request(
+                "proxy_group_invalid_filter",
+                format!(
+                    "unsupported proxy group filter operator {}",
+                    filter.operator
+                ),
+            ));
+        }
+        if !filter.enabled.unwrap_or(true) {
             continue;
+        }
+        let supports_values = matches!(filter.operator.as_str(), "in" | "equals");
+        let has_match_value = !filter.value.is_empty() || (supports_values && filter.has_values());
+        if !has_match_value && filter.field != "status" {
+            return Err(AppError::bad_request(
+                "proxy_group_invalid_filter",
+                "proxy group filter value cannot be empty",
+            ));
         }
         if filter.operator == "regex" && Regex::new(&filter.value).is_err() {
             return Err(AppError::bad_request(
@@ -297,6 +313,27 @@ fn validate_group_request(request: &ProxyGroupRequest) -> Result<(), AppError> {
     Ok(())
 }
 
+fn normalize_group_request(request: &mut ProxyGroupRequest) {
+    request.name = request.name.trim().to_string();
+    request.group_type = request.group_type.trim().to_string();
+    for filter in &mut request.filter {
+        filter.action = filter.action.trim().to_string();
+        filter.field = filter.field.trim().to_string();
+        filter.operator = filter.operator.trim().to_string();
+        filter.value = filter.value.trim().to_string();
+        filter.values = filter
+            .values
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !matches!(filter.operator.as_str(), "in" | "equals") {
+            filter.values.clear();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +341,7 @@ mod tests {
     fn node(name: &str, protocol: &str, latency: i64, country: Option<&str>) -> ProxyNodeResponse {
         ProxyNodeResponse {
             name: name.into(),
+            display_name: name.split("^_^").next().unwrap_or(name).into(),
             protocol: protocol.into(),
             latency,
             country: country.map(str::to_string),
@@ -434,5 +472,163 @@ mod tests {
         }];
 
         assert_eq!(calculate_members(&nodes, &filters), vec!["未测速", "超时"]);
+    }
+
+    #[test]
+    fn display_name_filters_and_implicit_timeout_match_frontend_semantics() {
+        let nodes = vec![
+            node("香港 01^_^sub_1", "trojan", 80, Some("HK")),
+            node("超时节点^_^sub_1", "ss", 0, Some("US")),
+        ];
+        let display_name = GroupFilterInput {
+            action: "keep".into(),
+            field: "name".into(),
+            operator: "regex".into(),
+            value: "^香港 01$".into(),
+            ..GroupFilterInput::default()
+        };
+        assert_eq!(
+            calculate_members(&nodes, &[display_name]),
+            vec!["香港 01^_^sub_1"]
+        );
+
+        let timeout = GroupFilterInput {
+            action: "keep".into(),
+            field: "status".into(),
+            operator: "is".into(),
+            value: String::new(),
+            ..GroupFilterInput::default()
+        };
+        assert_eq!(
+            calculate_members(&nodes, &[timeout]),
+            vec!["超时节点^_^sub_1"]
+        );
+
+        let mut delimiter_node = node("A^_^B^_^sub_1", "ss", 50, Some("US"));
+        delimiter_node.display_name = "A^_^B".into();
+        let delimiter_name = GroupFilterInput {
+            action: "keep".into(),
+            field: "name".into(),
+            operator: "regex".into(),
+            value: r"^A\^_\^B$".into(),
+            ..GroupFilterInput::default()
+        };
+        assert_eq!(
+            calculate_members(&[delimiter_node], &[delimiter_name]),
+            vec!["A^_^B^_^sub_1"]
+        );
+    }
+
+    #[test]
+    fn custom_group_names_reject_reserved_and_rule_delimiter_values() {
+        let request = |name: &str| ProxyGroupRequest {
+            name: name.into(),
+            group_type: "select".into(),
+            filter: Vec::new(),
+        };
+        for name in ["DIRECT", "reject", "Global", "PROXY"] {
+            assert_eq!(
+                validate_group_request(&request(name))
+                    .expect_err("reject reserved proxy policy name")
+                    .code,
+                "proxy_group_reserved"
+            );
+        }
+        for name in ["Group,One", "Group\nOne"] {
+            assert_eq!(
+                validate_group_request(&request(name))
+                    .expect_err("reject names that break rule serialization")
+                    .code,
+                "proxy_group_invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn group_filter_enums_reject_silent_fallbacks() {
+        let request_with = |filter: GroupFilterInput| ProxyGroupRequest {
+            name: "Strategy".into(),
+            group_type: "select".into(),
+            filter: vec![filter],
+        };
+
+        for filter in [
+            GroupFilterInput {
+                action: "kepe".into(),
+                value: "HK".into(),
+                ..GroupFilterInput::default()
+            },
+            GroupFilterInput {
+                field: "county".into(),
+                value: "HK".into(),
+                ..GroupFilterInput::default()
+            },
+            GroupFilterInput {
+                operator: "equal".into(),
+                value: "HK".into(),
+                ..GroupFilterInput::default()
+            },
+        ] {
+            assert_eq!(
+                validate_group_request(&request_with(filter))
+                    .expect_err("reject an unsupported filter enum")
+                    .code,
+                "proxy_group_invalid_filter"
+            );
+        }
+
+        for operator in ["contains", "regex", "less_than", "starts_with"] {
+            let filter = GroupFilterInput {
+                operator: operator.into(),
+                value: String::new(),
+                values: vec!["HK".into()],
+                ..GroupFilterInput::default()
+            };
+            assert_eq!(
+                validate_group_request(&request_with(filter))
+                    .expect_err("unrelated values must not hide an empty filter value")
+                    .code,
+                "proxy_group_invalid_filter"
+            );
+        }
+
+        for operator in ["in", "equals"] {
+            let filter = GroupFilterInput {
+                operator: operator.into(),
+                value: String::new(),
+                values: vec!["HK".into()],
+                ..GroupFilterInput::default()
+            };
+            assert!(validate_group_request(&request_with(filter)).is_ok());
+        }
+
+        let scalar_is = GroupFilterInput {
+            operator: "is".into(),
+            value: "HK".into(),
+            ..GroupFilterInput::default()
+        };
+        assert!(validate_group_request(&request_with(scalar_is)).is_ok());
+
+        let values_only_is = GroupFilterInput {
+            operator: "is".into(),
+            value: String::new(),
+            values: vec!["HK".into()],
+            ..GroupFilterInput::default()
+        };
+        assert_eq!(
+            validate_group_request(&request_with(values_only_is))
+                .expect_err("is requires one scalar value")
+                .code,
+            "proxy_group_invalid_filter"
+        );
+
+        let disabled_incomplete_filter = GroupFilterInput {
+            field: "latency".into(),
+            operator: "less_than".into(),
+            value: String::new(),
+            enabled: Some(false),
+            ..GroupFilterInput::default()
+        };
+        assert!(validate_group_request(&request_with(disabled_incomplete_filter)).is_ok());
     }
 }
