@@ -10,6 +10,7 @@ pub struct AppPaths {
     pub profiles_dir: PathBuf,
     pub rule_sets_dir: PathBuf,
     pub logs_dir: PathBuf,
+    pub backups_dir: PathBuf,
     pub cache_core_dir: PathBuf,
     pub database_file: PathBuf,
     pub runtime_yaml: PathBuf,
@@ -38,6 +39,7 @@ impl AppPaths {
         let profiles_dir = data_dir.join("profiles");
         let rule_sets_dir = profiles_dir.join("rule-sets");
         let logs_dir = data_dir.join("logs");
+        let backups_dir = data_dir.join("backups");
         let cache_core_dir = root_dir.join("cache-core");
         let database_file = data_dir.join("app.db");
         let runtime_yaml = profiles_dir.join("runtime.yaml");
@@ -49,6 +51,7 @@ impl AppPaths {
             profiles_dir,
             rule_sets_dir,
             logs_dir,
+            backups_dir,
             cache_core_dir,
             database_file,
             runtime_yaml,
@@ -66,6 +69,7 @@ impl AppPaths {
         self.migrate_legacy_rule_sets_dir()?;
         ensure_private_directory(&self.rule_sets_dir)?;
         ensure_private_directory(&self.logs_dir)?;
+        ensure_private_directory(&self.backups_dir)?;
         std::fs::create_dir_all(&self.cache_core_dir)?;
         restrict_sensitive_file_permissions(&self.database_file)?;
         for suffix in ["-wal", "-shm", "-journal"] {

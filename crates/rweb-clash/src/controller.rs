@@ -155,12 +155,33 @@ impl ControllerClient {
         Ok(payload
             .connections
             .into_iter()
-            .map(|conn| ConnectionResponse {
-                id: conn.id,
-                domain: conn.metadata.host.or(conn.metadata.destination_ip),
-                rule: conn.rule,
-                policy: conn.chains.last().cloned(),
-                speed: "实时".into(),
+            .map(|conn| {
+                let destination_ip = conn.metadata.destination_ip.clone();
+                let domain = conn
+                    .metadata
+                    .host
+                    .clone()
+                    .filter(|host| !host.trim().is_empty())
+                    .or_else(|| destination_ip.clone());
+                ConnectionResponse {
+                    id: conn.id,
+                    domain,
+                    rule: conn.rule,
+                    policy: conn.chains.last().cloned(),
+                    speed: "实时".into(),
+                    network: conn.metadata.network,
+                    connection_type: conn.metadata.connection_type,
+                    source_ip: conn.metadata.source_ip,
+                    source_port: value_as_string(conn.metadata.source_port),
+                    destination_ip,
+                    destination_port: value_as_string(conn.metadata.destination_port),
+                    process: conn.metadata.process_path.or(conn.metadata.process),
+                    start: conn.start,
+                    upload: conn.upload,
+                    download: conn.download,
+                    chains: conn.chains,
+                    rule_payload: conn.rule_payload,
+                }
             })
             .collect())
     }
@@ -173,6 +194,12 @@ impl ControllerClient {
             None::<()>,
         )
         .await
+    }
+
+    pub async fn close_all_connections(&self) -> Result<(), AppError> {
+        info!("closing all controller connections");
+        self.request_empty(Method::DELETE, "/connections", None::<()>)
+            .await
     }
 
     pub async fn flush_dns(&self) -> Result<(), AppError> {
@@ -278,16 +305,48 @@ struct ControllerConnections {
 struct ControllerConnection {
     id: String,
     metadata: ControllerMetadata,
+    #[serde(default)]
     rule: Option<String>,
     #[serde(default)]
     chains: Vec<String>,
+    #[serde(default)]
+    upload: u64,
+    #[serde(default)]
+    download: u64,
+    #[serde(default)]
+    start: Option<String>,
+    #[serde(rename = "rulePayload", default)]
+    rule_payload: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ControllerMetadata {
+    #[serde(default)]
     host: Option<String>,
-    #[serde(rename = "destinationIP")]
+    #[serde(rename = "destinationIP", default)]
     destination_ip: Option<String>,
+    #[serde(default)]
+    network: Option<String>,
+    #[serde(rename = "type", default)]
+    connection_type: Option<String>,
+    #[serde(rename = "sourceIP", default)]
+    source_ip: Option<String>,
+    #[serde(rename = "sourcePort", default)]
+    source_port: Option<serde_json::Value>,
+    #[serde(rename = "destinationPort", default)]
+    destination_port: Option<serde_json::Value>,
+    #[serde(rename = "processPath", default)]
+    process_path: Option<String>,
+    #[serde(default)]
+    process: Option<String>,
+}
+
+fn value_as_string(value: Option<serde_json::Value>) -> Option<String> {
+    match value {
+        Some(serde_json::Value::String(value)) => Some(value),
+        Some(serde_json::Value::Number(value)) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn append_traffic_chunk(payload: &mut Vec<u8>, chunk: &[u8]) -> Result<(), AppError> {

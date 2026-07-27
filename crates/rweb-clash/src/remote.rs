@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use crate::types::DownloadRoute;
 use axum::http::StatusCode;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, LOCATION, USER_AGENT};
@@ -12,6 +13,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
+use tracing::warn;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
@@ -32,24 +34,58 @@ pub struct RemoteTextResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: String,
+    pub route: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RouteOptions {
+    pub core_proxy: Option<String>,
+    pub system_proxy: Option<String>,
 }
 
 pub fn validate_http_url(value: &str) -> bool {
     parse_http_url(value).is_ok()
 }
 
-pub async fn get_text(
+pub async fn get_text_routed(
     value: &str,
     user_agent: Option<&str>,
     max_bytes: usize,
     error_code: &'static str,
+    route: DownloadRoute,
+    options: RouteOptions,
 ) -> Result<RemoteTextResponse, AppError> {
     tokio::time::timeout(REQUEST_TIMEOUT, async {
         let _permit = DOWNLOAD_PERMITS.acquire().await.map_err(|_| {
             AppError::service_unavailable("download_unavailable", "download queue is unavailable")
         })?;
         let initial_url = parse_http_url(value)?;
-        get_text_inner(initial_url, user_agent, max_bytes, error_code).await
+        let candidates = route_candidates(route, options)?;
+        let mut failures = Vec::new();
+        for (route_name, proxy_url) in candidates {
+            match get_text_inner(
+                initial_url.clone(),
+                user_agent,
+                max_bytes,
+                error_code,
+                route_name,
+                proxy_url.as_deref(),
+            )
+            .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error) if route == DownloadRoute::Auto => {
+                    warn!(route = route_name, %error, "download route failed, trying fallback");
+                    failures.push(format!("{route_name}: {}", error.message));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(AppError::new(
+            StatusCode::BAD_GATEWAY,
+            error_code,
+            format!("all download routes failed: {}", failures.join("; ")),
+        ))
     })
     .await
     .map_err(|_| {
@@ -61,25 +97,77 @@ pub async fn get_text(
     })?
 }
 
+fn route_candidates(
+    route: DownloadRoute,
+    options: RouteOptions,
+) -> Result<Vec<(&'static str, Option<String>)>, AppError> {
+    let unavailable = |name: &str| {
+        AppError::service_unavailable(
+            "download_route_unavailable",
+            format!("the {name} download route is unavailable"),
+        )
+    };
+    match route {
+        DownloadRoute::Direct => Ok(vec![("direct", None)]),
+        DownloadRoute::Core => Ok(vec![(
+            "core",
+            Some(options.core_proxy.ok_or_else(|| unavailable("core"))?),
+        )]),
+        DownloadRoute::System => Ok(vec![(
+            "system",
+            Some(
+                options
+                    .system_proxy
+                    .ok_or_else(|| unavailable("system proxy"))?,
+            ),
+        )]),
+        DownloadRoute::Auto => {
+            let mut routes = vec![("direct", None)];
+            if let Some(proxy) = options.core_proxy {
+                routes.push(("core", Some(proxy)));
+            }
+            if let Some(proxy) = options.system_proxy {
+                if !routes
+                    .iter()
+                    .any(|(_, existing)| existing.as_deref() == Some(proxy.as_str()))
+                {
+                    routes.push(("system", Some(proxy)));
+                }
+            }
+            Ok(routes)
+        }
+    }
+}
+
 async fn get_text_inner(
     mut url: Url,
     user_agent: Option<&str>,
     max_bytes: usize,
     error_code: &'static str,
+    route: &str,
+    proxy_url: Option<&str>,
 ) -> Result<RemoteTextResponse, AppError> {
     for redirect_count in 0..=MAX_REDIRECTS {
         let resolved = resolve_public_addresses(&url).await?;
         let host = url
             .host_str()
             .ok_or_else(|| invalid_url("remote resource URL must include a host"))?;
-        let client = reqwest::Client::builder()
+        let mut client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
-            .redirect(Policy::none())
-            .no_proxy()
-            .resolve_to_addrs(host, &resolved)
-            .build()
-            .map_err(AppError::internal)?;
+            .redirect(Policy::none());
+        if let Some(proxy_url) = proxy_url {
+            let proxy = reqwest::Proxy::all(proxy_url).map_err(|error| {
+                AppError::bad_request(
+                    "download_proxy_invalid",
+                    format!("download proxy URL is invalid: {error}"),
+                )
+            })?;
+            client = client.proxy(proxy);
+        } else {
+            client = client.no_proxy().resolve_to_addrs(host, &resolved);
+        }
+        let client = client.build().map_err(AppError::internal)?;
 
         let mut request = client.get(url.clone());
         if let Some(user_agent) = user_agent {
@@ -149,6 +237,7 @@ async fn get_text_inner(
             status,
             headers,
             body,
+            route: route.to_string(),
         });
     }
 

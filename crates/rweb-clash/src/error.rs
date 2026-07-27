@@ -149,3 +149,9 @@ impl From<reqwest::Error> for AppError {
         }
     }
 }
+
+impl From<zip::result::ZipError> for AppError {
+    fn from(value: zip::result::ZipError) -> Self {
+        Self::bad_request("backup_invalid", value.to_string())
+    }
+}

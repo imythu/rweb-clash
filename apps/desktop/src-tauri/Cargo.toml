@@ -12,7 +12,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 anyhow = "1.0.103"
 rweb-clash = { path = "../../../crates/rweb-clash" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.146"
 tauri = { version = "2.11.1", features = ["tray-icon"] }
+tauri-plugin-autostart = "2"
 tokio = { version = "1.51.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"

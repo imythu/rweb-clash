@@ -2,7 +2,10 @@ use crate::error::AppError;
 use crate::paths::{ensure_private_directory, restrict_sensitive_file_permissions, AppPaths};
 use crate::rule::sanitize_rule_policy;
 use crate::storage::{ProxyItemRecord, Storage};
-use crate::types::{SystemConfig, BUILTIN_DIRECT, BUILTIN_GLOBAL, BUILTIN_PROXY, BUILTIN_REJECT};
+use crate::types::{
+    SystemConfig, BUILTIN_DIRECT, BUILTIN_GLOBAL, BUILTIN_PROXY, BUILTIN_REJECT,
+    MIN_ACTIVE_PROBE_INTERVAL_SECONDS,
+};
 use crate::util::{new_id, valid_policy_target};
 use serde_yaml::{Mapping, Value};
 use std::collections::{HashMap, HashSet};
@@ -311,6 +314,14 @@ fn build_groups_from_members(
             insert(&mut mapping, "url", Value::String(url.clone()));
         }
         if let Some(interval) = item.interval_seconds {
+            let interval = if matches!(
+                item.group_type.as_deref(),
+                Some("url-test" | "fallback" | "load-balance")
+            ) {
+                interval.max(MIN_ACTIVE_PROBE_INTERVAL_SECONDS)
+            } else {
+                interval
+            };
             insert(&mut mapping, "interval", yaml_value(interval));
         }
         if let Some(tolerance) = item.tolerance_ms {
@@ -512,12 +523,50 @@ fn dns_mapping(config: &SystemConfig) -> Value {
     insert(
         &mut dns,
         "nameserver",
-        Value::Sequence(vec![
-            Value::String("https://dns.alidns.com/dns-query".into()),
-            Value::String("https://doh.pub/dns-query".into()),
-        ]),
+        yaml_string_sequence(&config.dns_nameservers),
     );
+    if !config.dns_fallback.is_empty() {
+        insert(
+            &mut dns,
+            "fallback",
+            yaml_string_sequence(&config.dns_fallback),
+        );
+    }
+    if !config.dns_fake_ip_filter.is_empty() {
+        insert(
+            &mut dns,
+            "fake-ip-filter",
+            yaml_string_sequence(&config.dns_fake_ip_filter),
+        );
+    }
+    if !config.dns_nameserver_policy.is_empty() {
+        insert(
+            &mut dns,
+            "nameserver-policy",
+            string_list_mapping(&config.dns_nameserver_policy),
+        );
+    }
+    if !config.dns_hosts.is_empty() {
+        insert(&mut dns, "hosts", string_list_mapping(&config.dns_hosts));
+    }
     Value::Mapping(dns)
+}
+
+fn yaml_string_sequence(values: &[String]) -> Value {
+    Value::Sequence(values.iter().cloned().map(Value::String).collect())
+}
+
+fn string_list_mapping(values: &std::collections::BTreeMap<String, Vec<String>>) -> Value {
+    let mut mapping = Mapping::new();
+    for (key, entries) in values {
+        let value = if entries.len() == 1 {
+            Value::String(entries[0].clone())
+        } else {
+            yaml_string_sequence(entries)
+        };
+        mapping.insert(Value::String(key.clone()), value);
+    }
+    Value::Mapping(mapping)
 }
 
 fn profile_mapping(config: &SystemConfig) -> Value {
@@ -742,6 +791,46 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(proxies, expected);
         }
+    }
+
+    #[test]
+    fn active_probe_groups_apply_the_runtime_interval_floor() {
+        let group = ProxyItemRecord {
+            name: "Automatic".into(),
+            kind: "group".into(),
+            subscription_id: None,
+            display_name: "Automatic".into(),
+            source: "custom".into(),
+            builtin: false,
+            source_name: None,
+            protocol: None,
+            country: None,
+            group_type: Some("url-test".into()),
+            raw_json: None,
+            content_hash: None,
+            latency_ms: None,
+            alive: true,
+            filtered_out: false,
+            filter_reason: None,
+            delay_ms: None,
+            tolerance_ms: Some(50),
+            url: Some(crate::types::DEFAULT_DELAY_TEST_URL.into()),
+            interval_seconds: Some(300),
+            strategy_json: "{}".into(),
+            position: 1024,
+            enabled: true,
+        };
+        let member_map = HashMap::from([("Automatic".into(), vec!["Node A".into()])]);
+        let available_nodes = HashSet::from(["Node A".into()]);
+
+        let (groups, _) = build_groups_from_members(&[group], member_map, &available_nodes, false)
+            .expect("build active probe group");
+        let interval = groups[0]
+            .as_mapping()
+            .and_then(|mapping| mapping.get(Value::String("interval".into())))
+            .and_then(Value::as_i64);
+
+        assert_eq!(interval, Some(MIN_ACTIVE_PROBE_INTERVAL_SECONDS));
     }
 
     #[tokio::test]

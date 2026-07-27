@@ -14,7 +14,7 @@ import { api, type GroupFilter, type ProxyGroup, type ProxyGroupInput, type Prox
 // --- Nano Components ---
 
 const SubBadge = ({ name }: { name: string }) => (
-  <span className="px-1.5 py-0.5 rounded-md bg-muted border border-muted-foreground/10 text-[9px] font-black text-muted-foreground uppercase tracking-tight shrink-0 ml-1.5">
+  <span title={name} className="ml-1.5 max-w-28 shrink-0 truncate rounded-md border border-muted-foreground/10 bg-muted px-1.5 py-0.5 text-[9px] font-black uppercase text-muted-foreground">
     {name}
   </span>
 );
@@ -233,6 +233,7 @@ const CreateGroupDrawer = ({ isOpen, onClose, onSave, allNodes, initialData }: C
   const [groupType, setGroupType] = useState(() => initialData?.type ?? 'select');
   const [blocks, setBlocks] = useState<SemanticBlock[]>(() => initialData?.filter.map(normalizeBlock) ?? []);
   const [isSaving, setIsSaving] = useState(false);
+  const saveInFlight = useRef(false);
   const { toast } = useToast();
 
   const uniqueTypes = useMemo(() => Array.from(new Set(allNodes.map(node => node.type))), [allNodes]);
@@ -324,6 +325,7 @@ const CreateGroupDrawer = ({ isOpen, onClose, onSave, allNodes, initialData }: C
   }, [blocks, allNodes]);
 
   const handleSave = async () => {
+    if (saveInFlight.current) return;
     if (!name.trim()) return toast('请填写分组名称', 'error');
     if (blocks.length > 0 && previewNodes.length === 0) return toast('当前规则未命中任何节点', 'error');
     const filter = blocks.filter(shouldPersistBlock).map(block => {
@@ -338,10 +340,12 @@ const CreateGroupDrawer = ({ isOpen, onClose, onSave, allNodes, initialData }: C
         ? { ...base, values: block.values.map(value => value.trim()).filter(Boolean) }
         : { ...base, value: block.value.trim() };
     });
+    saveInFlight.current = true;
     setIsSaving(true);
     try {
       await onSave({ name: name.trim(), type: groupType, filter });
     } finally {
+      saveInFlight.current = false;
       setIsSaving(false);
     }
   };
@@ -751,7 +755,7 @@ export const Proxies = () => {
                       <div className={cn("size-10 rounded-xl flex items-center justify-center shrink-0", isActive ? "bg-primary text-primary-foreground" : "bg-card border text-muted-foreground")}><GroupIcon type={group.type} className="size-5" /></div>
                       <div className="min-w-0 text-left">
                         <div className="flex items-center gap-1.5">
-                          <h4 className={cn("text-base font-bold truncate text-foreground", !isActive && "text-muted-foreground group-hover:text-foreground")}>{dName}</h4>
+                          <h4 title={dName} className={cn("line-clamp-2 break-all text-base font-bold leading-5 text-foreground", !isActive && "text-muted-foreground group-hover:text-foreground")}>{dName}</h4>
                           {sName && <SubBadge name={sName} />}
                           {isSystemBuiltin && <span className="px-1.5 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/20 text-[9px] font-black text-amber-600 shrink-0">系统内置</span>}
                           {isReadOnly && <Lock className="size-3 text-amber-500/70" />}
@@ -779,7 +783,7 @@ export const Proxies = () => {
                     </div>
                     <div className="min-w-0 text-left text-foreground">
                       <div className="flex items-center gap-3">
-                          <h3 className="text-xl md:text-2xl font-black truncate">{displayRuntimeName(activeGroup.name, activeGroup.displayName)}</h3>
+                          <h3 title={displayRuntimeName(activeGroup.name, activeGroup.displayName)} className="max-w-2xl break-all text-xl font-black md:text-2xl">{displayRuntimeName(activeGroup.name, activeGroup.displayName)}</h3>
                           {activeGroup.subscriptionName && <SubBadge name={activeGroup.subscriptionName} />}
                          {isSystemBuiltinGroup(activeGroup) && <span className="px-2 py-1 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[10px] font-black text-amber-600 shrink-0">系统内置</span>}
                       </div>
@@ -810,7 +814,7 @@ export const Proxies = () => {
                           <button type="button" aria-label={`选择策略组 ${displayRuntimeName(member.name, member.displayName)}`} aria-pressed={isActive} onClick={() => handleSelectNode(activeGroup.name, member.name)} disabled={!!isSwitching} className="absolute inset-0 z-0 rounded-2xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" />
                           <div className="relative z-10 pointer-events-none flex h-full flex-col justify-between gap-3">
                             <div className="flex items-center justify-between"><span className="inline-flex items-center gap-1 rounded-md bg-primary/10 px-2 py-1 text-[9px] font-black text-primary"><Layers className="size-3" /> 策略组</span>{isActive && <CheckCircle2 className="size-4 text-primary" />}</div>
-                            <div className="min-w-0"><p className="truncate text-sm font-bold">{displayRuntimeName(member.name, member.displayName)}</p><p className="mt-1 text-[9px] font-bold text-muted-foreground">{GROUP_STRATEGY_LABELS[member.type] ?? member.type} · {member.all.length} 成员</p></div>
+                            <div className="min-w-0"><p title={displayRuntimeName(member.name, member.displayName)} className="line-clamp-2 min-h-10 break-all text-sm font-bold">{displayRuntimeName(member.name, member.displayName)}</p><p className="mt-1 text-[9px] font-bold text-muted-foreground">{GROUP_STRATEGY_LABELS[member.type] ?? member.type} · {member.all.length} 成员</p></div>
                           </div>
                           {isSwitching === member.name && <div className="absolute inset-0 z-20 bg-background/50 flex items-center justify-center"><Loader2 className="size-5 animate-spin text-primary" /></div>}
                         </div>
@@ -831,7 +835,7 @@ export const Proxies = () => {
                           />
                           <div className="relative z-10 pointer-events-none">
                             <div className="flex justify-between items-center w-full mb-3 text-foreground"><StatusBadge delay={node.latency} loading={testingNode === node.name} onClick={(e) => handleTestNode(e, node.name)} className={cn("pointer-events-auto", activeGroup.now === node.name ? "bg-background border-primary/20 text-primary" : "")} />{activeGroup.now === node.name && <CheckCircle2 className="size-4 text-primary" />}</div>
-                            <div className="min-w-0 w-full"><p className="text-sm font-bold truncate">{dName}</p>{sName && <div className="mt-1"><SubBadge name={sName} /></div>}</div>
+                            <div className="min-w-0 w-full"><p title={dName} className="line-clamp-2 min-h-10 break-all text-sm font-bold">{dName}</p>{sName && <div className="mt-1"><SubBadge name={sName} /></div>}</div>
                           </div>
                           {isSwitching === node.name && <div className="absolute inset-0 z-20 bg-background/50 backdrop-blur-sm flex items-center justify-center"><Loader2 className="size-5 animate-spin text-primary" /></div>}
                         </div>
@@ -843,7 +847,7 @@ export const Proxies = () => {
                     <div className="flex items-center gap-4 px-4 py-2 text-[10px] font-black uppercase text-muted-foreground border-b mb-4"><div className="w-12 text-center">Rank</div><div className="flex-1 text-left">Identity</div><div className="w-24 text-right">Latency</div></div>
                     {activeMemberGroups.map((member, idx) => (
                       <div key={member.name} className={cn("flex items-center justify-between p-3.5 rounded-2xl border transition-all text-foreground", activeGroup.now === member.name ? "bg-primary/10 border-primary shadow-sm font-bold" : "bg-background border-border/40 text-muted-foreground")}>
-                        <div className="flex items-center gap-5 flex-1 min-w-0"><div className="w-8 h-8 rounded-lg bg-primary/10 text-primary flex items-center justify-center"><Layers className="size-4" /></div><div className="min-w-0"><p className="text-sm font-bold truncate">{displayRuntimeName(member.name, member.displayName)}</p><p className="text-[10px] text-muted-foreground">策略组 · {GROUP_STRATEGY_LABELS[member.type] ?? member.type}</p></div></div>
+                        <div className="flex items-center gap-5 flex-1 min-w-0"><div className="w-8 h-8 rounded-lg bg-primary/10 text-primary flex items-center justify-center"><Layers className="size-4" /></div><div className="min-w-0"><p title={displayRuntimeName(member.name, member.displayName)} className="line-clamp-2 break-all text-sm font-bold">{displayRuntimeName(member.name, member.displayName)}</p><p className="text-[10px] text-muted-foreground">策略组 · {GROUP_STRATEGY_LABELS[member.type] ?? member.type}</p></div></div>
                         <span className="text-[10px] font-bold text-muted-foreground">#{idx + 1}</span>
                       </div>
                     ))}
@@ -852,7 +856,7 @@ export const Proxies = () => {
                       const sName = node.subscriptionName;
                       return (
                         <div key={node.name} className={cn("flex items-center justify-between p-3.5 rounded-2xl border transition-all text-foreground", activeGroup.now === node.name ? "bg-primary/10 border-primary shadow-sm font-bold" : "bg-background border-border/40 hover:bg-card hover:border-border text-muted-foreground")}>
-                          <div className="flex items-center gap-5 flex-1 min-w-0 text-left text-foreground"><div className={cn("w-8 h-8 rounded-lg flex items-center justify-center font-bold text-xs shrink-0 text-foreground", activeGroup.now === node.name ? "bg-primary text-white shadow-sm" : "bg-muted text-muted-foreground")}>{idx + 1}</div><div className="min-w-0 flex-1 text-foreground text-left"><div className="flex items-center gap-2"><p className="text-sm font-bold truncate">{dName}</p>{sName && <SubBadge name={sName} />}</div><p className="text-[10px] text-muted-foreground uppercase mt-0.5">{node.type}</p></div></div>
+                          <div className="flex items-center gap-5 flex-1 min-w-0 text-left text-foreground"><div className={cn("w-8 h-8 rounded-lg flex items-center justify-center font-bold text-xs shrink-0 text-foreground", activeGroup.now === node.name ? "bg-primary text-white shadow-sm" : "bg-muted text-muted-foreground")}>{idx + 1}</div><div className="min-w-0 flex-1 text-foreground text-left"><div className="flex items-start gap-2"><p title={dName} className="line-clamp-2 break-all text-sm font-bold">{dName}</p>{sName && <SubBadge name={sName} />}</div><p className="text-[10px] text-muted-foreground uppercase mt-0.5">{node.type}</p></div></div>
                           <StatusBadge delay={node.latency} loading={testingNode === node.name} onClick={(e) => handleTestNode(e, node.name)} className={activeGroup.now === node.name ? "bg-background border-primary/20 text-primary" : ""} />
                         </div>
                       );
@@ -878,7 +882,7 @@ export const Proxies = () => {
           const sName = group.subscriptionName;
           return (
             <div key={group.name} className={cn("flex flex-col shrink-0 rounded-[1.25rem] border-2 transition-all overflow-hidden text-foreground", isExpanded ? "bg-card border-primary/30 shadow-md" : "bg-card border-border/50")}>
-              <div onClick={() => setExpandedGroupMobile(isExpanded ? null : group.name)} className="flex items-center justify-between p-4 cursor-pointer select-none text-foreground text-left"><div className="flex items-center gap-3 min-w-0 text-foreground text-left"><div className={cn("size-10 rounded-xl flex items-center justify-center shrink-0 shadow-sm text-foreground", isExpanded ? "bg-primary/10 text-primary" : "bg-muted/50 border text-muted-foreground")}><GroupIcon type={group.type} className="size-5 text-foreground" /></div><div className="min-w-0 text-left text-foreground"><div className="flex items-center gap-1.5 text-left text-foreground"><h4 className="text-base font-bold truncate text-foreground">{dName}</h4>{sName && <SubBadge name={sName} />}{isSystemBuiltin && <span className="px-1.5 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/20 text-[9px] font-black text-amber-600 shrink-0">系统内置</span>}{isReadOnly && <Lock className="size-3 text-amber-500/70 shrink-0" />}</div><div className="text-[10px] font-semibold text-muted-foreground uppercase text-left">{GROUP_STRATEGY_LABELS[group.type] ?? group.type} · {group.all.length} 成员</div></div></div><div className="flex items-center gap-3 shrink-0 text-foreground"><StatusBadge delay={group.delay} loading={testingGroup === group.name} onClick={(e) => handleTestGroup(e, group.name)} /><ChevronDown className={cn("size-4 text-muted-foreground transition-transform", isExpanded && "rotate-180 text-primary")} /></div></div>
+              <div onClick={() => setExpandedGroupMobile(isExpanded ? null : group.name)} className="flex items-center justify-between p-4 cursor-pointer select-none text-foreground text-left"><div className="flex items-center gap-3 min-w-0 text-foreground text-left"><div className={cn("size-10 rounded-xl flex items-center justify-center shrink-0 shadow-sm text-foreground", isExpanded ? "bg-primary/10 text-primary" : "bg-muted/50 border text-muted-foreground")}><GroupIcon type={group.type} className="size-5 text-foreground" /></div><div className="min-w-0 text-left text-foreground"><div className="flex items-start gap-1.5 text-left text-foreground"><h4 title={dName} className="line-clamp-2 break-all text-base font-bold leading-5 text-foreground">{dName}</h4>{sName && <SubBadge name={sName} />}{isSystemBuiltin && <span className="px-1.5 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/20 text-[9px] font-black text-amber-600 shrink-0">系统内置</span>}{isReadOnly && <Lock className="size-3 text-amber-500/70 shrink-0" />}</div><div className="text-[10px] font-semibold text-muted-foreground uppercase text-left">{GROUP_STRATEGY_LABELS[group.type] ?? group.type} · {group.all.length} 成员</div></div></div><div className="flex items-center gap-3 shrink-0 text-foreground"><StatusBadge delay={group.delay} loading={testingGroup === group.name} onClick={(e) => handleTestGroup(e, group.name)} /><ChevronDown className={cn("size-4 text-muted-foreground transition-transform", isExpanded && "rotate-180 text-primary")} /></div></div>
               {isExpanded && (
                 <div className="border-t bg-background/30 p-3 animate-in slide-in-from-top-2 duration-300 text-foreground text-left">
                   <div className="flex gap-2 mb-3 text-foreground text-left"><div className="relative flex-1"><Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground opacity-70" /><input value={searchNode} onChange={(e) => setSearchNode(e.target.value)} placeholder="过滤节点..." className="w-full pl-8 pr-3 py-2 bg-background border border-border/50 rounded-lg text-xs outline-none focus:border-primary/50 text-foreground" /></div>{!isReadOnly && <Button onClick={() => { setEditingData(group); setIsCreating(true); }} variant="outline" size="icon" className="h-9 w-9 text-foreground"><Edit3 className="size-3.5 text-foreground" /></Button>}<Button onClick={(e) => handleTestGroup(e, group.name)} disabled={testingGroup === group.name} variant="outline" className="h-9 px-3 rounded-lg gap-1.5 font-bold text-xs text-foreground">测速</Button></div>
@@ -887,7 +891,7 @@ export const Proxies = () => {
                       const isActive = group.now === member.name;
                       return (
                         <button key={member.name} type="button" onClick={() => handleSelectNode(group.name, member.name)} disabled={!!isSwitching || group.type !== 'select'} className={cn("w-full flex items-center justify-between p-3 rounded-xl border text-left", isActive ? "bg-primary/10 border-primary" : "bg-card border-border/50")}>
-                          <span className="flex min-w-0 items-center gap-2"><Layers className="size-4 shrink-0 text-primary" /><span className="truncate text-xs font-bold">{displayRuntimeName(member.name, member.displayName)}</span></span><span className="text-[9px] font-black text-primary">策略组</span>
+                          <span className="flex min-w-0 items-center gap-2"><Layers className="size-4 shrink-0 text-primary" /><span className="break-all text-xs font-bold">{displayRuntimeName(member.name, member.displayName)}</span></span><span className="text-[9px] font-black text-primary">策略组</span>
                         </button>
                       );
                     })}
@@ -905,7 +909,7 @@ export const Proxies = () => {
                               disabled={!!isSwitching}
                               className="absolute inset-0 z-0 rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                             />
-                            <div className="relative z-10 pointer-events-none min-w-0 flex-1 text-left"><div className="flex items-center gap-2"><p className="text-xs truncate">{dN}</p>{sN && <SubBadge name={sN} />}</div></div>
+                            <div className="relative z-10 pointer-events-none min-w-0 flex-1 text-left"><div className="flex items-start gap-2"><p className="break-all text-xs">{dN}</p>{sN && <SubBadge name={sN} />}</div></div>
                             <StatusBadge delay={node.latency} loading={testingNode === node.name} onClick={(e) => handleTestNode(e, node.name)} className={cn("relative z-10 pointer-events-auto", isNodeActive ? "bg-background border-primary/20 text-primary" : "")} />
                           </div>
                        )

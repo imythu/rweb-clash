@@ -21,13 +21,18 @@ import {
   Wand2,
   Smartphone,
   Layers,
-  AlertCircle
+  AlertCircle,
+  MonitorCog,
 } from 'lucide-react';
+import { isTauri } from '@tauri-apps/api/core';
 import type { LucideIcon } from 'lucide-react';
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useToast } from './toast-context';
 import { api, type SystemConfig } from '@/lib/api';
+import { AdvancedDnsSettings } from './AdvancedDnsSettings';
+import { BackupSettings } from './BackupSettings';
+import { DesktopStartupSettings } from './DesktopStartupSettings';
 
 interface BentoCardProps {
   title: string;
@@ -106,6 +111,7 @@ export const Settings = () => {
   const [showSecret, setShowSecret] = useState(false);
   const loadRequestId = useRef(0);
   const saveInFlight = useRef(false);
+  const flushInFlight = useRef(false);
 
   const fetchConfig = useCallback(async () => {
     const requestId = ++loadRequestId.current;
@@ -179,6 +185,8 @@ export const Settings = () => {
   };
 
   const flushDns = async () => {
+    if (flushInFlight.current) return;
+    flushInFlight.current = true;
     setIsFlushing(true);
     try {
       await api.flushDns();
@@ -186,6 +194,7 @@ export const Settings = () => {
     } catch {
       toast('DNS 缓存清空失败', 'error');
     } finally {
+      flushInFlight.current = false;
       setIsFlushing(false);
     }
   };
@@ -213,9 +222,17 @@ export const Settings = () => {
   // 检测专家模式修改导致的“套餐偏离”
   const isSpeedSurfingCustom = config.dns_mode === 'fake-ip' && (!config.tcp_concurrent || !config.unified_delay);
   const isCompatibleCustom = config.dns_mode === 'redir-host' && config.tcp_concurrent;
+  const advancedDnsKey = JSON.stringify([
+    config.dns_nameservers,
+    config.dns_fallback,
+    config.dns_fake_ip_filter,
+    config.dns_nameserver_policy,
+    config.dns_hosts,
+  ]);
 
   return (
-    <fieldset disabled={isSaving} aria-busy={isSaving} className="min-w-0 space-y-12 max-w-7xl mx-auto pb-12 animate-in fade-in duration-500 text-left px-1">
+    <div className="mx-auto flex min-w-0 max-w-7xl flex-col gap-12 px-1 pb-12 text-left animate-in fade-in duration-500">
+      <fieldset disabled={isSaving} aria-busy={isSaving} className="contents">
       
       {/* Header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-8">
@@ -397,9 +414,27 @@ export const Settings = () => {
                  <SettingRow label="自动启动内核" icon={Cpu}><MiniToggle active={config.auto_start} label="自动启动内核" onClick={() => updateField('auto_start', !config.auto_start)} /></SettingRow>
                  <SettingRow label="节点记忆" icon={HardDrive}><MiniToggle active={config.store_selected} label="节点记忆" onClick={() => updateField('store_selected', !config.store_selected)} /></SettingRow>
               </div>
+              <AdvancedDnsSettings
+                key={advancedDnsKey}
+                config={config}
+                saving={isSaving}
+                onSave={patch => saveConfig(patch)}
+                onError={message => toast(message, 'error')}
+              />
            </BentoCard>
         </div>
       )}
-    </fieldset>
+      </fieldset>
+      {isTauri() && (
+        <BentoCard
+          title="桌面启动"
+          description="独立于 Mihomo 内核启动设置"
+          icon={MonitorCog}
+        >
+          <DesktopStartupSettings />
+        </BentoCard>
+      )}
+      <BackupSettings />
+    </div>
   );
 };

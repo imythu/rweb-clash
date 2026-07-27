@@ -24,7 +24,9 @@ import {
 import { Button } from "@/components/ui/button";
 import { useToast } from './toast-context';
 import { cn, SUB_DELIMITER } from '@/lib/utils';
-import { api, type FilterRule, type FilterRuleInput, type Subscription, type SubscriptionInput, type SubscriptionMembers } from '@/lib/api';
+import { api, type DownloadRoute, type FilterRule, type FilterRuleInput, type Subscription, type SubscriptionInput, type SubscriptionMembers } from '@/lib/api';
+import { Spinner } from '@/components/ui/spinner';
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 
 const displayAssetName = (name: string) => name.split(SUB_DELIMITER)[0] || name;
 const displaySubscriptionFormat = (format?: string | null) => (format?.trim() || 'auto').toUpperCase();
@@ -38,7 +40,7 @@ type SelectOption = {
 type MemberSection = SubscriptionMembers['filtered'];
 type MemberViewFilter = 'all' | 'imported' | 'rejected';
 type EditableFilterRule = Omit<FilterRule, 'id'> & { id?: string; values: string[] };
-type SubscriptionDraft = Pick<Subscription, 'name' | 'url' | 'traffic' | 'intervalSeconds' | 'inheritGlobal'> &
+type SubscriptionDraft = Pick<Subscription, 'name' | 'url' | 'traffic' | 'intervalSeconds' | 'inheritGlobal' | 'downloadRoute'> &
   Partial<Pick<Subscription, 'id' | 'format' | 'breakdown'>> & {
     rules: EditableFilterRule[];
   };
@@ -51,6 +53,14 @@ const EMPTY_SUBSCRIPTION_DRAFT: SubscriptionDraft = {
   traffic: { used: 0, total: 100 * 1024 ** 3 },
   intervalSeconds: 21_600,
   inheritGlobal: true,
+  downloadRoute: 'auto',
+};
+
+const DOWNLOAD_ROUTE_LABELS: Record<DownloadRoute, string> = {
+  auto: '自动回退',
+  direct: '直连',
+  core: '当前内核',
+  system: '系统代理',
 };
 
 const formatLatency = (latency: number) => latency > 0 ? `${latency}ms` : 'T.O';
@@ -296,6 +306,9 @@ const SubscriptionCard = ({ sub, onEdit, onDelete, onMembers }: SubscriptionCard
                   <span className="px-1.5 py-0.5 rounded-md bg-primary/10 text-primary text-[9px] font-black tracking-wide">
                     {displaySubscriptionFormat(sub.format)}
                   </span>
+                  <span className="text-[9px] font-black text-muted-foreground">
+                    路线 {DOWNLOAD_ROUTE_LABELS[(sub.lastRoute || sub.downloadRoute) as DownloadRoute] || sub.lastRoute}
+                  </span>
                 </div>
               </div>
             </div>
@@ -488,6 +501,9 @@ export const Subscriptions = () => {
   const [isGlobalDrawerOpen, setIsGlobalDrawerOpen] = useState(false);
   const [globalRules, setGlobalRules] = useState<FilterRule[]>([]);
   const [isSavingGlobalRules, setIsSavingGlobalRules] = useState(false);
+  const [isSavingSubscription, setIsSavingSubscription] = useState(false);
+  const subscriptionSubmitInFlight = useRef(false);
+  const globalRulesSubmitInFlight = useRef(false);
   const membersRequestId = useRef(0);
 
   const fetchSubs = useCallback(async () => {
@@ -541,7 +557,7 @@ export const Subscriptions = () => {
   }, [selectionMembers]);
 
   const handleUpdateSub = async () => {
-    if (!editingSub) return;
+    if (!editingSub || subscriptionSubmitInFlight.current) return;
     // 1. Validate URL
     if (!editingSub.url.trim()) {
       toast('节点接口地址不能为空', 'error');
@@ -591,8 +607,11 @@ export const Subscriptions = () => {
         values: rule.type === 'in' ? (rule.values ?? []) : [],
         enabled: rule.enabled ?? true,
       })),
+      downloadRoute: editingSub.downloadRoute,
     };
 
+    subscriptionSubmitInFlight.current = true;
+    setIsSavingSubscription(true);
     try {
       const nextSubs = editingSub.id
         ? await api.updateSubscription(editingSub.id, payload)
@@ -602,6 +621,9 @@ export const Subscriptions = () => {
       setEditingSub(null);
     } catch {
       toast('配置同步失败', 'error');
+    } finally {
+      subscriptionSubmitInFlight.current = false;
+      setIsSavingSubscription(false);
     }
   };
 
@@ -646,6 +668,7 @@ export const Subscriptions = () => {
   });
 
   const handleSaveGlobalRules = async () => {
+    if (globalRulesSubmitInFlight.current) return;
     for (let i = 0; i < globalRules.length; i++) {
       const rule = globalRules[i];
       if (rule.type === 'in' ? !(rule.values?.length) : !rule.pattern.trim()) {
@@ -670,6 +693,7 @@ export const Subscriptions = () => {
       enabled: rule.enabled,
     }));
 
+    globalRulesSubmitInFlight.current = true;
     setIsSavingGlobalRules(true);
     try {
       setGlobalRules(await api.replaceGlobalFilterRules(payload));
@@ -678,6 +702,7 @@ export const Subscriptions = () => {
     } catch {
       toast('通用精选准则保存失败', 'error');
     } finally {
+      globalRulesSubmitInFlight.current = false;
       setIsSavingGlobalRules(false);
     }
   };
@@ -687,7 +712,7 @@ export const Subscriptions = () => {
   };
 
   const intervals = [
-    { label: '1H', value: 60 }, { label: '6H', value: 360 }, { label: '12H', value: 720 }, { label: '24H', value: 1440 }, { label: 'NEVER', value: 0 },
+    { label: '6H', value: 360 }, { label: '12H', value: 720 }, { label: '24H', value: 1440 }, { label: 'NEVER', value: 0 },
   ];
 
   const [lastAddedIndex, setLastAddedIndex] = useState<number | null>(null);
@@ -852,6 +877,19 @@ export const Subscriptions = () => {
                        ))}
                     </div>
                   </div>
+                  <div className="space-y-2.5 pt-2 border-t border-dashed border-muted">
+                    <label className="text-[10px] font-black uppercase ml-1 text-muted-foreground block tracking-wide">下载路线</label>
+                    <Select value={editingSub.downloadRoute} onValueChange={value => setEditingSub({ ...editingSub, downloadRoute: value as DownloadRoute })}>
+                      <SelectTrigger aria-label="订阅下载路线"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          {(Object.entries(DOWNLOAD_ROUTE_LABELS) as Array<[DownloadRoute, string]>).map(([value, label]) => (
+                            <SelectItem key={value} value={value}>{label}</SelectItem>
+                          ))}
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  </div>
                 </div>
               </section>
 
@@ -1003,8 +1041,11 @@ export const Subscriptions = () => {
 
             {/* Footer Buttons - ADAPTIVE */}
             <div className="p-4 md:p-6 border-t bg-muted/10 grid grid-cols-2 gap-4 shadow-[0_-10px_30px_rgba(0,0,0,0.05)]">
-              <Button variant="outline" onClick={() => setEditingSub(null)} className="rounded-xl md:rounded-2xl h-12 md:h-14 font-black uppercase border-2 text-[9px] md:text-xs tracking-widest hover:bg-background transition-all">放弃修改</Button>
-              <Button onClick={handleUpdateSub} className="rounded-xl md:rounded-2xl h-12 md:h-14 bg-zinc-900 hover:bg-black text-white font-black uppercase shadow-xl shadow-black/20 text-[9px] md:text-xs tracking-widest transition-all hover:scale-105 active:scale-95">保存配置同步</Button>
+              <Button variant="outline" disabled={isSavingSubscription} onClick={() => setEditingSub(null)} className="rounded-xl md:rounded-2xl h-12 md:h-14 font-black uppercase border-2 text-[9px] md:text-xs tracking-widest hover:bg-background transition-all">放弃修改</Button>
+              <Button disabled={isSavingSubscription} onClick={handleUpdateSub} className="rounded-xl md:rounded-2xl h-12 md:h-14 bg-zinc-900 hover:bg-black text-white font-black uppercase shadow-xl shadow-black/20 text-[9px] md:text-xs tracking-widest transition-all hover:scale-105 active:scale-95">
+                {isSavingSubscription && <Spinner data-icon="inline-start" />}
+                {isSavingSubscription ? '正在同步' : '保存配置同步'}
+              </Button>
             </div>
           </div>
         </div>

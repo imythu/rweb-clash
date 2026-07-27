@@ -197,6 +197,82 @@ pub async fn complete_system_proxy_recovery(backup_path: &Path) -> Result<(), Ap
     remove_backup(backup_path).await
 }
 
+pub async fn current_system_proxy_url() -> Result<Option<String>, AppError> {
+    let state = capture_system_proxy().await?;
+    Ok(system_proxy_url_from_state(&state))
+}
+
+fn system_proxy_url_from_state(state: &PlatformProxyState) -> Option<String> {
+    match state {
+        PlatformProxyState::Windows(state) => {
+            if state.proxy_enable != Some(1) {
+                return None;
+            }
+            windows_proxy_endpoint(state.proxy_server.as_deref()?)
+        }
+        PlatformProxyState::Macos(state) => state.services.iter().find_map(|service| {
+            [&service.https, &service.http]
+                .into_iter()
+                .find(|endpoint| {
+                    enabled_endpoint(endpoint.enabled, &endpoint.server, endpoint.port)
+                })
+                .and_then(|endpoint| proxy_url(&endpoint.server, endpoint.port))
+        }),
+        PlatformProxyState::Linux(state) => {
+            if state.mode != "manual" {
+                return None;
+            }
+            [&state.https, &state.http]
+                .into_iter()
+                .find(|endpoint| !endpoint.host.trim().is_empty() && endpoint.port > 0)
+                .and_then(|endpoint| proxy_url(&endpoint.host, endpoint.port))
+        }
+    }
+}
+
+fn windows_proxy_endpoint(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let selected = if value.contains('=') {
+        let entries = value
+            .split(';')
+            .filter_map(|entry| entry.split_once('='))
+            .map(|(scheme, endpoint)| (scheme.trim().to_ascii_lowercase(), endpoint.trim()))
+            .collect::<Vec<_>>();
+        entries
+            .iter()
+            .find(|(scheme, _)| scheme == "https")
+            .or_else(|| entries.iter().find(|(scheme, _)| scheme == "http"))
+            .map(|(_, endpoint)| *endpoint)?
+    } else {
+        value
+    };
+    normalize_proxy_url(selected)
+}
+
+fn enabled_endpoint(enabled: bool, host: &str, port: u16) -> bool {
+    enabled && !host.trim().is_empty() && port > 0
+}
+
+fn proxy_url(host: &str, port: u16) -> Option<String> {
+    normalize_proxy_url(&format!("{}:{port}", host.trim()))
+}
+
+fn normalize_proxy_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    let candidate = if value.starts_with("http://") || value.starts_with("https://") {
+        value.to_string()
+    } else {
+        format!("http://{value}")
+    };
+    let url = reqwest::Url::parse(&candidate).ok()?;
+    matches!(url.scheme(), "http" | "https")
+        .then_some(candidate)
+        .filter(|_| url.host_str().is_some() && url.port_or_known_default().is_some())
+}
+
 async fn create_backup(path: &Path, managed: &ManagedProxyEndpoint) -> Result<(), AppError> {
     let backup = SystemProxyBackup {
         version: SYSTEM_PROXY_BACKUP_VERSION,

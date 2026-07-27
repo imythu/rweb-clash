@@ -10,7 +10,9 @@ import {
   ArrowUpRight,
   ArrowDownLeft,
   Menu,
-  X
+  X,
+  Network,
+  Server,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { cn } from "@/lib/utils";
@@ -107,6 +109,8 @@ export const Layout = ({ children }: LayoutProps) => {
   const menuItems = [
     { id: 'dashboard', label: '总览', icon: LayoutDashboard, to: '/' },
     { id: 'subscriptions', label: '订阅管理', icon: Rss, to: '/subscriptions' },
+    { id: 'manual-nodes', label: '手动节点', icon: Server, to: '/manual-nodes' },
+    { id: 'connections', label: '实时连接', icon: Network, to: '/connections' },
     { id: 'proxies', label: '分组管理', icon: Globe, to: '/proxies' },
     { id: 'rules', label: '路由管理', icon: ShieldCheck, to: '/rules' },
     { id: 'logs', label: '运行日志', icon: Activity, to: '/logs' },

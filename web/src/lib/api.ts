@@ -8,6 +8,11 @@ export type SystemConfig = {
   secret: string;
   dns_enabled: boolean;
   dns_mode: 'fake-ip' | 'redir-host';
+  dns_nameservers: string[];
+  dns_fallback: string[];
+  dns_fake_ip_filter: string[];
+  dns_nameserver_policy: Record<string, string[]>;
+  dns_hosts: Record<string, string[]>;
   store_selected: boolean;
   unified_delay: boolean;
   tcp_concurrent: boolean;
@@ -35,6 +40,8 @@ export type SetupStatus = {
   needsOnboarding: boolean;
   hasSubscriptions: boolean;
   subscriptionCount: number;
+  hasSources: boolean;
+  manualNodeCount: number;
   coreReady: boolean;
   corePath: string;
   mixedPortAvailable: boolean;
@@ -60,7 +67,21 @@ export type Connection = {
   rule: string | null;
   policy: string | null;
   speed: string;
+  network: string | null;
+  type: string | null;
+  sourceIp: string | null;
+  sourcePort: string | null;
+  destinationIp: string | null;
+  destinationPort: string | null;
+  process: string | null;
+  start: string | null;
+  upload: number;
+  download: number;
+  chains: string[];
+  rulePayload: string | null;
 };
+
+export type DownloadRoute = 'direct' | 'core' | 'system' | 'auto';
 
 export type FilterRule = {
   id: string;
@@ -95,6 +116,8 @@ export type Subscription = {
   breakdown: Record<string, number>;
   lastUpdate: string | null;
   lastError: string | null;
+  downloadRoute: DownloadRoute;
+  lastRoute: string | null;
 };
 
 export type SubscriptionMemberNode = {
@@ -137,6 +160,7 @@ export type SubscriptionInput = {
   intervalSeconds?: number;
   inheritGlobal?: boolean;
   rules?: FilterRuleInput[];
+  downloadRoute?: DownloadRoute;
 };
 
 export type GroupFilter = {
@@ -219,6 +243,8 @@ export type RuleSet = {
   ruleCount: number;
   lastUpdate: string | null;
   lastError: string | null;
+  downloadRoute: DownloadRoute;
+  lastRoute: string | null;
 };
 
 export type RuleSetInput = {
@@ -228,6 +254,51 @@ export type RuleSetInput = {
   intervalSeconds?: number;
   behavior?: RuleSetBehavior;
   format?: string;
+  downloadRoute?: DownloadRoute;
+};
+
+export type ManualNode = {
+  name: string;
+  displayName: string;
+  type: string;
+  config: Record<string, unknown>;
+  latency: number;
+};
+
+export type ManualNodeInput = {
+  name: string;
+  config: Record<string, unknown>;
+};
+
+export type WebDavSettings = {
+  endpoint: string;
+  username: string;
+  passwordConfigured: boolean;
+  remotePath: string;
+  enabled: boolean;
+  autoSync: boolean;
+  intervalHours: number;
+  retention: number;
+  lastSync: string | null;
+  lastError: string | null;
+};
+
+export type WebDavSettingsInput = {
+  endpoint: string;
+  username: string;
+  password?: string | null;
+  remotePath: string;
+  enabled: boolean;
+  autoSync: boolean;
+  intervalHours: number;
+  retention: number;
+};
+
+export type Backup = {
+  name: string;
+  size: number;
+  createdAt: string;
+  remoteAvailable: boolean;
 };
 
 export type RuleTestResult = {
@@ -434,6 +505,13 @@ export const api = {
     request<DelayResult[]>(`/proxies/${encodePathPart(group)}/test`, { method: 'POST' }),
   testNode: (name: string) =>
     request<DelayResult>('/nodes/test', { method: 'POST', json: { name } }),
+  listManualNodes: () => request<ManualNode[]>('/manual-nodes'),
+  createManualNode: (input: ManualNodeInput) =>
+    request<ManualNode[]>('/manual-nodes', { method: 'POST', json: input }),
+  updateManualNode: (name: string, input: ManualNodeInput) =>
+    request<ManualNode[]>(`/manual-nodes/${encodePathPart(name)}`, { method: 'PUT', json: input }),
+  deleteManualNode: (name: string) =>
+    request<void>(`/manual-nodes/${encodePathPart(name)}`, { method: 'DELETE' }),
 
   listRules: () => request<Rule[]>('/rules'),
   createRule: (input: RuleInput) => request<Rule>('/rules', { method: 'POST', json: input }),
@@ -455,8 +533,21 @@ export const api = {
   exportLogs: () => request<string>('/logs/export'),
   exportDiagnostics: () => request<string>('/diagnostics/export'),
 
+  listBackups: () => request<Backup[]>('/backups'),
+  createBackup: () => request<Backup>('/backups', { method: 'POST' }),
+  deleteBackup: (name: string) => request<void>(`/backups/${encodePathPart(name)}`, { method: 'DELETE' }),
+  restoreBackup: (name: string) =>
+    request<OperationResponse>(`/backups/${encodePathPart(name)}/restore`, { method: 'POST' }),
+  webdavSettings: () => request<WebDavSettings>('/webdav'),
+  saveWebdavSettings: (input: WebDavSettingsInput) =>
+    request<WebDavSettings>('/webdav', { method: 'PUT', json: input }),
+  testWebdav: () => request<OperationResponse>('/webdav/test', { method: 'POST' }),
+  syncWebdav: () => request<Backup>('/webdav/sync', { method: 'POST' }),
+  restoreWebdav: () => request<OperationResponse>('/webdav/restore', { method: 'POST' }),
+
   traffic: () => request<Traffic>('/traffic'),
   connections: () => request<Connection[]>('/connections'),
   closeConnection: (id: string) => request<void>(`/connections/${encodePathPart(id)}`, { method: 'DELETE' }),
+  closeAllConnections: () => request<void>('/connections', { method: 'DELETE' }),
   flushDns: () => request<void>('/dns/flush', { method: 'POST' }),
 };

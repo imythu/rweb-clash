@@ -2,7 +2,7 @@ use crate::error::AppError;
 use crate::storage::{ProxyItemRecord, Storage};
 use crate::types::{
     GroupFilterInput, ProxyGroupRequest, ProxyNodeResponse, BUILTIN_DIRECT, BUILTIN_GLOBAL,
-    BUILTIN_PROXY, BUILTIN_REJECT,
+    BUILTIN_PROXY, BUILTIN_REJECT, DEFAULT_ACTIVE_PROBE_INTERVAL_SECONDS,
 };
 use crate::util::{contains_rule_delimiter_or_control, content_hash};
 use regex::Regex;
@@ -109,7 +109,7 @@ impl ProxyService {
             delay_ms: None,
             tolerance_ms: Some(50),
             url: Some(crate::types::DEFAULT_DELAY_TEST_URL.into()),
-            interval_seconds: Some(300),
+            interval_seconds: Some(DEFAULT_ACTIVE_PROBE_INTERVAL_SECONDS),
             strategy_json: "{}".into(),
             position: 100_000,
             enabled: true,

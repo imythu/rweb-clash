@@ -1,8 +1,10 @@
+use crate::backup::BackupService;
 use crate::controller::ControllerClient;
 use crate::core::{CoreManager, CoreStartConfig};
 use crate::egress::EgressProbe;
 use crate::error::AppError;
 use crate::instance_lock::{DataRootLock, GlobalAppLock};
+use crate::manual::manual_node_record;
 use crate::paths::AppPaths;
 use crate::platform::{
     apply_system_proxy, begin_system_proxy_disable, complete_system_proxy_recovery,
@@ -15,10 +17,11 @@ use crate::storage::Storage;
 use crate::subscription::{cleanup_stale_subscription_candidates, SubscriptionSyncer};
 use crate::types::{
     ConnectionResponse, CoreStatusResponse, DelayResponse, EgressResponse, FilterRuleInput,
-    OperationResponse, ProxyGroupRequest, ProxyTopologyResponse, RuleInput, RuleResponse,
-    RuleSetInput, RuleSetResponse, RuleTestRequest, RuleTestResponse, SelectProxyRequest,
-    SetupStatusResponse, SubscriptionInput, SubscriptionResponse, SystemConfig, SystemConfigPatch,
-    SystemStatusResponse, TrafficResponse, DEFAULT_DELAY_TEST_URL, DEFAULT_DELAY_TIMEOUT_MS,
+    ManualNodeInput, ManualNodeResponse, OperationResponse, ProxyGroupRequest,
+    ProxyTopologyResponse, RuleInput, RuleResponse, RuleSetInput, RuleSetResponse, RuleTestRequest,
+    RuleTestResponse, SelectProxyRequest, SetupStatusResponse, SubscriptionInput,
+    SubscriptionResponse, SystemConfig, SystemConfigPatch, SystemStatusResponse, TrafficResponse,
+    DEFAULT_DELAY_TEST_URL, DEFAULT_DELAY_TIMEOUT_MS,
 };
 use crate::util::{new_id, parse_host_from_log, validate_url};
 use std::collections::HashSet;
@@ -43,6 +46,7 @@ struct AppInner {
     proxy_service: ProxyService,
     rule_service: RuleService,
     egress_probe: EgressProbe,
+    backup_service: BackupService,
     config_update: Mutex<()>,
     runtime_operation: Mutex<()>,
     rule_set_operation: Mutex<()>,
@@ -143,6 +147,7 @@ impl App {
         )
         .await?;
         let core = CoreManager::new(paths.clone(), storage.clone());
+        let backup_service = BackupService::new(storage.clone(), paths.clone());
         let app = Self {
             inner: Arc::new(AppInner {
                 paths: paths.clone(),
@@ -151,6 +156,7 @@ impl App {
                 proxy_service: ProxyService::new(storage.clone()),
                 rule_service,
                 egress_probe: EgressProbe::new(),
+                backup_service,
                 storage,
                 core,
                 config_update: Mutex::new(()),
@@ -368,6 +374,8 @@ impl App {
     pub async fn setup_status(&self) -> Result<SetupStatusResponse, AppError> {
         let config = self.config().await?;
         let subscriptions = self.list_subscriptions().await?;
+        let manual_node_count = self.manual_nodes().await?.len();
+        let has_sources = !subscriptions.is_empty() || manual_node_count > 0;
         let core_path = self.inner.paths.mihomo_binary();
         let core_ready = core_path.is_file();
         let mixed_port_available = port_available(config.mixed_port).await;
@@ -392,9 +400,11 @@ impl App {
         }
 
         Ok(SetupStatusResponse {
-            needs_onboarding: subscriptions.is_empty() || !core_ready,
+            needs_onboarding: !has_sources || !core_ready,
             has_subscriptions: !subscriptions.is_empty(),
             subscription_count: subscriptions.len(),
+            has_sources,
+            manual_node_count,
             core_ready,
             core_path: AppPaths::display(&core_path),
             mixed_port_available,
@@ -610,13 +620,14 @@ impl App {
         );
         self.inner
             .storage
-            .create_pending_subscription(
+            .create_pending_subscription_with_route(
                 &id,
                 input.name.trim(),
                 input.url.trim(),
                 input.interval_seconds(),
                 input.inherit_global.unwrap_or(true),
                 &input.rules,
+                input.download_route,
             )
             .await?;
         if let Err(err) = self
@@ -693,13 +704,14 @@ impl App {
         );
         self.inner
             .storage
-            .update_subscription(
+            .update_subscription_with_route(
                 id,
                 input.name.trim(),
                 input.url.trim(),
                 input.interval_seconds(),
                 input.inherit_global.unwrap_or(true),
                 &input.rules,
+                input.download_route,
             )
             .await?;
         if let Err(err) = self
@@ -723,13 +735,14 @@ impl App {
             if let Err(rollback_error) = self
                 .inner
                 .storage
-                .update_subscription(
+                .update_subscription_with_route(
                     id,
                     &previous.name,
                     &previous.url,
                     previous.interval_seconds.max(0) as u64,
                     previous.inherit_global,
                     &previous_rules,
+                    previous.download_route,
                 )
                 .await
             {
@@ -852,6 +865,45 @@ impl App {
     pub async fn proxy_topology(&self) -> Result<ProxyTopologyResponse, AppError> {
         let (groups, nodes) = self.inner.storage.proxy_topology().await?;
         Ok(ProxyTopologyResponse { groups, nodes })
+    }
+
+    pub async fn manual_nodes(&self) -> Result<Vec<ManualNodeResponse>, AppError> {
+        self.inner.storage.list_manual_nodes().await
+    }
+
+    pub async fn create_manual_node(
+        &self,
+        input: ManualNodeInput,
+    ) -> Result<Vec<ManualNodeResponse>, AppError> {
+        let item = manual_node_record(input)?;
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
+        self.inner.storage.create_manual_node(&item).await?;
+        self.inner.storage.sync_builtin_proxy_group().await?;
+        self.refresh_runtime_locked(core_was_running).await?;
+        self.manual_nodes().await
+    }
+
+    pub async fn update_manual_node(
+        &self,
+        name: &str,
+        mut input: ManualNodeInput,
+    ) -> Result<Vec<ManualNodeResponse>, AppError> {
+        input.name = name.to_string();
+        let item = manual_node_record(input)?;
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
+        self.inner.storage.update_manual_node(&item).await?;
+        self.refresh_runtime_locked(core_was_running).await?;
+        self.manual_nodes().await
+    }
+
+    pub async fn delete_manual_node(&self, name: &str) -> Result<(), AppError> {
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        let core_was_running = self.inner.core.is_running().await;
+        self.inner.storage.delete_manual_node(name).await?;
+        self.inner.storage.sync_builtin_proxy_group().await?;
+        self.refresh_runtime_locked(core_was_running).await
     }
 
     pub async fn create_proxy_group(&self, input: ProxyGroupRequest) -> Result<(), AppError> {
@@ -1245,6 +1297,61 @@ impl App {
         Ok(output)
     }
 
+    pub async fn webdav_settings(&self) -> Result<crate::types::WebDavSettingsResponse, AppError> {
+        self.inner.backup_service.settings().await
+    }
+
+    pub async fn save_webdav_settings(
+        &self,
+        input: crate::types::WebDavSettingsInput,
+    ) -> Result<crate::types::WebDavSettingsResponse, AppError> {
+        self.inner.backup_service.save_settings(input).await
+    }
+
+    pub async fn test_webdav(&self) -> Result<(), AppError> {
+        self.inner.backup_service.test_webdav().await
+    }
+
+    pub async fn backups(&self) -> Result<Vec<crate::types::BackupResponse>, AppError> {
+        self.inner.backup_service.list_backups().await
+    }
+
+    pub async fn create_backup(&self) -> Result<crate::types::BackupResponse, AppError> {
+        self.inner.backup_service.create_backup().await
+    }
+
+    pub async fn delete_backup(&self, name: &str) -> Result<(), AppError> {
+        self.inner.backup_service.delete_backup(name).await
+    }
+
+    pub async fn sync_webdav(&self) -> Result<crate::types::BackupResponse, AppError> {
+        self.inner.backup_service.sync_to_webdav().await
+    }
+
+    pub async fn restore_backup(&self, name: &str) -> Result<(), AppError> {
+        self.stop_core().await?;
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        self.inner.backup_service.restore_local(name).await?;
+        self.compile_restored_runtime().await
+    }
+
+    pub async fn restore_webdav(&self) -> Result<(), AppError> {
+        let _safety_backup = self.inner.backup_service.create_backup().await?;
+        self.stop_core().await?;
+        let _runtime_operation = self.inner.runtime_operation.lock().await;
+        self.inner.backup_service.restore_webdav().await?;
+        self.compile_restored_runtime().await
+    }
+
+    async fn compile_restored_runtime(&self) -> Result<(), AppError> {
+        let mut config = self.config().await?;
+        config.system_proxy = false;
+        validate_config(&config)?;
+        self.inner.storage.save_config(&config).await?;
+        compile_runtime_yaml(&self.inner.storage, &self.inner.paths, &config).await?;
+        Ok(())
+    }
+
     pub async fn traffic(&self) -> TrafficResponse {
         if !self.inner.core.is_running().await {
             return TrafficResponse { up: 0, down: 0 };
@@ -1271,6 +1378,14 @@ impl App {
     pub async fn close_connection(&self, id: &str) -> Result<(), AppError> {
         let controller = self.controller_client().await?;
         controller.close_connection(id).await
+    }
+
+    pub async fn close_all_connections(&self) -> Result<(), AppError> {
+        if !self.inner.core.is_running().await {
+            return Ok(());
+        }
+        let controller = self.controller_client().await?;
+        controller.close_all_connections().await
     }
 
     pub async fn flush_dns(&self) -> Result<(), AppError> {
@@ -1364,6 +1479,7 @@ impl App {
             mihomo_binary: self.inner.paths.mihomo_binary(),
             runtime_yaml,
             runtime_dir: self.inner.paths.profiles_dir.clone(),
+            log_level: config.log_level.clone(),
         }
     }
 
@@ -1807,6 +1923,15 @@ impl App {
                     warn!("rule set auto refresh failed for {id}: {err}");
                 }
             }
+            match self.inner.backup_service.auto_sync_due().await {
+                Ok(true) => {
+                    if let Err(error) = self.inner.backup_service.sync_to_webdav().await {
+                        warn!(%error, "automatic WebDAV backup failed");
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => warn!(%error, "failed to evaluate automatic WebDAV backup"),
+            }
         }
     }
 
@@ -1893,6 +2018,7 @@ fn validate_config(config: &SystemConfig) -> Result<(), AppError> {
             format!("unsupported dns mode {}", config.dns_mode),
         ));
     }
+    validate_dns_config(config)?;
     if config.external_controller_enabled {
         let controller = parse_controller_url(&config.external_controller).ok_or_else(|| {
             AppError::bad_request(
@@ -1914,6 +2040,100 @@ fn validate_config(config: &SystemConfig) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+fn validate_dns_config(config: &SystemConfig) -> Result<(), AppError> {
+    if config.dns_enabled && config.dns_nameservers.is_empty() {
+        return Err(AppError::bad_request(
+            "config_invalid_dns",
+            "at least one DNS nameserver is required when DNS is enabled",
+        ));
+    }
+    for (label, values) in [
+        ("nameserver", &config.dns_nameservers),
+        ("fallback", &config.dns_fallback),
+    ] {
+        if values.len() > 128 || values.iter().any(|value| !valid_dns_server(value)) {
+            return Err(AppError::bad_request(
+                "config_invalid_dns",
+                format!("{label} contains an invalid DNS server"),
+            ));
+        }
+    }
+    if config.dns_fake_ip_filter.len() > 2048
+        || config
+            .dns_fake_ip_filter
+            .iter()
+            .any(|value| !valid_dns_token(value))
+    {
+        return Err(AppError::bad_request(
+            "config_invalid_dns",
+            "fake-IP filter contains an invalid entry",
+        ));
+    }
+    validate_dns_map("nameserver policy", &config.dns_nameserver_policy, true)?;
+    validate_dns_map("hosts", &config.dns_hosts, false)?;
+    Ok(())
+}
+
+fn validate_dns_map(
+    label: &str,
+    values: &std::collections::BTreeMap<String, Vec<String>>,
+    servers: bool,
+) -> Result<(), AppError> {
+    if values.len() > 512 {
+        return Err(AppError::bad_request(
+            "config_invalid_dns",
+            format!("{label} contains too many entries"),
+        ));
+    }
+    for (key, entries) in values {
+        if !valid_dns_token(key)
+            || entries.is_empty()
+            || entries.len() > 32
+            || entries.iter().any(|entry| {
+                if servers {
+                    !valid_dns_server(entry)
+                } else {
+                    !valid_dns_token(entry)
+                }
+            })
+        {
+            return Err(AppError::bad_request(
+                "config_invalid_dns",
+                format!("{label} contains an invalid entry for {key}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_dns_server(value: &str) -> bool {
+    let value = value.trim();
+    if !valid_dns_token(value) {
+        return false;
+    }
+    if matches!(value, "system" | "dhcp://system") {
+        return true;
+    }
+    if let Ok(url) = reqwest::Url::parse(value) {
+        return matches!(
+            url.scheme(),
+            "udp" | "tcp" | "tls" | "https" | "quic" | "dhcp" | "rcode"
+        ) && url.host_str().is_some();
+    }
+    let host = value.split_once('#').map(|(host, _)| host).unwrap_or(value);
+    host.parse::<std::net::IpAddr>().is_ok()
+        || host.parse::<std::net::SocketAddr>().is_ok()
+        || (!host.contains('/') && host.contains('.'))
+}
+
+fn valid_dns_token(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 2048
+        && !value.chars().any(char::is_control)
+        && !value.contains(',')
 }
 
 fn parse_controller_url(value: &str) -> Option<reqwest::Url> {
@@ -2080,6 +2300,7 @@ mod tests {
         let data_root_lock = DataRootLock::acquire(&paths)?;
         let storage = Storage::connect(&paths).await?;
         let core = CoreManager::new(paths.clone(), storage.clone());
+        let backup_service = BackupService::new(storage.clone(), paths.clone());
         Ok(App {
             inner: Arc::new(AppInner {
                 paths: paths.clone(),
@@ -2088,6 +2309,7 @@ mod tests {
                 proxy_service: ProxyService::new(storage.clone()),
                 rule_service: RuleService::new(storage.clone(), paths),
                 egress_probe: EgressProbe::new(),
+                backup_service,
                 storage,
                 core,
                 config_update: Mutex::new(()),
@@ -2438,6 +2660,7 @@ mod tests {
                         interval: None,
                         inherit_global: Some(false),
                         rules: Vec::new(),
+                        download_route: crate::types::DownloadRoute::Auto,
                     },
                 )
                 .await
@@ -2486,6 +2709,7 @@ mod tests {
                 interval: None,
                 inherit_global: Some(true),
                 rules: Vec::new(),
+                download_route: crate::types::DownloadRoute::Auto,
             }),
         )
         .await

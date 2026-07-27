@@ -1,8 +1,9 @@
 use crate::app::App;
 use crate::error::{scope_trace_id, AppError};
 use crate::types::{
-    FilterRuleInput, OperationResponse, ProxyGroupRequest, RuleInput, RuleSetInput,
-    RuleTestRequest, SelectProxyRequest, SubscriptionInput, SystemConfigPatch,
+    FilterRuleInput, ManualNodeInput, OperationResponse, ProxyGroupRequest, RuleInput,
+    RuleSetInput, RuleTestRequest, SelectProxyRequest, SubscriptionInput, SystemConfigPatch,
+    WebDavSettingsInput,
 };
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -62,6 +63,14 @@ pub fn router(app: App) -> Router {
         )
         .route("/api/proxies/{group}/test", post(test_proxy_group))
         .route("/api/nodes/test", post(test_node))
+        .route(
+            "/api/manual-nodes",
+            get(list_manual_nodes).post(create_manual_node),
+        )
+        .route(
+            "/api/manual-nodes/{name}",
+            put(update_manual_node).delete(delete_manual_node),
+        )
         .route("/api/rules", get(list_rules).post(create_rule))
         .route("/api/rules/{id}", put(update_rule).delete(delete_rule))
         .route("/api/rules/test", post(test_rule))
@@ -71,8 +80,21 @@ pub fn router(app: App) -> Router {
         .route("/api/logs", get(list_logs).delete(clear_logs))
         .route("/api/logs/export", get(export_logs))
         .route("/api/diagnostics/export", get(export_diagnostics))
+        .route("/api/backups", get(list_backups).post(create_backup))
+        .route("/api/backups/{name}", delete(delete_backup))
+        .route("/api/backups/{name}/restore", post(restore_backup))
+        .route(
+            "/api/webdav",
+            get(webdav_settings).put(save_webdav_settings),
+        )
+        .route("/api/webdav/test", post(test_webdav))
+        .route("/api/webdav/sync", post(sync_webdav))
+        .route("/api/webdav/restore", post(restore_webdav))
         .route("/api/traffic", get(traffic))
-        .route("/api/connections", get(connections))
+        .route(
+            "/api/connections",
+            get(connections).delete(close_all_connections),
+        )
         .route("/api/connections/{id}", delete(close_connection))
         .route("/api/dns/flush", post(flush_dns))
         .layer(DefaultBodyLimit::max(MAX_API_BODY_BYTES))
@@ -470,6 +492,15 @@ mod embedded_frontend_tests {
     }
 }
 
+#[cfg(test)]
+mod openapi_tests {
+    #[test]
+    fn checked_in_openapi_document_is_valid_yaml() {
+        serde_yaml::from_str::<serde_yaml::Value>(include_str!("../../../web/doc/openapi.yaml"))
+            .expect("parse web OpenAPI document");
+    }
+}
+
 async fn trace_request(mut request: axum::extract::Request, next: Next) -> Response {
     let trace_id = request
         .headers()
@@ -750,6 +781,40 @@ async fn test_node(
     Ok(Json(app.test_node(&request.name).await?))
 }
 
+async fn list_manual_nodes(
+    State(app): State<App>,
+) -> Result<Json<Vec<crate::types::ManualNodeResponse>>, AppError> {
+    Ok(Json(app.manual_nodes().await?))
+}
+
+async fn create_manual_node(
+    State(app): State<App>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let input = decode_body::<ManualNodeInput>(body)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(app.create_manual_node(input).await?),
+    ))
+}
+
+async fn update_manual_node(
+    Path(name): Path<String>,
+    State(app): State<App>,
+    body: Bytes,
+) -> Result<Json<Vec<crate::types::ManualNodeResponse>>, AppError> {
+    let input = decode_body::<ManualNodeInput>(body)?;
+    Ok(Json(app.update_manual_node(&name, input).await?))
+}
+
+async fn delete_manual_node(
+    Path(name): Path<String>,
+    State(app): State<App>,
+) -> Result<StatusCode, AppError> {
+    app.delete_manual_node(&name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_rules(
     State(app): State<App>,
 ) -> Result<Json<Vec<crate::types::RuleResponse>>, AppError> {
@@ -845,6 +910,62 @@ async fn export_diagnostics(State(app): State<App>) -> Result<String, AppError> 
     app.export_diagnostics().await
 }
 
+async fn list_backups(
+    State(app): State<App>,
+) -> Result<Json<Vec<crate::types::BackupResponse>>, AppError> {
+    Ok(Json(app.backups().await?))
+}
+
+async fn create_backup(State(app): State<App>) -> Result<impl IntoResponse, AppError> {
+    Ok((StatusCode::CREATED, Json(app.create_backup().await?)))
+}
+
+async fn delete_backup(
+    Path(name): Path<String>,
+    State(app): State<App>,
+) -> Result<StatusCode, AppError> {
+    app.delete_backup(&name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn restore_backup(
+    Path(name): Path<String>,
+    State(app): State<App>,
+) -> Result<Json<OperationResponse>, AppError> {
+    app.restore_backup(&name).await?;
+    Ok(Json(OperationResponse::ok("backup restored")))
+}
+
+async fn webdav_settings(
+    State(app): State<App>,
+) -> Result<Json<crate::types::WebDavSettingsResponse>, AppError> {
+    Ok(Json(app.webdav_settings().await?))
+}
+
+async fn save_webdav_settings(
+    State(app): State<App>,
+    body: Bytes,
+) -> Result<Json<crate::types::WebDavSettingsResponse>, AppError> {
+    let input = decode_body::<WebDavSettingsInput>(body)?;
+    Ok(Json(app.save_webdav_settings(input).await?))
+}
+
+async fn test_webdav(State(app): State<App>) -> Result<Json<OperationResponse>, AppError> {
+    app.test_webdav().await?;
+    Ok(Json(OperationResponse::ok("WebDAV connection succeeded")))
+}
+
+async fn sync_webdav(
+    State(app): State<App>,
+) -> Result<Json<crate::types::BackupResponse>, AppError> {
+    Ok(Json(app.sync_webdav().await?))
+}
+
+async fn restore_webdav(State(app): State<App>) -> Result<Json<OperationResponse>, AppError> {
+    app.restore_webdav().await?;
+    Ok(Json(OperationResponse::ok("WebDAV backup restored")))
+}
+
 async fn traffic(State(app): State<App>) -> Json<crate::types::TrafficResponse> {
     Json(app.traffic().await)
 }
@@ -858,6 +979,11 @@ async fn close_connection(
     State(app): State<App>,
 ) -> Result<StatusCode, AppError> {
     app.close_connection(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn close_all_connections(State(app): State<App>) -> Result<StatusCode, AppError> {
+    app.close_all_connections().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -1,8 +1,12 @@
 use crate::error::AppError;
 use crate::paths::{restrict_sensitive_file_permissions, AppPaths};
+use crate::platform::current_system_proxy_url;
 use crate::remote;
 use crate::storage::{ProxyItemRecord, Storage, SubscriptionSyncCommit};
-use crate::types::{FilterRule, DEFAULT_DELAY_TEST_URL, SUB_DELIMITER};
+use crate::types::{
+    FilterRule, DEFAULT_ACTIVE_PROBE_INTERVAL_SECONDS, DEFAULT_DELAY_TEST_URL,
+    MAX_ACTIVE_PROBE_INTERVAL_SECONDS, MIN_ACTIVE_PROBE_INTERVAL_SECONDS, SUB_DELIMITER,
+};
 use crate::util::{content_hash, likely_country_from_name, new_id, now_iso, validate_url};
 use base64::engine::general_purpose;
 use base64::Engine;
@@ -28,9 +32,6 @@ const MAX_SUBSCRIPTION_NODES: usize = 20_000;
 const MAX_SUBSCRIPTION_GROUPS: usize = 2_000;
 const MAX_GROUP_MEMBERS: usize = 20_000;
 const MAX_TOTAL_GROUP_MEMBERS: usize = 100_000;
-const DEFAULT_PROBE_INTERVAL_SECONDS: i64 = 300;
-const MIN_PROBE_INTERVAL_SECONDS: i64 = 300;
-const MAX_PROBE_INTERVAL_SECONDS: i64 = 86_400;
 const DEFAULT_PROBE_TOLERANCE_MS: i64 = 50;
 const MIN_PROBE_TOLERANCE_MS: i64 = 0;
 const MAX_PROBE_TOLERANCE_MS: i64 = 10_000;
@@ -191,13 +192,31 @@ impl SubscriptionSyncer {
             user_agent = DEFAULT_USER_AGENT,
             "fetching subscription"
         );
-        let response = remote::get_text(
+        let download_route = self
+            .storage
+            .get_subscription_download_route(subscription_id)
+            .await?;
+        let config = self.storage.load_config().await?;
+        let system_proxy = match current_system_proxy_url().await {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                warn!(%error, "failed to inspect the system proxy download route");
+                None
+            }
+        };
+        let response = remote::get_text_routed(
             url,
             Some(DEFAULT_USER_AGENT),
             MAX_SUBSCRIPTION_BYTES,
             "subscription_fetch_failed",
+            download_route,
+            remote::RouteOptions {
+                core_proxy: Some(format!("http://127.0.0.1:{}", config.mixed_port)),
+                system_proxy,
+            },
         )
         .await?;
+        let used_route = response.route.clone();
         let status = response.status;
         let headers = response.headers;
         let body = response.body;
@@ -205,6 +224,7 @@ impl SubscriptionSyncer {
             subscription_id = %subscription_id,
             status = status.as_u16(),
             bytes = body.len(),
+            route = %used_route,
             "subscription fetched"
         );
         let meta = parse_subscription_meta(&headers);
@@ -343,6 +363,9 @@ impl SubscriptionSyncer {
             run_mihomo_validation,
         )
         .await?;
+        self.storage
+            .set_subscription_last_route(subscription_id, &used_route)
+            .await?;
         info!(
             subscription_id = %subscription_id,
             source_name = %source_name,
@@ -1283,8 +1306,11 @@ fn normalized_subscription_group_probe(
         return (None, None, None);
     }
     let interval = yaml_field_i64(group, "interval")
-        .unwrap_or(DEFAULT_PROBE_INTERVAL_SECONDS)
-        .clamp(MIN_PROBE_INTERVAL_SECONDS, MAX_PROBE_INTERVAL_SECONDS);
+        .unwrap_or(DEFAULT_ACTIVE_PROBE_INTERVAL_SECONDS)
+        .clamp(
+            MIN_ACTIVE_PROBE_INTERVAL_SECONDS,
+            MAX_ACTIVE_PROBE_INTERVAL_SECONDS,
+        );
     let tolerance = (group_type == "url-test").then(|| {
         yaml_field_i64(group, "tolerance")
             .unwrap_or(DEFAULT_PROBE_TOLERANCE_MS)
@@ -1815,11 +1841,11 @@ proxy-groups:
             .find(|group| group.display_name == "Slow Probe")
             .expect("slow group");
 
-        assert_eq!(fast.interval, Some(MIN_PROBE_INTERVAL_SECONDS));
+        assert_eq!(fast.interval, Some(MIN_ACTIVE_PROBE_INTERVAL_SECONDS));
         assert_eq!(fast.tolerance, Some(MAX_PROBE_TOLERANCE_MS));
-        assert_eq!(negative.interval, Some(MIN_PROBE_INTERVAL_SECONDS));
+        assert_eq!(negative.interval, Some(MIN_ACTIVE_PROBE_INTERVAL_SECONDS));
         assert_eq!(negative.tolerance, None);
-        assert_eq!(slow.interval, Some(MAX_PROBE_INTERVAL_SECONDS));
+        assert_eq!(slow.interval, Some(MAX_ACTIVE_PROBE_INTERVAL_SECONDS));
     }
 
     #[test]

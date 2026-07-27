@@ -1,5 +1,6 @@
 use crate::error::AppError;
 use crate::paths::AppPaths;
+use crate::platform::current_system_proxy_url;
 use crate::remote;
 use crate::runtime::available_policy_targets;
 use crate::storage::{RuleSetRefreshState, Storage};
@@ -313,13 +314,14 @@ impl RuleService {
             "creating rule set"
         );
         self.storage
-            .create_pending_rule_set(
+            .create_pending_rule_set_with_route(
                 &id,
                 name,
                 url,
                 input.interval_seconds(),
                 Some(&behavior),
                 &format,
+                input.download_route,
             )
             .await?;
         let creation = async {
@@ -427,13 +429,27 @@ impl RuleService {
             url_host = %url_host_label(&rule_set.url),
             "fetching rule set"
         );
-        let response = remote::get_text(
+        let config = self.storage.load_config().await?;
+        let system_proxy = match current_system_proxy_url().await {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                warn!(%error, "failed to inspect the system proxy download route");
+                None
+            }
+        };
+        let response = remote::get_text_routed(
             &rule_set.url,
             None,
             MAX_RULE_SET_BYTES,
             "ruleset_fetch_failed",
+            rule_set.download_route,
+            remote::RouteOptions {
+                core_proxy: Some(format!("http://127.0.0.1:{}", config.mixed_port)),
+                system_proxy,
+            },
         )
         .await?;
+        let used_route = response.route.clone();
         let status = response.status;
         let content = response.body;
         let behavior = rule_set
@@ -453,6 +469,7 @@ impl RuleService {
             bytes = content.len(),
             rules = rule_count,
             format = %detected_format,
+            route = %used_route,
             "rule set fetched"
         );
         let digest = content_hash(content.as_bytes());
@@ -510,6 +527,9 @@ impl RuleService {
             format = %detected_format,
             "rule set saved"
         );
+        self.storage
+            .set_rule_set_last_route(id, &used_route)
+            .await?;
         Ok(previous)
     }
 

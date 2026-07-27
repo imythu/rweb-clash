@@ -78,6 +78,66 @@ paths:
         '200':
           description: 切换成功
 
+  /manual-nodes:
+    get:
+      summary: 列出手动录入的节点
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ManualNode'
+    post:
+      summary: 添加手动节点
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManualNodeInput'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ManualNode'
+
+  /manual-nodes/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    put:
+      summary: 更新手动节点
+      description: 节点名称不可通过更新操作修改。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManualNodeInput'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ManualNode'
+    delete:
+      summary: 删除手动节点
+      responses:
+        '204':
+          description: Deleted
+
   /subscriptions:
     get:
       summary: 列出所有资源提供者 (订阅)
@@ -403,6 +463,73 @@ components:
         country: { type: string, example: "HK" }
         subscriptionId: { type: string, nullable: true }
         subscriptionName: { type: string, nullable: true, description: "订阅显示名称；内部运行时 ID 不包含该名称" }
+
+    ManualNodeInput:
+      type: object
+      required: [name, config]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        config:
+          type: object
+          description: Mihomo proxies 数组中的单个节点对象；name 由顶层字段注入。
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum:
+                - ss
+                - ssr
+                - vmess
+                - vless
+                - trojan
+                - http
+                - socks5
+                - snell
+                - ssh
+                - hysteria
+                - hysteria2
+                - tuic
+                - wireguard
+                - masque
+                - openvpn
+                - shadowquic
+                - mieru
+                - anytls
+                - sudoku
+                - trusttunnel
+                - tailscale
+                - direct
+                - dns
+                - rematch
+            server: { type: string, description: "需要远端地址的协议必填；WireGuard 使用 peers 完整写法时可省略" }
+            port: { type: integer, minimum: 1, maximum: 65535, description: "需要远端端口的协议必填；Mieru 可改用 port-range，WireGuard 使用 peers 完整写法时可省略" }
+            peers:
+              type: array
+              description: "WireGuard 多 peer 完整写法；配置后忽略顶层 peer 端点和公钥字段"
+              items:
+                type: object
+                required: [server, port, public-key]
+                properties:
+                  server: { type: string }
+                  port: { type: integer, minimum: 1, maximum: 65535 }
+                  public-key: { type: string }
+                  allowed-ips:
+                    type: array
+                    items: { type: string }
+          additionalProperties: true
+
+    ManualNode:
+      allOf:
+        - $ref: '#/components/schemas/ManualNodeInput'
+        - type: object
+          required: [displayName, type, latency]
+          properties:
+            displayName: { type: string }
+            type: { type: string }
+            latency: { type: integer, description: "毫秒；-1 表示未测速，0 表示超时" }
 
     Subscription:
       type: object

@@ -73,6 +73,7 @@ pub struct CoreStartConfig {
     pub mihomo_binary: std::path::PathBuf,
     pub runtime_yaml: std::path::PathBuf,
     pub runtime_dir: std::path::PathBuf,
+    pub log_level: String,
 }
 
 impl CoreManager {
@@ -181,10 +182,20 @@ impl CoreManager {
         let pid = child.id();
         info!(pid = ?pid, version = ?version, "mihomo process spawned");
         if let Some(stdout) = child.stdout.take() {
-            self.spawn_log_reader(stdout, "info".into(), "mihomo-stdout".into());
+            self.spawn_log_reader(
+                stdout,
+                "info".into(),
+                "mihomo-stdout".into(),
+                config.log_level.clone(),
+            );
         }
         if let Some(stderr) = child.stderr.take() {
-            self.spawn_log_reader(stderr, "warning".into(), "mihomo-stderr".into());
+            self.spawn_log_reader(
+                stderr,
+                "warning".into(),
+                "mihomo-stderr".into(),
+                config.log_level.clone(),
+            );
         }
         {
             let mut guard = self.inner.child.lock().await;
@@ -433,14 +444,23 @@ impl CoreManager {
         *guard = status;
     }
 
-    fn spawn_log_reader<T>(&self, reader: T, level: String, source: String)
-    where
+    fn spawn_log_reader<T>(
+        &self,
+        reader: T,
+        fallback_level: String,
+        source: String,
+        minimum_level: String,
+    ) where
         T: tokio::io::AsyncRead + Send + Unpin + 'static,
     {
         let storage = self.inner.storage.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(reader).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                let level = detected_log_level(&line, &fallback_level);
+                if !log_level_is_enabled(&level, &minimum_level) {
+                    continue;
+                }
                 let payload = format!("{source}: {line}");
                 match level.as_str() {
                     "error" => error!("{payload}"),
@@ -454,6 +474,36 @@ impl CoreManager {
             }
         });
     }
+}
+
+fn detected_log_level(line: &str, fallback: &str) -> String {
+    let uppercase = line.to_ascii_uppercase();
+    if uppercase.contains("[ERROR]") || uppercase.contains(" LEVEL=ERROR") {
+        "error".into()
+    } else if uppercase.contains("[WARN]")
+        || uppercase.contains("[WARNING]")
+        || uppercase.contains(" LEVEL=WARN")
+    {
+        "warning".into()
+    } else if uppercase.contains("[DEBUG]") || uppercase.contains(" LEVEL=DEBUG") {
+        "debug".into()
+    } else {
+        fallback.to_string()
+    }
+}
+
+fn log_level_is_enabled(level: &str, minimum: &str) -> bool {
+    fn rank(level: &str) -> u8 {
+        match level {
+            "debug" => 1,
+            "info" => 2,
+            "warning" | "warn" => 3,
+            "error" => 4,
+            "silent" => 5,
+            _ => 2,
+        }
+    }
+    minimum != "silent" && rank(level) >= rank(minimum)
 }
 
 pub(crate) async fn validate_mihomo_config(
@@ -621,6 +671,7 @@ mod tests {
                 mihomo_binary: temp.path().join("missing-mihomo"),
                 runtime_yaml: temp.path().join("missing-runtime.yaml"),
                 runtime_dir: paths.profiles_dir,
+                log_level: "info".into(),
             })
             .await
             .expect_err("invalid candidate must be rejected");
@@ -655,6 +706,7 @@ mod tests {
                     mihomo_binary: temp.path().to_path_buf(),
                     runtime_yaml: paths.runtime_yaml,
                     runtime_dir: paths.profiles_dir,
+                    log_level: "info".into(),
                 },
                 true,
             )

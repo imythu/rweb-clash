@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Search, Plus, Shield, Zap, Trash2, Loader2, 
   CheckCircle2, FlaskConical, Layers,
@@ -13,7 +13,9 @@ import { cn, SUB_DELIMITER } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useToast } from './toast-context';
-import { api, type ProxyGroup, type ProxyNode, type Rule, type RuleInput, type RuleSet, type RuleSetBehavior, type RuleSetInput, type RuleTestResult } from '@/lib/api';
+import { api, type DownloadRoute, type ProxyGroup, type ProxyNode, type Rule, type RuleInput, type RuleSet, type RuleSetBehavior, type RuleSetInput, type RuleTestResult } from '@/lib/api';
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Spinner } from '@/components/ui/spinner';
 
 // --- Nano Components ---
 
@@ -52,6 +54,13 @@ const SubBadge = ({ name }: { name: string }) => (
 
 const displayRuntimeName = (name: string, displayName?: string | null) =>
   displayName || name.split(SUB_DELIMITER)[0] || name;
+
+const DOWNLOAD_ROUTE_LABELS: Record<DownloadRoute, string> = {
+  auto: '自动回退',
+  direct: '直连',
+  core: '当前内核',
+  system: '系统代理',
+};
 
 const ActionPill = ({ action, displayName, subscriptionName, className }: { action: string, displayName?: string | null, subscriptionName?: string | null, className?: string }) => {
   const isProxy = !['DIRECT', 'REJECT'].includes(action.toUpperCase());
@@ -95,26 +104,32 @@ const RuleSetDrawer = ({ isOpen, onClose, ruleSets, onRefresh, onDelete, onAdd }
   const [newName, setNewName] = useState('');
   const [newUrl, setNewUrl] = useState('');
   const [newBehavior, setNewBehavior] = useState<RuleSetBehavior>('classical');
+  const [newRoute, setNewRoute] = useState<DownloadRoute>('auto');
   const newInterval = '86400';
   const [syncing, setSyncing] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const operationInFlight = useRef(false);
   const { toast } = useToast();
 
   const handleAdd = async () => {
+    if (operationInFlight.current) return;
     if (!newName.trim() || !newUrl.trim()) {
       toast('请完整填写订阅名称和资源 URL', 'error');
       return;
     }
+    operationInFlight.current = true;
     setIsSaving(true);
     try {
-      const saved = await onAdd({ name: newName.trim(), url: newUrl.trim(), interval: parseInt(newInterval), behavior: newBehavior });
+      const saved = await onAdd({ name: newName.trim(), url: newUrl.trim(), interval: parseInt(newInterval), behavior: newBehavior, downloadRoute: newRoute });
       if (saved) {
         setIsAdding(false);
         setNewName('');
         setNewUrl('');
         setNewBehavior('classical');
+        setNewRoute('auto');
       }
     } finally {
+      operationInFlight.current = false;
       setIsSaving(false);
     }
   };
@@ -136,7 +151,14 @@ const RuleSetDrawer = ({ isOpen, onClose, ruleSets, onRefresh, onDelete, onAdd }
                <div className="space-y-1.5"><label className="text-[10px] font-black uppercase text-muted-foreground">订阅名称</label><input value={newName} onChange={e => setNewName(e.target.value)} placeholder="e.g. gfw_list" className="w-full bg-background border-2 border-muted rounded-xl px-4 py-3 text-xs font-black" /></div>
                <div className="space-y-1.5"><label className="text-[10px] font-black uppercase text-muted-foreground">资源 URL</label><input value={newUrl} onChange={e => setNewUrl(e.target.value)} placeholder="https://..." className="w-full bg-background border-2 border-muted rounded-xl px-4 py-3 text-[10px] font-mono" /></div>
                <div className="space-y-1.5"><label className="text-[10px] font-black uppercase text-muted-foreground">Behavior</label><select value={newBehavior} onChange={event => setNewBehavior(event.target.value as RuleSetBehavior)} className="w-full bg-background border-2 border-muted rounded-xl px-4 py-3 text-xs font-black outline-none"><option value="domain">Domain</option><option value="ipcidr">IP CIDR</option><option value="classical">Classical</option></select></div>
-               <Button onClick={() => void handleAdd()} disabled={isSaving || !newName.trim() || !newUrl.trim()} className="w-full h-11 bg-primary text-primary-foreground rounded-xl font-black text-[10px]">{isSaving ? <Loader2 className="size-4 animate-spin" /> : '确认新增规则集'}</Button>
+               <div className="space-y-1.5">
+                 <label className="text-[10px] font-black uppercase text-muted-foreground">下载路线</label>
+                 <Select value={newRoute} onValueChange={value => setNewRoute(value as DownloadRoute)}>
+                   <SelectTrigger><SelectValue /></SelectTrigger>
+                   <SelectContent><SelectGroup>{(Object.entries(DOWNLOAD_ROUTE_LABELS) as Array<[DownloadRoute, string]>).map(([value, label]) => <SelectItem key={value} value={value}>{label}</SelectItem>)}</SelectGroup></SelectContent>
+                 </Select>
+               </div>
+               <Button onClick={() => void handleAdd()} disabled={isSaving || !newName.trim() || !newUrl.trim()} className="w-full h-11 bg-primary text-primary-foreground rounded-xl font-black text-[10px]">{isSaving ? <><Spinner data-icon="inline-start" /> 正在下载</> : '确认新增规则集'}</Button>
             </div>
           )}
           <div className="space-y-3">
@@ -146,7 +168,7 @@ const RuleSetDrawer = ({ isOpen, onClose, ruleSets, onRefresh, onDelete, onAdd }
                    <div className="min-w-0 flex-1"><h5 className="text-xs font-black uppercase truncate">{rs.name}</h5><p className="text-[9px] font-mono text-muted-foreground truncate opacity-60">{rs.url}</p></div>
                    <div className="flex gap-1.5 opacity-0 group-hover:opacity-100 transition-all"><Button variant="ghost" size="icon" onClick={async () => { setSyncing(rs.id); await onRefresh(rs.id); setSyncing(null); }} className="size-7"><RefreshCw className={cn("size-3.5", syncing === rs.id && "animate-spin")} /></Button><Button variant="ghost" size="icon" onClick={() => onDelete(rs.id)} className="size-7 text-red-500"><Trash2 className="size-3.5" /></Button></div>
                 </div>
-                <div className="flex flex-wrap gap-x-4 gap-y-1 text-[9px] font-black uppercase text-muted-foreground"><span>Behavior: {rs.behavior || 'classical'}</span><span>Format: {rs.format || 'text'}</span><span>Entries: {rs.ruleCount || 0}</span><span>Update: {rs.lastUpdate}</span></div>
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-[9px] font-black uppercase text-muted-foreground"><span>Behavior: {rs.behavior || 'classical'}</span><span>Format: {rs.format || 'text'}</span><span>Entries: {rs.ruleCount || 0}</span><span>路线: {DOWNLOAD_ROUTE_LABELS[(rs.lastRoute || rs.downloadRoute) as DownloadRoute] || rs.lastRoute}</span><span>Update: {rs.lastUpdate}</span></div>
               </div>
             ))}
           </div>
@@ -247,6 +269,7 @@ export const Rules = () => {
   const [isTesting, setIsTesting] = useState(false);
   const [draggedRuleId, setDraggedRuleId] = useState<string | null>(null);
   const [movingRuleId, setMovingRuleId] = useState<string | null>(null);
+  const movingRuleRef = useRef<string | null>(null);
   const displayNameByRuntimeName = useMemo(() => new Map<string, string>([
     ...proxies.map(proxy => [proxy.name, displayRuntimeName(proxy.name, proxy.displayName)] as const),
     ...nodes.map(node => [node.name, displayRuntimeName(node.name, node.displayName)] as const),
@@ -331,7 +354,8 @@ export const Rules = () => {
   const sourcePosition = (rule: Rule) => rules.filter(item => item.source === rule.source).findIndex(item => item.id === rule.id) + 1;
   const sourceRuleCount = (rule: Rule) => rules.filter(item => item.source === rule.source).length;
   const handleMoveRule = async (rule: Rule, position: number) => {
-    if (movingRuleId) return;
+    if (movingRuleRef.current) return;
+    movingRuleRef.current = rule.id;
     setMovingRuleId(rule.id);
     try {
       await api.updateRule(rule.id, {
@@ -340,7 +364,7 @@ export const Rules = () => {
       });
       await fetchRules();
     } catch { toast('规则顺序调整失败', 'error'); }
-    finally { setMovingRuleId(null); }
+    finally { movingRuleRef.current = null; setMovingRuleId(null); }
   };
 
   const handleDropRule = (target: Rule) => {
@@ -447,7 +471,7 @@ export const Rules = () => {
 
       {/* 4. The Data Grid */}
       <div className="space-y-2">
-        {filteredRules.map((rule, idx) => (
+        {filteredRules.map((rule) => (
           <div key={rule.id} draggable={!movingRuleId} onDragStart={() => setDraggedRuleId(rule.id)} onDragEnd={() => setDraggedRuleId(null)} onDragOver={event => event.preventDefault()} onDrop={() => handleDropRule(rule)} className={cn("group relative bg-card hover:bg-card border border-border hover:border-primary/20 rounded-2xl p-3 md:px-6 md:py-4 transition-all duration-300 shadow-sm hover:shadow-md overflow-hidden text-left", draggedRuleId === rule.id && "opacity-50", movingRuleId === rule.id && "pointer-events-none opacity-60")}>
              {/* Desktop Layout */}
              <div className={cn("hidden lg:grid items-center gap-4", GRID_COLS)}>
@@ -472,7 +496,7 @@ export const Rules = () => {
              <div className="flex lg:hidden flex-col gap-4 text-left">
                 <div className="flex items-start justify-between gap-4 text-left">
                    <div className="flex gap-3 min-w-0 text-left">
-                      <span className="flex items-center gap-1 text-[10px] font-mono opacity-70 font-black pt-1"><GripVertical className="size-3.5" />{String(idx + 1).padStart(2, '0')}</span>
+                      <span className="flex items-center gap-1 text-[10px] font-mono opacity-70 font-black pt-1"><GripVertical className="size-3.5" />{String(sourcePosition(rule)).padStart(2, '0')}</span>
                       <div className="min-w-0 text-left"><div className="px-1.5 py-0.5 rounded bg-zinc-900 text-zinc-100 text-[9px] font-black uppercase tracking-wide mb-1.5 inline-block">{rule.type}</div><h4 className="text-sm font-black truncate text-foreground">{rule.value}</h4></div>
                    </div>
                    <div className="flex gap-1 shrink-0"><select aria-label="设置规则顺序" value={sourcePosition(rule)} onChange={event => void handleMoveRule(rule, Number(event.target.value))} className="h-8 w-12 rounded-lg border bg-background text-center text-[10px] font-black">{Array.from({ length: sourceRuleCount(rule) }, (_, position) => <option key={position + 1} value={position + 1}>{position + 1}</option>)}</select><Button title="置顶" onClick={() => void handleMoveRule(rule, 1)} variant="ghost" size="icon" className="size-8 rounded-lg bg-muted/50"><Pin className="size-3.5" /></Button><Button onClick={() => { setEditingRule(rule); setIsDrawerOpen(true); }} variant="ghost" size="icon" className="size-8 rounded-lg bg-muted/50"><Edit3 className="size-3.5" /></Button><Button onClick={() => handleDeleteRule(rule.id)} variant="ghost" size="icon" className="size-8 rounded-lg text-red-500 bg-red-500/5"><Trash2 className="size-3.5" /></Button></div>

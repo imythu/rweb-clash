@@ -1,12 +1,14 @@
 mod api;
 mod app;
 mod assets;
+mod backup;
 mod bootstrap;
 mod controller;
 mod core;
 mod egress;
 mod error;
 mod instance_lock;
+mod manual;
 mod paths;
 mod platform;
 mod proxy;

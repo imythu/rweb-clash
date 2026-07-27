@@ -5,6 +5,8 @@ import { Layout } from './components/Layout';
 import { Dashboard } from './components/Dashboard';
 import { Proxies } from './components/Proxies';
 import { Subscriptions } from './components/Subscriptions';
+import { ManualNodes } from './components/ManualNodes';
+import { Connections } from './components/Connections';
 import { Rules } from './components/Rules';
 import { Logs } from './components/Logs';
 import { Settings } from './components/Settings';
@@ -117,6 +119,8 @@ function App() {
       <Routes>
         <Route path="/" element={<Dashboard />} />
         <Route path="/subscriptions" element={<Subscriptions />} />
+        <Route path="/manual-nodes" element={<ManualNodes />} />
+        <Route path="/connections" element={<Connections />} />
         <Route path="/proxies" element={<Proxies />} />
         <Route path="/rules" element={<Rules />} />
         <Route path="/logs" element={<Logs />} />

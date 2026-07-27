@@ -3,17 +3,18 @@ use crate::paths::{
     ensure_private_directory, restrict_sensitive_file_permissions, sqlite_companion_path, AppPaths,
 };
 use crate::types::{
-    FilterRule, FilterRuleInput, GroupFilterInput, LogEntryResponse, ProxyGroupResponse,
-    ProxyNodeResponse, RuleResponse, RuleSetResponse, SubscriptionMemberGroup,
-    SubscriptionMemberNode, SubscriptionMemberSection, SubscriptionMembersResponse,
-    SubscriptionResponse, SystemConfig, TrafficQuota, BUILTIN_DIRECT, BUILTIN_GLOBAL,
-    BUILTIN_PROXY, BUILTIN_REJECT, SUB_DELIMITER,
+    DownloadRoute, FilterRule, FilterRuleInput, GroupFilterInput, LogEntryResponse,
+    ManualNodeResponse, ProxyGroupResponse, ProxyNodeResponse, RuleResponse, RuleSetResponse,
+    SubscriptionMemberGroup, SubscriptionMemberNode, SubscriptionMemberSection,
+    SubscriptionMembersResponse, SubscriptionResponse, SystemConfig, TrafficQuota, BUILTIN_DIRECT,
+    BUILTIN_GLOBAL, BUILTIN_PROXY, BUILTIN_REJECT, SUB_DELIMITER,
 };
 use crate::util::{bool_to_i64, display_log_time, i64_to_bool, new_id, normalize_status, now_iso};
 use serde_json::{Map, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -72,6 +73,7 @@ pub struct RuleSetRecord {
     pub behavior: Option<String>,
     pub format: String,
     pub local_path: Option<String>,
+    pub download_route: DownloadRoute,
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +328,150 @@ impl Storage {
         Ok(storage)
     }
 
+    pub async fn backup_database(&self, destination: &Path) -> Result<(), AppError> {
+        if let Some(parent) = destination.parent() {
+            ensure_private_directory(parent)?;
+        }
+        match tokio::fs::remove_file(destination).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        sqlx::query("VACUUM INTO ?")
+            .bind(destination.to_string_lossy().as_ref())
+            .execute(&self.pool)
+            .await?;
+        restrict_sensitive_file_permissions(destination)?;
+        Ok(())
+    }
+
+    pub async fn restore_database(&self, source: &Path) -> Result<(), AppError> {
+        if !source.is_file() {
+            return Err(AppError::bad_request(
+                "backup_invalid",
+                "backup database snapshot is missing",
+            ));
+        }
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("ATTACH DATABASE ? AS backup")
+            .bind(source.to_string_lossy().as_ref())
+            .execute(&mut *connection)
+            .await?;
+        let restore = async {
+            let integrity = sqlx::query_scalar::<_, String>("PRAGMA backup.quick_check")
+                .fetch_one(&mut *connection)
+                .await?;
+            if integrity != "ok" {
+                return Err(AppError::bad_request(
+                    "backup_invalid",
+                    format!("backup database integrity check failed: {integrity}"),
+                ));
+            }
+
+            const DELETE_ORDER: &[&str] = &[
+                "proxy_group_members",
+                "proxy_group_filters",
+                "subscription_rules",
+                "proxy_items",
+                "routing_rules",
+                "rule_sets",
+                "subscriptions",
+                "global_filter_rules",
+                "traffic_snapshots",
+                "log_entries",
+                "app_settings",
+            ];
+            const INSERT_ORDER: &[&str] = &[
+                "app_settings",
+                "subscriptions",
+                "global_filter_rules",
+                "subscription_rules",
+                "proxy_items",
+                "proxy_group_filters",
+                "proxy_group_members",
+                "routing_rules",
+                "rule_sets",
+                "traffic_snapshots",
+                "log_entries",
+            ];
+
+            for table in INSERT_ORDER {
+                let exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM backup.sqlite_master WHERE type = 'table' AND name = ?)",
+                )
+                .bind(table)
+                .fetch_one(&mut *connection)
+                .await?;
+                if !exists {
+                    return Err(AppError::bad_request(
+                        "backup_incompatible",
+                        format!("backup database is missing table {table}"),
+                    ));
+                }
+            }
+
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *connection)
+                .await?;
+            let transaction_result: Result<(), AppError> = async {
+                for table in DELETE_ORDER {
+                    sqlx::query(&format!("DELETE FROM main.{table}"))
+                        .execute(&mut *connection)
+                        .await?;
+                }
+                for table in INSERT_ORDER {
+                    let main_columns = attached_table_columns(&mut connection, "main", table).await?;
+                    let backup_columns =
+                        attached_table_columns(&mut connection, "backup", table).await?;
+                    let columns = main_columns
+                        .into_iter()
+                        .filter(|column| backup_columns.contains(column))
+                        .collect::<Vec<_>>();
+                    if columns.is_empty() {
+                        return Err(AppError::bad_request(
+                            "backup_incompatible",
+                            format!("backup table {table} has no compatible columns"),
+                        ));
+                    }
+                    let columns = columns.join(", ");
+                    sqlx::query(&format!(
+                        "INSERT INTO main.{table} ({columns}) SELECT {columns} FROM backup.{table}"
+                    ))
+                    .execute(&mut *connection)
+                    .await?;
+                }
+                Ok(())
+            }
+            .await;
+            match transaction_result {
+                Ok(()) => {
+                    sqlx::query("COMMIT").execute(&mut *connection).await?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    Err(error)
+                }
+            }
+        }
+        .await;
+        let detach = sqlx::query("DETACH DATABASE backup")
+            .execute(&mut *connection)
+            .await;
+        restore?;
+        detach?;
+        drop(connection);
+
+        self.normalize_routing_match_rules().await?;
+        self.cleanup_pending_subscriptions().await?;
+        self.cleanup_pending_rule_sets().await?;
+        self.ensure_default_settings().await?;
+        self.ensure_builtin_rule_sets().await?;
+        self.ensure_builtin_rules().await?;
+        self.sync_builtin_proxy_group().await?;
+        Ok(())
+    }
+
     async fn migrate(&self) -> Result<(), AppError> {
         let migrations = [
             r#"
@@ -368,6 +514,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   raw_etag TEXT,
   raw_last_modified TEXT,
   raw_content_hash TEXT,
+  download_route TEXT NOT NULL DEFAULT 'auto',
+  last_route TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 )"#,
@@ -501,6 +649,8 @@ CREATE TABLE IF NOT EXISTS rule_sets (
   staged_format TEXT,
   staged_update_at TEXT,
   staged_last_error TEXT,
+  download_route TEXT NOT NULL DEFAULT 'auto',
+  last_route TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 )"#,
@@ -540,16 +690,30 @@ CREATE TABLE IF NOT EXISTS log_entries (
         self.ensure_proxy_group_filter_values_column().await?;
         self.ensure_filter_rule_values_columns().await?;
         self.ensure_subscription_source_format_column().await?;
+        self.ensure_text_column("subscriptions", "download_route", "'auto'")
+            .await?;
+        self.ensure_nullable_column("subscriptions", "last_route", "TEXT")
+            .await?;
         self.ensure_integer_column("subscriptions", "ready", "1")
             .await?;
         self.ensure_proxy_item_builtin_column().await?;
         self.ensure_integer_column("rule_sets", "ready", "1")
             .await?;
         self.ensure_rule_set_staging_columns().await?;
+        self.ensure_text_column("rule_sets", "download_route", "'auto'")
+            .await?;
+        self.ensure_nullable_column("rule_sets", "last_route", "TEXT")
+            .await?;
         self.normalize_rule_set_local_paths().await?;
         self.normalize_builtin_rule_set_formats().await?;
         sqlx::query(
             "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES(1, 'initial', ?)",
+        )
+        .bind(now_iso())
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES(2, 'source-routes', ?)",
         )
         .bind(now_iso())
         .execute(&self.pool)
@@ -1036,11 +1200,13 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
             interval_seconds,
             inherit_global,
             rules,
+            DownloadRoute::Auto,
             true,
         )
         .await
     }
 
+    #[cfg(test)]
     pub async fn create_pending_subscription(
         &self,
         id: &str,
@@ -1057,6 +1223,31 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
             interval_seconds,
             inherit_global,
             rules,
+            DownloadRoute::Auto,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_pending_subscription_with_route(
+        &self,
+        id: &str,
+        name: &str,
+        url: &str,
+        interval_seconds: u64,
+        inherit_global: bool,
+        rules: &[FilterRuleInput],
+        download_route: DownloadRoute,
+    ) -> Result<(), AppError> {
+        self.create_subscription_with_ready(
+            id,
+            name,
+            url,
+            interval_seconds,
+            inherit_global,
+            rules,
+            download_route,
             false,
         )
         .await
@@ -1071,6 +1262,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
         interval_seconds: u64,
         inherit_global: bool,
         rules: &[FilterRuleInput],
+        download_route: DownloadRoute,
         ready: bool,
     ) -> Result<(), AppError> {
         let interval_seconds = sqlite_i64(interval_seconds, "subscription interval_seconds")?;
@@ -1081,8 +1273,8 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
             r#"
 INSERT INTO subscriptions(
   id, name, url, ready, status, interval_seconds, inherit_global_rules, node_count,
-  next_sync_at, created_at, updated_at
-) VALUES(?, ?, ?, ?, 'syncing', ?, ?, 0, ?, ?, ?)
+  next_sync_at, download_route, created_at, updated_at
+) VALUES(?, ?, ?, ?, 'syncing', ?, ?, 0, ?, ?, ?, ?)
 "#,
         )
         .bind(id)
@@ -1092,6 +1284,7 @@ INSERT INTO subscriptions(
         .bind(interval_seconds)
         .bind(bool_to_i64(inherit_global))
         .bind(next_sync_at)
+        .bind(download_route.as_str())
         .bind(&now)
         .bind(&now)
         .execute(&mut *tx)
@@ -1122,6 +1315,7 @@ INSERT INTO subscriptions(
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn update_subscription(
         &self,
         id: &str,
@@ -1131,13 +1325,36 @@ INSERT INTO subscriptions(
         inherit_global: bool,
         rules: &[FilterRuleInput],
     ) -> Result<(), AppError> {
+        self.update_subscription_with_route(
+            id,
+            name,
+            url,
+            interval_seconds,
+            inherit_global,
+            rules,
+            DownloadRoute::Auto,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_subscription_with_route(
+        &self,
+        id: &str,
+        name: &str,
+        url: &str,
+        interval_seconds: u64,
+        inherit_global: bool,
+        rules: &[FilterRuleInput],
+        download_route: DownloadRoute,
+    ) -> Result<(), AppError> {
         let interval_seconds = sqlite_i64(interval_seconds, "subscription interval_seconds")?;
         let now = now_iso();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
             r#"
 UPDATE subscriptions
-SET name = ?, url = ?, interval_seconds = ?, inherit_global_rules = ?, updated_at = ?
+SET name = ?, url = ?, interval_seconds = ?, inherit_global_rules = ?, download_route = ?, updated_at = ?
 WHERE id = ?
 "#,
         )
@@ -1145,6 +1362,7 @@ WHERE id = ?
         .bind(url)
         .bind(interval_seconds)
         .bind(bool_to_i64(inherit_global))
+        .bind(download_route.as_str())
         .bind(&now)
         .bind(id)
         .execute(&mut *tx)
@@ -1276,7 +1494,7 @@ LIMIT 1
             r#"
 SELECT id, name, url, source_format, status, interval_seconds, inherit_global_rules,
        upload_bytes, download_bytes, total_bytes, expire_at, node_count,
-       last_update_at, last_error
+       last_update_at, last_error, download_route, last_route
 FROM subscriptions
 WHERE ready = 1
 ORDER BY created_at DESC
@@ -1314,6 +1532,10 @@ ORDER BY created_at DESC
                 breakdown: self.subscription_breakdown(&id).await?,
                 last_update: row.try_get("last_update_at")?,
                 last_error: row.try_get("last_error")?,
+                download_route: download_route_from_str(
+                    &row.try_get::<String, _>("download_route")?,
+                ),
+                last_route: row.try_get("last_route")?,
             });
         }
         Ok(output)
@@ -1447,6 +1669,35 @@ ORDER BY position, display_name
         Ok((row.try_get("name")?, row.try_get("url")?))
     }
 
+    pub async fn get_subscription_download_route(
+        &self,
+        id: &str,
+    ) -> Result<DownloadRoute, AppError> {
+        let route = sqlx::query_scalar::<_, String>(
+            "SELECT download_route FROM subscriptions WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| {
+            AppError::not_found(
+                "subscription_not_found",
+                format!("subscription {id} not found"),
+            )
+        })?;
+        Ok(download_route_from_str(&route))
+    }
+
+    pub async fn set_subscription_last_route(&self, id: &str, route: &str) -> Result<(), AppError> {
+        sqlx::query("UPDATE subscriptions SET last_route = ?, updated_at = ? WHERE id = ?")
+            .bind(route)
+            .bind(now_iso())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn due_subscription_ids(&self) -> Result<Vec<String>, AppError> {
         let rows = sqlx::query(
             r#"
@@ -1455,11 +1706,18 @@ FROM subscriptions
 WHERE ready = 1
   AND interval_seconds > 0
   AND status != 'syncing'
-  AND (
-    last_update_at IS NULL
-    OR CAST(strftime('%s', last_update_at) AS INTEGER) + interval_seconds
-       <= CAST(strftime('%s', 'now') AS INTEGER)
-  )
+  AND COALESCE(
+    CASE
+      WHEN sync_finished_at IS NULL AND last_update_at IS NULL
+        THEN CAST(strftime('%s', next_sync_at) AS INTEGER)
+      WHEN CAST(strftime('%s', next_sync_at) AS INTEGER)
+        > CAST(strftime('%s', COALESCE(sync_finished_at, last_update_at)) AS INTEGER)
+        THEN CAST(strftime('%s', next_sync_at) AS INTEGER)
+      ELSE NULL
+    END,
+    CAST(strftime('%s', COALESCE(sync_finished_at, last_update_at, created_at)) AS INTEGER)
+      + MAX(interval_seconds, 21600)
+  ) <= CAST(strftime('%s', 'now') AS INTEGER)
 "#,
         )
         .fetch_all(&self.pool)
@@ -1478,9 +1736,18 @@ WHERE ready = 1
   AND interval_seconds > 0
   AND (
     status = 'syncing'
-    OR last_update_at IS NULL
-    OR CAST(strftime('%s', last_update_at) AS INTEGER) + interval_seconds
-       <= CAST(strftime('%s', 'now') AS INTEGER)
+    OR COALESCE(
+      CASE
+        WHEN sync_finished_at IS NULL AND last_update_at IS NULL
+          THEN CAST(strftime('%s', next_sync_at) AS INTEGER)
+        WHEN CAST(strftime('%s', next_sync_at) AS INTEGER)
+          > CAST(strftime('%s', COALESCE(sync_finished_at, last_update_at)) AS INTEGER)
+          THEN CAST(strftime('%s', next_sync_at) AS INTEGER)
+        ELSE NULL
+      END,
+      CAST(strftime('%s', COALESCE(sync_finished_at, last_update_at, created_at)) AS INTEGER)
+        + MAX(interval_seconds, 21600)
+    ) <= CAST(strftime('%s', 'now') AS INTEGER)
   )
 "#,
         )
@@ -1513,6 +1780,25 @@ UPDATE subscriptions
 SET status = 'offline',
     sync_finished_at = ?,
     sync_error_count = sync_error_count + 1,
+    next_sync_at = CASE
+      WHEN interval_seconds <= 0 THEN NULL
+      ELSE datetime(
+        'now',
+        printf(
+          '+%d seconds',
+          MIN(
+            MAX(interval_seconds, 21600),
+            CASE sync_error_count
+              WHEN 0 THEN 900
+              WHEN 1 THEN 1800
+              WHEN 2 THEN 3600
+              WHEN 3 THEN 7200
+              ELSE 14400
+            END
+          )
+        )
+      )
+    END,
     last_error = ?,
     updated_at = ?
 WHERE id = ?
@@ -1676,6 +1962,11 @@ SET name = ?,
     node_count = ?,
     sync_finished_at = ?,
     last_update_at = ?,
+    sync_error_count = 0,
+    next_sync_at = CASE
+      WHEN interval_seconds <= 0 THEN NULL
+      ELSE datetime('now', printf('+%d seconds', MAX(interval_seconds, 21600)))
+    END,
     last_error = NULL,
     source_format = ?,
     raw_content_hash = ?,
@@ -1720,6 +2011,134 @@ WHERE id = ?
         let now = now_iso();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         upsert_proxy_item_in_transaction(&mut tx, item, &now).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_manual_nodes(&self) -> Result<Vec<ManualNodeResponse>, AppError> {
+        let rows = sqlx::query(
+            r#"
+SELECT name, display_name, protocol, raw_json, latency_ms
+FROM proxy_items
+WHERE kind = 'node' AND source = 'manual'
+ORDER BY position, created_at, name
+"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let raw_json: String = row.try_get("raw_json")?;
+                Ok(ManualNodeResponse {
+                    name: row.try_get("name")?,
+                    display_name: row.try_get("display_name")?,
+                    protocol: row.try_get("protocol")?,
+                    config: serde_json::from_str(&raw_json).map_err(AppError::from)?,
+                    latency: row.try_get::<Option<i64>, _>("latency_ms")?.unwrap_or(-1),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn create_manual_node(&self, item: &ProxyItemRecord) -> Result<(), AppError> {
+        validate_manual_record(item)?;
+        let _mutation = self.topology_mutation.lock().await;
+        let now = now_iso();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM proxy_items WHERE name = ?)",
+        )
+        .bind(&item.name)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exists {
+            return Err(AppError::conflict(
+                "manual_node_exists",
+                format!("proxy item {} already exists", item.name),
+            ));
+        }
+        let mut item = item.clone();
+        item.position = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(MAX(position), 0) + 1024 FROM proxy_items WHERE kind = 'node'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        upsert_proxy_item_in_transaction(&mut tx, &item, &now).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn update_manual_node(&self, item: &ProxyItemRecord) -> Result<(), AppError> {
+        validate_manual_record(item)?;
+        let _mutation = self.topology_mutation.lock().await;
+        let now = now_iso();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let existing = sqlx::query(
+            "SELECT source, position, latency_ms FROM proxy_items WHERE name = ? AND kind = 'node'",
+        )
+        .bind(&item.name)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::not_found(
+                "manual_node_not_found",
+                format!("manual node {} not found", item.name),
+            )
+        })?;
+        if existing.try_get::<String, _>("source")? != "manual" {
+            return Err(AppError::conflict(
+                "manual_node_readonly",
+                "subscription nodes cannot be edited as manual nodes",
+            ));
+        }
+        let mut item = item.clone();
+        item.position = existing.try_get("position")?;
+        item.latency_ms = existing.try_get("latency_ms")?;
+        upsert_proxy_item_in_transaction(&mut tx, &item, &now).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn delete_manual_node(&self, name: &str) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let source = sqlx::query_scalar::<_, String>(
+            "SELECT source FROM proxy_items WHERE name = ? AND kind = 'node'",
+        )
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::not_found(
+                "manual_node_not_found",
+                format!("manual node {name} not found"),
+            )
+        })?;
+        if source != "manual" {
+            return Err(AppError::conflict(
+                "manual_node_readonly",
+                "subscription nodes cannot be deleted as manual nodes",
+            ));
+        }
+        if let Some(rule_id) =
+            sqlx::query_scalar::<_, String>("SELECT id FROM routing_rules WHERE policy = ? LIMIT 1")
+                .bind(name)
+                .fetch_optional(&mut *tx)
+                .await?
+        {
+            return Err(AppError::conflict(
+                "manual_node_referenced",
+                format!("manual node {name} is referenced by routing rule {rule_id}"),
+            ));
+        }
+        sqlx::query("DELETE FROM proxy_group_members WHERE member_name = ?")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM proxy_items WHERE name = ?")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2527,7 +2946,7 @@ WHERE id = ?
 
     pub async fn list_rule_sets(&self) -> Result<Vec<RuleSetResponse>, AppError> {
         let rows = sqlx::query(
-            "SELECT id, name, url, behavior, format, rule_count, last_update_at, last_error FROM rule_sets WHERE ready = 1 ORDER BY name",
+            "SELECT id, name, url, behavior, format, rule_count, last_update_at, last_error, download_route, last_route FROM rule_sets WHERE ready = 1 ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -2542,6 +2961,10 @@ WHERE id = ?
                     rule_count: row.try_get("rule_count")?,
                     last_update: row.try_get("last_update_at")?,
                     last_error: row.try_get("last_error")?,
+                    download_route: download_route_from_str(
+                        &row.try_get::<String, _>("download_route")?,
+                    ),
+                    last_route: row.try_get("last_route")?,
                 })
             })
             .collect()
@@ -2557,7 +2980,8 @@ SELECT id, name, url, behavior,
        COALESCE(staged_format, format) AS format,
        COALESCE(staged_rule_count, rule_count) AS rule_count,
        COALESCE(staged_update_at, last_update_at) AS last_update_at,
-       COALESCE(staged_last_error, last_error) AS last_error
+       COALESCE(staged_last_error, last_error) AS last_error,
+       download_route, last_route
 FROM rule_sets
 WHERE id = ? AND (ready = 1 OR staged_local_path IS NOT NULL)
 "#,
@@ -2575,6 +2999,10 @@ WHERE id = ? AND (ready = 1 OR staged_local_path IS NOT NULL)
                 rule_count: row.try_get("rule_count")?,
                 last_update: row.try_get("last_update_at")?,
                 last_error: row.try_get("last_error")?,
+                download_route: download_route_from_str(
+                    &row.try_get::<String, _>("download_route")?,
+                ),
+                last_route: row.try_get("last_route")?,
             })
         })
         .transpose()
@@ -2585,7 +3013,8 @@ WHERE id = ? AND (ready = 1 OR staged_local_path IS NOT NULL)
             r#"
 SELECT id, name, url, behavior,
        COALESCE(staged_format, format) AS format,
-       COALESCE(staged_local_path, local_path) AS local_path
+       COALESCE(staged_local_path, local_path) AS local_path,
+       download_route
 FROM rule_sets
 WHERE ready = 1 OR staged_local_path IS NOT NULL
 ORDER BY name
@@ -2602,6 +3031,9 @@ ORDER BY name
                     behavior: row.try_get("behavior")?,
                     format: row.try_get("format")?,
                     local_path: row.try_get("local_path")?,
+                    download_route: download_route_from_str(
+                        &row.try_get::<String, _>("download_route")?,
+                    ),
                 })
             })
             .collect()
@@ -2643,7 +3075,7 @@ ORDER BY name
 
     pub async fn rule_set_for_refresh(&self, id: &str) -> Result<Option<RuleSetRecord>, AppError> {
         let row = sqlx::query(
-            "SELECT id, name, url, behavior, format, local_path FROM rule_sets WHERE id = ?",
+            "SELECT id, name, url, behavior, format, local_path, download_route FROM rule_sets WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -2656,6 +3088,9 @@ ORDER BY name
                 behavior: row.try_get("behavior")?,
                 format: row.try_get("format")?,
                 local_path: row.try_get("local_path")?,
+                download_route: download_route_from_str(
+                    &row.try_get::<String, _>("download_route")?,
+                ),
             })
         })
         .transpose()
@@ -2668,11 +3103,15 @@ SELECT id
 FROM rule_sets
 WHERE ready = 1
   AND interval_seconds > 0
-  AND (
-    last_update_at IS NULL
-    OR CAST(strftime('%s', last_update_at) AS INTEGER) + interval_seconds
-       <= CAST(strftime('%s', 'now') AS INTEGER)
-  )
+  AND CAST(
+    strftime(
+      '%s',
+      CASE WHEN last_error IS NOT NULL THEN updated_at ELSE COALESCE(last_update_at, created_at) END
+    ) AS INTEGER
+  ) + CASE
+    WHEN last_error IS NOT NULL THEN 3600
+    ELSE MAX(interval_seconds, 21600)
+  END <= CAST(strftime('%s', 'now') AS INTEGER)
 "#,
         )
         .fetch_all(&self.pool)
@@ -2692,10 +3131,20 @@ WHERE ready = 1
         behavior: Option<&str>,
         format: &str,
     ) -> Result<(), AppError> {
-        self.create_rule_set_with_ready(id, name, url, interval_seconds, behavior, format, true)
-            .await
+        self.create_rule_set_with_ready(
+            id,
+            name,
+            url,
+            interval_seconds,
+            behavior,
+            format,
+            DownloadRoute::Auto,
+            true,
+        )
+        .await
     }
 
+    #[cfg(test)]
     pub async fn create_pending_rule_set(
         &self,
         id: &str,
@@ -2705,8 +3154,41 @@ WHERE ready = 1
         behavior: Option<&str>,
         format: &str,
     ) -> Result<(), AppError> {
-        self.create_rule_set_with_ready(id, name, url, interval_seconds, behavior, format, false)
-            .await
+        self.create_rule_set_with_ready(
+            id,
+            name,
+            url,
+            interval_seconds,
+            behavior,
+            format,
+            DownloadRoute::Auto,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_pending_rule_set_with_route(
+        &self,
+        id: &str,
+        name: &str,
+        url: &str,
+        interval_seconds: u64,
+        behavior: Option<&str>,
+        format: &str,
+        download_route: DownloadRoute,
+    ) -> Result<(), AppError> {
+        self.create_rule_set_with_ready(
+            id,
+            name,
+            url,
+            interval_seconds,
+            behavior,
+            format,
+            download_route,
+            false,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2718,6 +3200,7 @@ WHERE ready = 1
         interval_seconds: u64,
         behavior: Option<&str>,
         format: &str,
+        download_route: DownloadRoute,
         ready: bool,
     ) -> Result<(), AppError> {
         let interval_seconds = sqlite_i64(interval_seconds, "rule set interval_seconds")?;
@@ -2739,8 +3222,8 @@ WHERE ready = 1
         }
         sqlx::query(
             r#"
-INSERT INTO rule_sets(id, name, url, ready, behavior, format, interval_seconds, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO rule_sets(id, name, url, ready, behavior, format, interval_seconds, download_route, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
         )
         .bind(id)
@@ -2750,6 +3233,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
         .bind(behavior)
         .bind(format)
         .bind(interval_seconds)
+        .bind(download_route.as_str())
         .bind(&now)
         .bind(&now)
         .execute(&mut *tx)
@@ -3037,6 +3521,16 @@ WHERE id = ?
     ) -> Result<(), AppError> {
         sqlx::query("UPDATE rule_sets SET last_error = ?, updated_at = ? WHERE id = ?")
             .bind(message)
+            .bind(now_iso())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_rule_set_last_route(&self, id: &str, route: &str) -> Result<(), AppError> {
+        sqlx::query("UPDATE rule_sets SET last_route = ?, updated_at = ? WHERE id = ?")
+            .bind(route)
             .bind(now_iso())
             .bind(id)
             .execute(&self.pool)
@@ -3886,6 +4380,39 @@ fn is_builtin_policy(value: &str) -> bool {
         value,
         BUILTIN_DIRECT | BUILTIN_REJECT | BUILTIN_GLOBAL | BUILTIN_PROXY
     )
+}
+
+fn download_route_from_str(value: &str) -> DownloadRoute {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "direct" => DownloadRoute::Direct,
+        "core" => DownloadRoute::Core,
+        "system" => DownloadRoute::System,
+        _ => DownloadRoute::Auto,
+    }
+}
+
+fn validate_manual_record(item: &ProxyItemRecord) -> Result<(), AppError> {
+    if item.kind != "node"
+        || item.source != "manual"
+        || item.subscription_id.is_some()
+        || item.raw_json.is_none()
+    {
+        return Err(AppError::internal("invalid manual proxy item record"));
+    }
+    Ok(())
+}
+
+async fn attached_table_columns(
+    connection: &mut sqlx::pool::PoolConnection<Sqlite>,
+    schema: &str,
+    table: &str,
+) -> Result<HashSet<String>, AppError> {
+    let rows = sqlx::query(&format!("PRAGMA {schema}.table_info({table})"))
+        .fetch_all(&mut **connection)
+        .await?;
+    rows.into_iter()
+        .map(|row| row.try_get("name").map_err(AppError::from))
+        .collect()
 }
 
 async fn move_rule_in_transaction(
@@ -5550,6 +6077,26 @@ INSERT INTO routing_rules(
             .iter()
             .any(|id| id == subscription_id));
 
+        sqlx::query(
+            "UPDATE subscriptions SET next_sync_at = datetime('now', '-1 day') WHERE id = ?",
+        )
+        .bind(subscription_id)
+        .execute(&storage.pool)
+        .await
+        .expect("simulate a stale legacy next_sync_at value");
+        assert!(!storage
+            .due_subscription_ids()
+            .await
+            .expect("query subscription with legacy schedule")
+            .iter()
+            .any(|id| id == subscription_id));
+        assert!(!storage
+            .startup_subscription_ids()
+            .await
+            .expect("query startup subscription with legacy schedule")
+            .iter()
+            .any(|id| id == subscription_id));
+
         let rule_set_id = "rs_fresh_due_test";
         storage
             .create_rule_set(
@@ -5578,6 +6125,117 @@ INSERT INTO routing_rules(
             .due_rule_set_ids()
             .await
             .expect("query due rule sets")
+            .iter()
+            .any(|id| id == rule_set_id));
+    }
+
+    #[tokio::test]
+    async fn failed_remote_resources_wait_before_retrying() {
+        let temp = TestDir::new("failed-resource-backoff");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        let subscription_id = "sub_failed_backoff";
+        storage
+            .create_subscription(
+                subscription_id,
+                "Failing Provider",
+                "https://example.com/profile.yaml",
+                60,
+                true,
+                &[],
+            )
+            .await
+            .expect("create subscription");
+        storage
+            .mark_subscription_sync_error(subscription_id, "network unavailable")
+            .await
+            .expect("record subscription failure");
+
+        assert!(!storage
+            .due_subscription_ids()
+            .await
+            .expect("query backed-off subscriptions")
+            .iter()
+            .any(|id| id == subscription_id));
+        assert!(!storage
+            .startup_subscription_ids()
+            .await
+            .expect("query startup backed-off subscriptions")
+            .iter()
+            .any(|id| id == subscription_id));
+        let next_sync_at = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT next_sync_at FROM subscriptions WHERE id = ?",
+        )
+        .bind(subscription_id)
+        .fetch_one(&storage.pool)
+        .await
+        .expect("read retry timestamp");
+        assert!(next_sync_at.is_some());
+
+        sqlx::query(
+            r#"
+UPDATE subscriptions
+SET sync_finished_at = datetime('now', '-1 hour'),
+    next_sync_at = datetime('now', '-1 second')
+WHERE id = ?
+"#,
+        )
+        .bind(subscription_id)
+        .execute(&storage.pool)
+        .await
+        .expect("expire retry backoff");
+        assert!(storage
+            .due_subscription_ids()
+            .await
+            .expect("query expired subscription backoff")
+            .iter()
+            .any(|id| id == subscription_id));
+
+        storage
+            .replace_subscription_assets(subscription_id, &[], &[], test_sync_commit())
+            .await
+            .expect("complete successful retry");
+        let error_count =
+            sqlx::query_scalar::<_, i64>("SELECT sync_error_count FROM subscriptions WHERE id = ?")
+                .bind(subscription_id)
+                .fetch_one(&storage.pool)
+                .await
+                .expect("read reset error count");
+        assert_eq!(error_count, 0);
+
+        let rule_set_id = "rs_failed_backoff";
+        storage
+            .create_rule_set(
+                rule_set_id,
+                "failing-rules",
+                "https://example.com/rules.txt",
+                60,
+                Some("domain"),
+                "text",
+            )
+            .await
+            .expect("create rule set");
+        storage
+            .mark_rule_set_refresh_error(rule_set_id, "network unavailable")
+            .await
+            .expect("record rule-set failure");
+        assert!(!storage
+            .due_rule_set_ids()
+            .await
+            .expect("query backed-off rule sets")
+            .iter()
+            .any(|id| id == rule_set_id));
+
+        sqlx::query("UPDATE rule_sets SET updated_at = datetime('now', '-2 hours') WHERE id = ?")
+            .bind(rule_set_id)
+            .execute(&storage.pool)
+            .await
+            .expect("expire rule-set backoff");
+        assert!(storage
+            .due_rule_set_ids()
+            .await
+            .expect("query expired rule-set backoff")
             .iter()
             .any(|id| id == rule_set_id));
     }

@@ -65,6 +65,11 @@ const DEFAULT_SYSTEM_CONFIG: SystemConfig = {
   secret: '',
   dns_enabled: true,
   dns_mode: 'fake-ip',
+  dns_nameservers: [],
+  dns_fallback: [],
+  dns_fake_ip_filter: [],
+  dns_nameserver_policy: {},
+  dns_hosts: {},
   store_selected: true,
   unified_delay: true,
   tcp_concurrent: false,
@@ -326,6 +331,8 @@ export const Dashboard = () => {
   const [egress, setEgress] = useState<Egress>(readCachedEgress);
   const [egressLoading, setEgressLoading] = useState(false);
   const realtimeInFlight = useRef(false);
+  const configUpdateInFlight = useRef(false);
+  const coreActionInFlight = useRef(false);
   const statusRequest = useRef<{ controller: AbortController; generation: number } | null>(null);
   const statusGeneration = useRef(0);
   const egressRequest = useRef<{ controller: AbortController; generation: number } | null>(null);
@@ -445,6 +452,8 @@ export const Dashboard = () => {
   }, [coreStatus?.state, fetchEgress]);
 
   const updateConfig = async (updates: Partial<SystemConfig>) => {
+    if (configUpdateInFlight.current) return;
+    configUpdateInFlight.current = true;
     try {
       const nextConfig = await api.patchConfig(updates);
       setConfig(nextConfig);
@@ -453,11 +462,14 @@ export const Dashboard = () => {
       toast('状态同步成功', 'success');
     } catch {
       toast('同步失败', 'error');
+    } finally {
+      configUpdateInFlight.current = false;
     }
   };
 
   const runCoreAction = async (action: CoreAction) => {
-    if (coreAction) return;
+    if (coreActionInFlight.current) return;
+    coreActionInFlight.current = true;
     setCoreAction(action);
     try {
       const nextCore = action === 'start'
@@ -473,6 +485,7 @@ export const Dashboard = () => {
       console.error("Core action error:", e);
       toast(e instanceof ApiError ? e.message : '内核操作失败', 'error');
     } finally {
+      coreActionInFlight.current = false;
       setCoreAction(null);
     }
   };

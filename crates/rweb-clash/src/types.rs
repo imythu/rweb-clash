@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 pub const SUB_DELIMITER: &str = "^_^";
 pub const BUILTIN_DIRECT: &str = "DIRECT";
@@ -8,6 +9,12 @@ pub const BUILTIN_GLOBAL: &str = "GLOBAL";
 pub const BUILTIN_PROXY: &str = "PROXY";
 pub const DEFAULT_DELAY_TEST_URL: &str = "http://www.gstatic.com/generate_204";
 pub const DEFAULT_DELAY_TIMEOUT_MS: u64 = 5_000;
+pub const MIN_REMOTE_REFRESH_INTERVAL_SECONDS: u64 = 21_600;
+pub const DEFAULT_SUBSCRIPTION_REFRESH_INTERVAL_SECONDS: u64 = 21_600;
+pub const DEFAULT_RULE_SET_REFRESH_INTERVAL_SECONDS: u64 = 86_400;
+pub const MIN_ACTIVE_PROBE_INTERVAL_SECONDS: i64 = 1_800;
+pub const DEFAULT_ACTIVE_PROBE_INTERVAL_SECONDS: i64 = 1_800;
+pub const MAX_ACTIVE_PROBE_INTERVAL_SECONDS: i64 = 86_400;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -21,6 +28,11 @@ pub struct SystemConfig {
     pub secret: String,
     pub dns_enabled: bool,
     pub dns_mode: String,
+    pub dns_nameservers: Vec<String>,
+    pub dns_fallback: Vec<String>,
+    pub dns_fake_ip_filter: Vec<String>,
+    pub dns_nameserver_policy: BTreeMap<String, Vec<String>>,
+    pub dns_hosts: BTreeMap<String, Vec<String>>,
     pub store_selected: bool,
     pub unified_delay: bool,
     pub tcp_concurrent: bool,
@@ -42,6 +54,14 @@ impl Default for SystemConfig {
             secret: "r-clash-secret".into(),
             dns_enabled: true,
             dns_mode: "fake-ip".into(),
+            dns_nameservers: vec![
+                "https://dns.alidns.com/dns-query".into(),
+                "https://doh.pub/dns-query".into(),
+            ],
+            dns_fallback: Vec::new(),
+            dns_fake_ip_filter: Vec::new(),
+            dns_nameserver_policy: BTreeMap::new(),
+            dns_hosts: BTreeMap::new(),
             store_selected: true,
             unified_delay: true,
             tcp_concurrent: false,
@@ -65,6 +85,11 @@ pub struct SystemConfigPatch {
     pub secret: Option<String>,
     pub dns_enabled: Option<bool>,
     pub dns_mode: Option<String>,
+    pub dns_nameservers: Option<Vec<String>>,
+    pub dns_fallback: Option<Vec<String>>,
+    pub dns_fake_ip_filter: Option<Vec<String>>,
+    pub dns_nameserver_policy: Option<BTreeMap<String, Vec<String>>>,
+    pub dns_hosts: Option<BTreeMap<String, Vec<String>>>,
     pub store_selected: Option<bool>,
     pub unified_delay: Option<bool>,
     pub tcp_concurrent: Option<bool>,
@@ -103,6 +128,21 @@ impl SystemConfigPatch {
         if let Some(value) = self.dns_mode {
             config.dns_mode = value;
         }
+        if let Some(value) = self.dns_nameservers {
+            config.dns_nameservers = value;
+        }
+        if let Some(value) = self.dns_fallback {
+            config.dns_fallback = value;
+        }
+        if let Some(value) = self.dns_fake_ip_filter {
+            config.dns_fake_ip_filter = value;
+        }
+        if let Some(value) = self.dns_nameserver_policy {
+            config.dns_nameserver_policy = value;
+        }
+        if let Some(value) = self.dns_hosts {
+            config.dns_hosts = value;
+        }
         if let Some(value) = self.store_selected {
             config.store_selected = value;
         }
@@ -123,6 +163,27 @@ impl SystemConfigPatch {
         }
         if let Some(value) = self.auto_start {
             config.auto_start = value;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadRoute {
+    Direct,
+    Core,
+    System,
+    #[default]
+    Auto,
+}
+
+impl DownloadRoute {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Core => "core",
+            Self::System => "system",
+            Self::Auto => "auto",
         }
     }
 }
@@ -229,6 +290,8 @@ pub struct SubscriptionInput {
     #[serde(alias = "inheritGlobal")]
     pub inherit_global: Option<bool>,
     pub rules: Vec<FilterRuleInput>,
+    #[serde(alias = "downloadRoute")]
+    pub download_route: DownloadRoute,
 }
 
 impl Default for SubscriptionInput {
@@ -240,15 +303,18 @@ impl Default for SubscriptionInput {
             interval: None,
             inherit_global: Some(true),
             rules: Vec::new(),
+            download_route: DownloadRoute::Auto,
         }
     }
 }
 
 impl SubscriptionInput {
     pub fn interval_seconds(&self) -> u64 {
-        self.interval_seconds
-            .or_else(|| self.interval.map(|minutes| minutes.saturating_mul(60)))
-            .unwrap_or(21_600)
+        normalize_remote_refresh_interval(
+            self.interval_seconds
+                .or_else(|| self.interval.map(|minutes| minutes.saturating_mul(60)))
+                .unwrap_or(DEFAULT_SUBSCRIPTION_REFRESH_INTERVAL_SECONDS),
+        )
     }
 }
 
@@ -273,6 +339,10 @@ pub struct SubscriptionResponse {
     pub last_update: Option<String>,
     #[serde(rename = "lastError")]
     pub last_error: Option<String>,
+    #[serde(rename = "downloadRoute")]
+    pub download_route: DownloadRoute,
+    #[serde(rename = "lastRoute")]
+    pub last_route: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -503,6 +573,8 @@ pub struct RuleSetInput {
     pub interval: Option<u64>,
     pub behavior: Option<String>,
     pub format: Option<String>,
+    #[serde(alias = "downloadRoute")]
+    pub download_route: DownloadRoute,
 }
 
 impl Default for RuleSetInput {
@@ -514,13 +586,75 @@ impl Default for RuleSetInput {
             interval: None,
             behavior: None,
             format: Some("text".into()),
+            download_route: DownloadRoute::Auto,
         }
     }
 }
 
 impl RuleSetInput {
     pub fn interval_seconds(&self) -> u64 {
-        self.interval_seconds.or(self.interval).unwrap_or(86_400)
+        normalize_remote_refresh_interval(
+            self.interval_seconds
+                .or(self.interval)
+                .unwrap_or(DEFAULT_RULE_SET_REFRESH_INTERVAL_SECONDS),
+        )
+    }
+}
+
+fn normalize_remote_refresh_interval(interval_seconds: u64) -> u64 {
+    if interval_seconds == 0 {
+        0
+    } else {
+        interval_seconds.max(MIN_REMOTE_REFRESH_INTERVAL_SECONDS)
+    }
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_remote_refreshes_keep_a_six_hour_floor() {
+        let subscription = SubscriptionInput {
+            interval_seconds: Some(60),
+            ..SubscriptionInput::default()
+        };
+        assert_eq!(
+            subscription.interval_seconds(),
+            MIN_REMOTE_REFRESH_INTERVAL_SECONDS
+        );
+
+        let legacy_subscription = SubscriptionInput {
+            interval: Some(1),
+            ..SubscriptionInput::default()
+        };
+        assert_eq!(
+            legacy_subscription.interval_seconds(),
+            MIN_REMOTE_REFRESH_INTERVAL_SECONDS
+        );
+
+        let rule_set = RuleSetInput {
+            interval_seconds: Some(300),
+            ..RuleSetInput::default()
+        };
+        assert_eq!(
+            rule_set.interval_seconds(),
+            MIN_REMOTE_REFRESH_INTERVAL_SECONDS
+        );
+    }
+
+    #[test]
+    fn zero_still_disables_automatic_remote_refreshes() {
+        let subscription = SubscriptionInput {
+            interval_seconds: Some(0),
+            ..SubscriptionInput::default()
+        };
+        let rule_set = RuleSetInput {
+            interval_seconds: Some(0),
+            ..RuleSetInput::default()
+        };
+        assert_eq!(subscription.interval_seconds(), 0);
+        assert_eq!(rule_set.interval_seconds(), 0);
     }
 }
 
@@ -537,6 +671,10 @@ pub struct RuleSetResponse {
     pub last_update: Option<String>,
     #[serde(rename = "lastError")]
     pub last_error: Option<String>,
+    #[serde(rename = "downloadRoute")]
+    pub download_route: DownloadRoute,
+    #[serde(rename = "lastRoute")]
+    pub last_route: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -574,6 +712,102 @@ pub struct ConnectionResponse {
     pub rule: Option<String>,
     pub policy: Option<String>,
     pub speed: String,
+    pub network: Option<String>,
+    #[serde(rename = "type")]
+    pub connection_type: Option<String>,
+    #[serde(rename = "sourceIp")]
+    pub source_ip: Option<String>,
+    #[serde(rename = "sourcePort")]
+    pub source_port: Option<String>,
+    #[serde(rename = "destinationIp")]
+    pub destination_ip: Option<String>,
+    #[serde(rename = "destinationPort")]
+    pub destination_port: Option<String>,
+    pub process: Option<String>,
+    pub start: Option<String>,
+    pub upload: u64,
+    pub download: u64,
+    pub chains: Vec<String>,
+    #[serde(rename = "rulePayload")]
+    pub rule_payload: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManualNodeInput {
+    pub name: String,
+    pub config: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManualNodeResponse {
+    pub name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    #[serde(rename = "type")]
+    pub protocol: String,
+    pub config: Value,
+    pub latency: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WebDavSettingsInput {
+    pub endpoint: String,
+    pub username: String,
+    pub password: Option<String>,
+    #[serde(alias = "remotePath")]
+    pub remote_path: String,
+    pub enabled: bool,
+    #[serde(alias = "autoSync")]
+    pub auto_sync: bool,
+    #[serde(alias = "intervalHours")]
+    pub interval_hours: u64,
+    pub retention: usize,
+}
+
+impl Default for WebDavSettingsInput {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            username: String::new(),
+            password: None,
+            remote_path: "rweb-clash".into(),
+            enabled: false,
+            auto_sync: false,
+            interval_hours: 24,
+            retention: 7,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WebDavSettingsResponse {
+    pub endpoint: String,
+    pub username: String,
+    #[serde(rename = "passwordConfigured")]
+    pub password_configured: bool,
+    #[serde(rename = "remotePath")]
+    pub remote_path: String,
+    pub enabled: bool,
+    #[serde(rename = "autoSync")]
+    pub auto_sync: bool,
+    #[serde(rename = "intervalHours")]
+    pub interval_hours: u64,
+    pub retention: usize,
+    #[serde(rename = "lastSync")]
+    pub last_sync: Option<String>,
+    #[serde(rename = "lastError")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupResponse {
+    pub name: String,
+    pub size: u64,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    #[serde(rename = "remoteAvailable")]
+    pub remote_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -600,6 +834,10 @@ pub struct SetupStatusResponse {
     pub has_subscriptions: bool,
     #[serde(rename = "subscriptionCount")]
     pub subscription_count: usize,
+    #[serde(rename = "hasSources")]
+    pub has_sources: bool,
+    #[serde(rename = "manualNodeCount")]
+    pub manual_node_count: usize,
     #[serde(rename = "coreReady")]
     pub core_ready: bool,
     #[serde(rename = "corePath")]
