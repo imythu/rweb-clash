@@ -2,6 +2,8 @@ use crate::error::AppError;
 use crate::paths::AppPaths;
 use crate::storage::Storage;
 use crate::types::CoreStatusResponse;
+#[cfg(any(target_os = "macos", test))]
+use crate::util::content_hash;
 use crate::util::{now_iso, parse_host_from_log};
 use axum::http::StatusCode;
 use std::process::Stdio;
@@ -12,9 +14,18 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 
+#[cfg(any(target_os = "macos", test))]
+use tokio::io::AsyncReadExt;
+#[cfg(any(target_os = "macos", test))]
+use tokio::net::tcp::OwnedWriteHalf;
+#[cfg(any(target_os = "macos", test))]
+use tokio::net::TcpListener;
+
 const DEFAULT_MIHOMO_VALIDATION_TIMEOUT_SECS: u64 = 120;
 const MAX_MIHOMO_VALIDATION_TIMEOUT_SECS: u64 = 3_600;
 const MIHOMO_VALIDATION_TIMEOUT_ENV: &str = "RWEB_CLASH_MIHOMO_VALIDATION_TIMEOUT_SECS";
+#[cfg(any(target_os = "macos", test))]
+const MACOS_TUN_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn mihomo_command(binary: &std::path::Path) -> Command {
     #[cfg(target_os = "windows")]
@@ -39,7 +50,16 @@ struct CoreInner {
     storage: Storage,
     operation: Mutex<()>,
     child: Mutex<Option<Child>>,
+    #[cfg(any(target_os = "macos", test))]
+    macos_tun: Mutex<Option<MacosTunSession>>,
     status: RwLock<CoreStatus>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+struct MacosTunSession {
+    stop_path: std::path::PathBuf,
+    _bridge: OwnedWriteHalf,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +94,7 @@ pub struct CoreStartConfig {
     pub runtime_yaml: std::path::PathBuf,
     pub runtime_dir: std::path::PathBuf,
     pub log_level: String,
+    pub tun: bool,
 }
 
 impl CoreManager {
@@ -83,6 +104,8 @@ impl CoreManager {
                 storage,
                 operation: Mutex::new(()),
                 child: Mutex::new(None),
+                #[cfg(any(target_os = "macos", test))]
+                macos_tun: Mutex::new(None),
                 status: RwLock::new(CoreStatus::default()),
             }),
         }
@@ -160,47 +183,15 @@ impl CoreManager {
         }
 
         let version = self.binary_version(&config.mihomo_binary).await;
-        let mut command = mihomo_command(&config.mihomo_binary);
-        command
-            .arg("-d")
-            .arg(&config.runtime_dir)
-            .arg("-f")
-            .arg(&config.runtime_yaml)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
+        let pid = match self.spawn_core_process(&config).await {
+            Ok(pid) => pid,
             Err(error) => {
-                let error = AppError::from(error);
                 self.mark_error(config.controller_addr.clone(), &error.message)
                     .await;
                 return Err(error);
             }
         };
-        let pid = child.id();
         info!(pid = ?pid, version = ?version, "mihomo process spawned");
-        if let Some(stdout) = child.stdout.take() {
-            self.spawn_log_reader(
-                stdout,
-                "info".into(),
-                "mihomo-stdout".into(),
-                config.log_level.clone(),
-            );
-        }
-        if let Some(stderr) = child.stderr.take() {
-            self.spawn_log_reader(
-                stderr,
-                "warning".into(),
-                "mihomo-stderr".into(),
-                config.log_level.clone(),
-            );
-        }
-        {
-            let mut guard = self.inner.child.lock().await;
-            *guard = Some(child);
-        }
 
         if let Err(err) = self.wait_for_startup(&config).await {
             self.terminate_tracked_child().await;
@@ -219,6 +210,276 @@ impl CoreManager {
         })
         .await;
         Ok(self.snapshot(config.controller_addr).await)
+    }
+
+    async fn spawn_core_process(&self, config: &CoreStartConfig) -> Result<Option<u32>, AppError> {
+        #[cfg(target_os = "macos")]
+        if config.tun {
+            return self.spawn_macos_tun_process(config).await;
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = config.tun;
+
+        let mut command = mihomo_command(&config.mihomo_binary);
+        command
+            .arg("-d")
+            .arg(&config.runtime_dir)
+            .arg("-f")
+            .arg(&config.runtime_yaml)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = command.spawn().map_err(AppError::from)?;
+        let pid = child.id();
+        if let Some(stdout) = child.stdout.take() {
+            self.spawn_log_reader(
+                stdout,
+                "info".into(),
+                "mihomo-stdout".into(),
+                config.log_level.clone(),
+            );
+        }
+        if let Some(stderr) = child.stderr.take() {
+            self.spawn_log_reader(
+                stderr,
+                "warning".into(),
+                "mihomo-stderr".into(),
+                config.log_level.clone(),
+            );
+        }
+        let mut guard = self.inner.child.lock().await;
+        *guard = Some(child);
+        Ok(pid)
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    async fn spawn_macos_tun_process(
+        &self,
+        config: &CoreStartConfig,
+    ) -> Result<Option<u32>, AppError> {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .map_err(macos_tun_setup_error)?;
+        let port = listener.local_addr().map_err(macos_tun_setup_error)?.port();
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let stop_path = std::env::temp_dir().join(format!(
+            "rweb-clash-tun-stop-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let binary_hash = content_hash(tokio::fs::read(&config.mihomo_binary).await?);
+        let runtime_hash = content_hash(tokio::fs::read(&config.runtime_yaml).await?);
+        let geoip_path = config.runtime_dir.join("geoip.metadb");
+        let geoip_hash = match tokio::fs::read(&geoip_path).await {
+            Ok(bytes) => Some(content_hash(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(AppError::from(error)),
+        };
+        let shell = macos_tun_shell_command(
+            config,
+            &MacosTunShellParams {
+                port,
+                token: &token,
+                stop_path: &stop_path,
+                owner_pid: std::process::id(),
+                binary_hash: &binary_hash,
+                runtime_hash: &runtime_hash,
+                geoip_hash: geoip_hash.as_deref(),
+            },
+        )?;
+        let script = format!(
+            "do shell script \"{}\" with administrator privileges",
+            escape_applescript_string(&shell)
+        );
+        let mut command = Command::new("/usr/bin/osascript");
+        command
+            .args(["-e", &script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|error| {
+            AppError::service_unavailable(
+                "tun_authorization_failed",
+                format!("failed to request macOS administrator authorization for TUN: {error}"),
+            )
+        })?;
+
+        let deadline = tokio::time::Instant::now() + MACOS_TUN_AUTHORIZATION_TIMEOUT;
+        let (log_reader, bridge, pid) = loop {
+            if let Some(status) = child.try_wait().map_err(AppError::from)? {
+                let detail = macos_authorization_output(&mut child).await;
+                return Err(AppError::service_unavailable(
+                    "tun_authorization_failed",
+                    if detail.is_empty() {
+                        format!("macOS administrator authorization for TUN exited with {status}")
+                    } else {
+                        format!("macOS administrator authorization for TUN failed: {detail}")
+                    },
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let _ = child.kill().await;
+                return Err(AppError::service_unavailable(
+                    "tun_authorization_failed",
+                    "timed out waiting for macOS administrator authorization for TUN",
+                ));
+            }
+
+            let (stream, _) =
+                match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+                    Ok(Ok(accepted)) => accepted,
+                    Ok(Err(error)) => {
+                        let _ = child.kill().await;
+                        return Err(macos_tun_setup_error(error));
+                    }
+                    Err(_) => continue,
+                };
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut received_token = String::new();
+            let mut received_pid = String::new();
+            let handshake = tokio::time::timeout(Duration::from_secs(2), async {
+                reader.read_line(&mut received_token).await?;
+                reader.read_line(&mut received_pid).await
+            })
+            .await;
+            if !matches!(handshake, Ok(Ok(_))) || received_token.trim() != token {
+                continue;
+            }
+            let Ok(pid) = received_pid.trim().parse::<u32>() else {
+                continue;
+            };
+            if pid == 0 {
+                continue;
+            }
+            break (reader, write_half, pid);
+        };
+
+        if let Some(stdout) = child.stdout.take() {
+            self.spawn_log_reader(
+                stdout,
+                "info".into(),
+                "macos-tun-authorization".into(),
+                config.log_level.clone(),
+            );
+        }
+        if let Some(stderr) = child.stderr.take() {
+            self.spawn_log_reader(
+                stderr,
+                "warning".into(),
+                "macos-tun-authorization".into(),
+                config.log_level.clone(),
+            );
+        }
+        self.spawn_log_reader(
+            log_reader,
+            "info".into(),
+            "mihomo-stdout".into(),
+            config.log_level.clone(),
+        );
+        {
+            let mut guard = self.inner.child.lock().await;
+            *guard = Some(child);
+        }
+        {
+            let mut guard = self.inner.macos_tun.lock().await;
+            *guard = Some(MacosTunSession {
+                stop_path,
+                _bridge: bridge,
+            });
+        }
+        Ok(Some(pid))
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    async fn signal_macos_tun_stop(&self) -> Option<std::path::PathBuf> {
+        let session = {
+            let mut guard = self.inner.macos_tun.lock().await;
+            guard.take()
+        }?;
+        let stop_path = session.stop_path.clone();
+        drop(session);
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stop_path)
+            .await
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => warn!(
+                path = %AppPaths::display(&stop_path),
+                error = %error,
+                "failed to create macOS TUN stop marker; closing the log bridge instead"
+            ),
+        }
+        Some(stop_path)
+    }
+
+    async fn stop_child_process(&self, child: &mut Child) -> Result<(), AppError> {
+        let pid = child.id();
+        #[cfg(target_os = "macos")]
+        let stop_path = self.signal_macos_tun_stop().await;
+        #[cfg(target_os = "macos")]
+        let graceful = stop_path.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let graceful = false;
+
+        let result = if graceful {
+            info!(pid = ?pid, "requesting privileged mihomo process shutdown");
+            match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+                Ok(Ok(status)) => {
+                    info!(pid = ?pid, %status, "privileged mihomo process stopped");
+                    Ok(())
+                }
+                Ok(Err(error)) => {
+                    warn!(pid = ?pid, error = %error, "failed waiting for privileged mihomo process");
+                    Ok(())
+                }
+                Err(_) => {
+                    warn!(pid = ?pid, "privileged mihomo shutdown timed out; terminating authorization process");
+                    if child.try_wait().map_err(AppError::from)?.is_none() {
+                        child.kill().await.map_err(AppError::from)?;
+                    }
+                    match child.wait().await {
+                        Ok(status) => {
+                            info!(pid = ?pid, %status, "authorization process terminated")
+                        }
+                        Err(error) => {
+                            warn!(pid = ?pid, error = %error, "failed waiting for authorization process")
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        } else {
+            if child.try_wait().map_err(AppError::from)?.is_none() {
+                info!(pid = ?pid, "killing mihomo process");
+                child.kill().await.map_err(AppError::from)?;
+            }
+            match child.wait().await {
+                Ok(status) => info!(pid = ?pid, %status, "mihomo process stopped"),
+                Err(error) => {
+                    warn!(pid = ?pid, error = %error, "failed waiting for mihomo process")
+                }
+            }
+            Ok(())
+        };
+
+        #[cfg(target_os = "macos")]
+        if let Some(stop_path) = stop_path {
+            if let Err(error) = tokio::fs::remove_file(&stop_path).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        path = %AppPaths::display(&stop_path),
+                        error = %error,
+                        "failed to remove macOS TUN stop marker"
+                    );
+                }
+            }
+        }
+        result
     }
 
     pub async fn stop(&self, controller_addr: String) -> Result<CoreStatusResponse, AppError> {
@@ -243,17 +504,11 @@ impl CoreManager {
             guard.take()
         };
         if let Some(mut child) = child {
-            let pid = child.id();
-            if child.try_wait().map_err(AppError::from)?.is_none() {
-                info!(pid = ?pid, "killing mihomo process");
-                child.kill().await.map_err(AppError::from)?;
-            }
-            match child.wait().await {
-                Ok(status) => info!(pid = ?pid, %status, "mihomo process stopped"),
-                Err(err) => warn!(pid = ?pid, error = %err, "failed waiting for mihomo process"),
-            }
+            self.stop_child_process(&mut child).await?;
         } else {
             info!("core stop requested, no child process was tracked");
+            #[cfg(target_os = "macos")]
+            self.clear_macos_tun_session().await;
         }
 
         self.set_status(CoreStatus {
@@ -338,17 +593,45 @@ impl CoreManager {
     async fn tracked_child_exit_status(
         &self,
     ) -> Result<Option<std::process::ExitStatus>, AppError> {
-        let mut guard = self.inner.child.lock().await;
-        if let Some(mut child) = guard.take() {
-            match child.try_wait().map_err(AppError::from)? {
-                Some(status) => Ok(Some(status)),
-                None => {
-                    *guard = Some(child);
-                    Ok(None)
+        let status = {
+            let mut guard = self.inner.child.lock().await;
+            if let Some(mut child) = guard.take() {
+                match child.try_wait().map_err(AppError::from)? {
+                    Some(status) => Some(status),
+                    None => {
+                        *guard = Some(child);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        #[cfg(target_os = "macos")]
+        if status.is_some() {
+            self.clear_macos_tun_session().await;
+        }
+        Ok(status)
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    async fn clear_macos_tun_session(&self) {
+        let session = {
+            let mut guard = self.inner.macos_tun.lock().await;
+            guard.take()
+        };
+        if let Some(session) = session {
+            let stop_path = session.stop_path.clone();
+            drop(session);
+            if let Err(error) = tokio::fs::remove_file(&stop_path).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        path = %AppPaths::display(&stop_path),
+                        error = %error,
+                        "failed to remove stale macOS TUN stop marker"
+                    );
                 }
             }
-        } else {
-            Ok(None)
         }
     }
 
@@ -358,18 +641,12 @@ impl CoreManager {
             guard.take()
         };
         if let Some(mut child) = child {
-            let pid = child.id();
-            if matches!(child.try_wait(), Ok(None)) {
-                let _ = child.kill().await;
+            if let Err(error) = self.stop_child_process(&mut child).await {
+                warn!(error = %error, "failed terminating mihomo after failed startup");
             }
-            match child.wait().await {
-                Ok(status) => {
-                    info!(pid = ?pid, %status, "mihomo process terminated after failed startup")
-                }
-                Err(err) => {
-                    warn!(pid = ?pid, error = %err, "failed waiting for mihomo after failed startup")
-                }
-            }
+        } else {
+            #[cfg(target_os = "macos")]
+            self.clear_macos_tun_session().await;
         }
     }
 
@@ -408,6 +685,8 @@ impl CoreManager {
             }
         };
         if let Some(status) = exited {
+            #[cfg(target_os = "macos")]
+            self.clear_macos_tun_session().await;
             let message = format!("mihomo exited unexpectedly with status {status}");
             warn!(%status, "tracked mihomo process exited unexpectedly");
             self.mark_error(controller_addr, &message).await;
@@ -474,6 +753,142 @@ impl CoreManager {
             }
         });
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_tun_setup_error(error: impl std::fmt::Display) -> AppError {
+    AppError::service_unavailable(
+        "tun_authorization_failed",
+        format!("failed to prepare macOS administrator authorization for TUN: {error}"),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn macos_authorization_output(child: &mut Child) -> String {
+    let mut parts = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let mut text = String::new();
+        if stderr.read_to_string(&mut text).await.is_ok() && !text.trim().is_empty() {
+            parts.push(text.trim().to_string());
+        }
+    }
+    if let Some(mut stdout) = child.stdout.take() {
+        let mut text = String::new();
+        if stdout.read_to_string(&mut text).await.is_ok() && !text.trim().is_empty() {
+            parts.push(text.trim().to_string());
+        }
+    }
+    parts.join("; ")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn escape_applescript_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct MacosTunShellParams<'a> {
+    port: u16,
+    token: &'a str,
+    stop_path: &'a std::path::Path,
+    owner_pid: u32,
+    binary_hash: &'a str,
+    runtime_hash: &'a str,
+    geoip_hash: Option<&'a str>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_tun_shell_command(
+    config: &CoreStartConfig,
+    params: &MacosTunShellParams<'_>,
+) -> Result<String, AppError> {
+    fn quoted_path(path: &std::path::Path, label: &str) -> Result<String, AppError> {
+        if !path.is_absolute() {
+            return Err(AppError::bad_request(
+                "tun_path_invalid",
+                format!(
+                    "macOS TUN {label} path must be absolute: {}",
+                    path.display()
+                ),
+            ));
+        }
+        let value = path.to_str().ok_or_else(|| {
+            AppError::bad_request(
+                "tun_path_invalid",
+                format!(
+                    "macOS TUN {label} path is not valid UTF-8: {}",
+                    path.display()
+                ),
+            )
+        })?;
+        Ok(shell_single_quote(value))
+    }
+
+    let binary = quoted_path(&config.mihomo_binary, "binary")?;
+    let runtime_yaml = quoted_path(&config.runtime_yaml, "runtime config")?;
+    let stop_path = quoted_path(params.stop_path, "stop marker")?;
+    let token = shell_single_quote(params.token);
+    let binary_hash = shell_single_quote(params.binary_hash);
+    let runtime_hash = shell_single_quote(params.runtime_hash);
+    let geoip_stage = if let Some(geoip_hash) = params.geoip_hash {
+        let geoip_database =
+            quoted_path(&config.runtime_dir.join("geoip.metadb"), "GeoIP database")?;
+        let geoip_hash = shell_single_quote(geoip_hash);
+        format!(
+            concat!(
+                "/bin/cp {geoip_database} \"$runtime_home/geoip.metadb\" || exit 1; ",
+                "[ \"$(/usr/bin/shasum -a 256 \"$runtime_home/geoip.metadb\" | /usr/bin/awk '{{print $1}}')\" = {geoip_hash} ] || exit 1; "
+            ),
+            geoip_database = geoip_database,
+            geoip_hash = geoip_hash,
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        concat!(
+            "core_pid=''; bridge_pid=''; requested_stop=0; ",
+            "tmpdir=$(/usr/bin/mktemp -d /private/tmp/rweb-clash-tun.XXXXXX) || exit 1; ",
+            "cleanup() {{ ",
+            "if [ -n \"$core_pid\" ] && /bin/kill -0 \"$core_pid\" 2>/dev/null; then /bin/kill -TERM \"$core_pid\" 2>/dev/null || true; fi; ",
+            "if [ -n \"$bridge_pid\" ]; then /bin/kill \"$bridge_pid\" 2>/dev/null || true; fi; ",
+            "/bin/rm -rf \"$tmpdir\"; ",
+            "}}; ",
+            "trap cleanup EXIT; trap 'requested_stop=1; exit 0' HUP INT TERM; ",
+            "fifo=\"$tmpdir/log\"; /usr/bin/mkfifo \"$fifo\" || exit 1; ",
+            "runtime_home=\"$tmpdir/home\"; /bin/mkdir -m 700 \"$runtime_home\" || exit 1; ",
+            "/bin/cp {binary} \"$runtime_home/mihomo\" || exit 1; ",
+            "[ \"$(/usr/bin/shasum -a 256 \"$runtime_home/mihomo\" | /usr/bin/awk '{{print $1}}')\" = {binary_hash} ] || exit 1; ",
+            "/bin/chmod 700 \"$runtime_home/mihomo\" || exit 1; ",
+            "/bin/cp {runtime_yaml} \"$runtime_home/runtime.yaml\" || exit 1; ",
+            "[ \"$(/usr/bin/shasum -a 256 \"$runtime_home/runtime.yaml\" | /usr/bin/awk '{{print $1}}')\" = {runtime_hash} ] || exit 1; ",
+            "{geoip_stage}",
+            "\"$runtime_home/mihomo\" -d \"$runtime_home\" -f \"$runtime_home/runtime.yaml\" >\"$fifo\" 2>&1 & core_pid=$!; ",
+            "( /usr/bin/printf '%s\\n%s\\n' {token} \"$core_pid\"; /bin/cat \"$fifo\"; ) | /usr/bin/nc 127.0.0.1 {port} & bridge_pid=$!; ",
+            "while /bin/kill -0 \"$core_pid\" 2>/dev/null; do ",
+            "if ! /bin/kill -0 {owner_pid} 2>/dev/null || ! /bin/kill -0 \"$bridge_pid\" 2>/dev/null || [ -e {stop_path} ]; then ",
+            "requested_stop=1; /bin/kill -TERM \"$core_pid\" 2>/dev/null || true; break; fi; ",
+            "/bin/sleep 0.2; done; ",
+            "core_status=0; wait \"$core_pid\" || core_status=$?; ",
+            "/bin/kill \"$bridge_pid\" 2>/dev/null || true; wait \"$bridge_pid\" 2>/dev/null || true; ",
+            "bridge_pid=''; core_pid=''; ",
+            "if [ \"$requested_stop\" -eq 1 ]; then exit 0; fi; exit \"$core_status\""
+        ),
+        binary = binary,
+        runtime_yaml = runtime_yaml,
+        binary_hash = binary_hash,
+        runtime_hash = runtime_hash,
+        geoip_stage = geoip_stage,
+        token = token,
+        port = params.port,
+        owner_pid = params.owner_pid,
+        stop_path = stop_path,
+    ))
 }
 
 fn detected_log_level(line: &str, fallback: &str) -> String {
@@ -643,6 +1058,75 @@ mod tests {
         assert_eq!(validation_timeout_seconds(Some("not-a-number")), 120);
     }
 
+    #[test]
+    fn macos_tun_shell_values_are_quoted_for_shell_and_applescript() {
+        let _ = CoreManager::spawn_macos_tun_process;
+        let _ = CoreManager::signal_macos_tun_stop;
+        let _ = CoreManager::clear_macos_tun_session;
+
+        assert_eq!(shell_single_quote("a'b"), r#"'a'\''b'"#);
+        assert_eq!(escape_applescript_string(r#"a\b\"c"#), r#"a\\b\\\"c"#);
+
+        let root = std::env::current_dir()
+            .expect("current directory")
+            .join("macos tun 'fixture'");
+        let config = CoreStartConfig {
+            controller_addr: "127.0.0.1:9090".into(),
+            controller_secret: String::new(),
+            controller_enabled: true,
+            mihomo_binary: root.join("mihomo"),
+            runtime_yaml: root.join("runtime.yaml"),
+            runtime_dir: root.join("profiles"),
+            log_level: "info".into(),
+            tun: true,
+        };
+        let stop_path = root.join("stop");
+        let command = macos_tun_shell_command(
+            &config,
+            &MacosTunShellParams {
+                port: 32123,
+                token: "abc'def",
+                stop_path: &stop_path,
+                owner_pid: 42,
+                binary_hash: &"a".repeat(64),
+                runtime_hash: &"b".repeat(64),
+                geoip_hash: Some(&"c".repeat(64)),
+            },
+        )
+        .expect("build privileged shell command");
+
+        assert!(command.contains(&shell_single_quote(
+            config.mihomo_binary.to_str().expect("binary path")
+        )));
+        assert!(command.contains(&shell_single_quote(
+            config.runtime_yaml.to_str().expect("runtime path")
+        )));
+        assert!(command.contains(&shell_single_quote(
+            config
+                .runtime_dir
+                .join("geoip.metadb")
+                .to_str()
+                .expect("GeoIP path")
+        )));
+        assert!(command.contains(r#""$runtime_home/mihomo" -d "$runtime_home""#));
+        assert!(command.contains("/usr/bin/shasum -a 256"));
+        assert!(command.contains("/usr/bin/nc 127.0.0.1 32123"));
+        assert!(command.contains("/bin/kill -0 42"));
+        assert!(command.contains(r#"! /bin/kill -0 "$bridge_pid""#));
+        assert!(command.contains(r#"[ -e "#));
+        assert!(command.contains(r#"/bin/kill -TERM "$core_pid""#));
+        assert!(command.contains("trap cleanup EXIT"));
+        assert!(command.contains(&shell_single_quote("abc'def")));
+        assert!(command.contains(&shell_single_quote(stop_path.to_str().expect("stop path"))));
+
+        #[cfg(unix)]
+        assert!(std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", &command])
+            .status()
+            .expect("parse privileged shell command")
+            .success());
+    }
+
     #[tokio::test]
     async fn invalid_restart_candidate_preserves_running_status() {
         let temp = TestDir::new("core-restart-validation");
@@ -672,6 +1156,7 @@ mod tests {
                 runtime_yaml: temp.path().join("missing-runtime.yaml"),
                 runtime_dir: paths.profiles_dir,
                 log_level: "info".into(),
+                tun: false,
             })
             .await
             .expect_err("invalid candidate must be rejected");
@@ -707,6 +1192,7 @@ mod tests {
                     runtime_yaml: paths.runtime_yaml,
                     runtime_dir: paths.profiles_dir,
                     log_level: "info".into(),
+                    tun: false,
                 },
                 true,
             )

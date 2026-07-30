@@ -28,16 +28,13 @@ security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain
 
 security find-identity -v -p codesigning "$keychain_path"
 
-if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
-  echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
-  echo "Using configured Apple signing identity: $APPLE_SIGNING_IDENTITY"
-  exit 0
+identity="${APPLE_SIGNING_IDENTITY:-}"
+if [[ -z "$identity" ]]; then
+  identity="$(
+    security find-identity -v -p codesigning "$keychain_path" |
+      awk -F'"' '/Developer ID Application/ { print $2; exit }'
+  )"
 fi
-
-identity="$(
-  security find-identity -v -p codesigning "$keychain_path" |
-    awk -F'"' '/Developer ID Application/ { print $2; exit }'
-)"
 if [[ -z "$identity" ]]; then
   identity="$(
     security find-identity -v -p codesigning "$keychain_path" |
@@ -57,3 +54,13 @@ fi
 
 echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
 echo "Configured Apple signing identity: $identity"
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+core_path="$repo_root/apps/desktop/src-tauri/resources/core/mihomo"
+if [[ ! -x "$core_path" ]]; then
+  echo "Packaged macOS Mihomo core is missing or not executable: $core_path" >&2
+  exit 1
+fi
+/usr/bin/codesign --force --timestamp --options runtime --sign "$identity" "$core_path"
+/usr/bin/codesign --verify --strict --verbose=2 "$core_path"
+echo "Signed packaged macOS Mihomo core: $core_path"

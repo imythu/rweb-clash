@@ -251,6 +251,11 @@ Assert-Contains ("name:\s*Build signed macOS bundles\s*\r?\n\s*if:\s*" + $manual
 if ((Get-Content -LiteralPath (Join-Path $repoRoot "scripts/configure-macos-signing.sh") -Raw) -notmatch "APPLE_SIGNING_IDENTITY=.*GITHUB_ENV") {
   throw "macOS signing setup must export APPLE_SIGNING_IDENTITY through GITHUB_ENV"
 }
+$macosSigningScript = Get-Content -LiteralPath (Join-Path $repoRoot "scripts/configure-macos-signing.sh") -Raw
+if ($macosSigningScript -notmatch 'codesign[\s\S]*resources/core/mihomo' -and
+    $macosSigningScript -notmatch 'resources/core/mihomo[\s\S]*codesign') {
+  throw "macOS signing setup must sign the packaged Mihomo core"
+}
 
 Assert-Contains "package_target:\s*windows-amd64" "Windows amd64 Tauri target"
 Assert-Contains "rust_target:\s*x86_64-pc-windows-msvc" "Windows amd64 Rust target"

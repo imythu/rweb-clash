@@ -694,7 +694,22 @@ async fn validate_tun_permissions_inner() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", not(any(target_os = "windows", unix))))]
+#[cfg(target_os = "macos")]
+async fn validate_tun_permissions_inner() -> Result<(), String> {
+    for tool in ["/usr/bin/osascript", "/usr/bin/nc", "/usr/bin/mkfifo"] {
+        let metadata = tokio::fs::metadata(tool)
+            .await
+            .map_err(|error| format!("macOS TUN authorization requires {tool}: {error}"))?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "macOS TUN authorization requires {tool} to be a regular file"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "windows", unix)))]
 async fn validate_tun_permissions_inner() -> Result<(), String> {
     Ok(())
 }

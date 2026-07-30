@@ -1480,6 +1480,7 @@ impl App {
             runtime_yaml,
             runtime_dir: self.inner.paths.profiles_dir.clone(),
             log_level: config.log_level.clone(),
+            tun: config.tun,
         }
     }
 
@@ -1548,15 +1549,21 @@ impl App {
                 runtime_yaml = %AppPaths::display(&path),
                 "reloading core runtime config"
             );
-            if controller
-                .reload_config(&AppPaths::display(&path))
-                .await
-                .is_ok()
+            let requires_restart = runtime_change_requires_restart(config, controller_config);
+            if !requires_restart
+                && controller
+                    .reload_config(&AppPaths::display(&path))
+                    .await
+                    .is_ok()
             {
                 self.synchronize_proxy_selections(config, false).await?;
                 return Ok(false);
             }
-            warn!("controller reload failed, restarting mihomo");
+            if requires_restart {
+                info!("TUN mode requires a mihomo restart");
+            } else {
+                warn!("controller reload failed, restarting mihomo");
+            }
             if config.tun {
                 validate_tun_permissions().await?;
             }
@@ -1966,6 +1973,10 @@ fn egress_proxy_url(core_state: &str, mixed_port: u16) -> Option<String> {
 
 fn requires_early_system_proxy_persist(current: &SystemConfig, attempted: &SystemConfig) -> bool {
     current.system_proxy != attempted.system_proxy
+}
+
+fn runtime_change_requires_restart(current: &SystemConfig, attempted: &SystemConfig) -> bool {
+    current.tun || attempted.tun
 }
 
 fn system_proxy_recovery_required(config: &SystemConfig, backup_found: bool) -> bool {
@@ -2448,6 +2459,18 @@ mod tests {
             ..SystemConfig::default()
         };
         assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn changing_tun_mode_requires_a_core_restart() {
+        let current = SystemConfig::default();
+        let mut attempted = current.clone();
+        assert!(!runtime_change_requires_restart(&current, &attempted));
+
+        attempted.tun = true;
+        assert!(runtime_change_requires_restart(&current, &attempted));
+        assert!(runtime_change_requires_restart(&attempted, &current));
+        assert!(runtime_change_requires_restart(&attempted, &attempted));
     }
 
     #[test]
