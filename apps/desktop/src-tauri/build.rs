@@ -17,9 +17,8 @@ fn generate_embedded_core() {
     let core_path = manifest_dir.join("resources/core").join(file_name);
     println!("cargo:rerun-if-changed={}", core_path.display());
 
-    let mut output = String::from(
-        "static DESKTOP_EMBEDDED_FILES: &[rweb_clash::EmbeddedFile] = &[\n",
-    );
+    let mut output =
+        String::from("static DESKTOP_EMBEDDED_FILES: &[rweb_clash::EmbeddedFile] = &[\n");
     if core_path.is_file() {
         output.push_str("    rweb_clash::EmbeddedFile { path: ");
         output.push_str(&format!("{:?}", format!("core/{file_name}")));
