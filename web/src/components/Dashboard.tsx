@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, type ReactNode } from 'react';
 import { 
   ArrowUp, 
   ArrowDown, 
@@ -17,7 +17,8 @@ import {
   Power,
   Play,
   RotateCw,
-  Square
+  Square,
+  Info,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { cn } from "@/lib/utils";
@@ -111,11 +112,13 @@ const MasterSwitch = ({
   label,
   active,
   onClick,
+  accessory,
 }: {
   icon: LucideIcon;
   label: string;
   active?: boolean;
   onClick: () => void;
+  accessory?: ReactNode;
 }) => (
   <div 
     onClick={onClick}
@@ -129,7 +132,10 @@ const MasterSwitch = ({
         <Icon className="size-5 md:size-7" />
       </div>
       <div className="flex flex-col">
-        <span className="text-sm md:text-lg font-black uppercase tracking-tight">{label}</span>
+        <div className="flex items-center gap-1.5 text-sm md:text-lg font-black uppercase tracking-tight">
+          <span>{label}</span>
+          {accessory}
+        </div>
         <span className={cn("text-[10px] md:text-xs font-bold uppercase", active ? "text-green-500" : "text-muted-foreground")}>
           {active ? 'Active' : 'Disabled'}
         </span>
@@ -147,6 +153,61 @@ const MasterSwitch = ({
     </div>
   </div>
 );
+
+const TunHelpBadge = () => {
+  const [hovered, setHovered] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const open = hovered || pinned;
+
+  useEffect(() => {
+    if (!pinned) return;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setPinned(false);
+    };
+    document.addEventListener('pointerdown', closeOnOutsideClick);
+    return () => document.removeEventListener('pointerdown', closeOnOutsideClick);
+  }, [pinned]);
+
+  return (
+    <div
+      ref={rootRef}
+      className="relative normal-case"
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      onClick={(event) => {
+        event.stopPropagation();
+        setPinned((value) => !value);
+      }}
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') setPinned(false);
+      }}
+    >
+      <button
+        type="button"
+        aria-label="查看 TUN 开启条件"
+        aria-expanded={open}
+        className="flex size-5 items-center justify-center rounded-full border border-primary/30 bg-primary/10 text-primary hover:bg-primary/20"
+      >
+        <Info className="size-3" />
+      </button>
+      {open && (
+        <div
+          role="tooltip"
+          onClick={(event) => event.stopPropagation()}
+          className="absolute left-1/2 top-7 z-50 w-[min(20rem,calc(100vw-2rem))] -translate-x-1/2 rounded-lg border bg-popover p-4 text-left text-popover-foreground shadow-xl xl:left-0 xl:translate-x-0"
+        >
+          <p className="mb-3 text-sm font-bold">TUN 开启条件</p>
+          <div className="space-y-3 text-xs font-normal leading-5 text-muted-foreground">
+            <p><strong className="text-foreground">Windows：</strong>需要管理员权限。请以管理员身份重新启动 rweb-clash。</p>
+            <p><strong className="text-foreground">Linux：</strong>需要 <code>CAP_NET_ADMIN</code>，以及可读写的 <code>/dev/net/tun</code> 字符设备。容器需添加 <code>NET_ADMIN</code> 并映射该设备；宿主缺少设备时先执行 <code>sudo modprobe tun</code>。</p>
+            <p><strong className="text-foreground">macOS：</strong>需要系统管理员授权，并确保系统自带的授权辅助工具可用；开启时请完成系统弹出的授权。</p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
 
 type CoreAction = 'start' | 'stop' | 'restart';
 
@@ -451,17 +512,34 @@ export const Dashboard = () => {
     }
   }, [coreStatus?.state, fetchEgress]);
 
+  const applyConfigUpdate = async (updates: Partial<SystemConfig>) => {
+    const nextConfig = await api.patchConfig(updates);
+    setConfig(nextConfig);
+    if (updates.mode) setActiveMode(updates.mode);
+    await Promise.all([fetchStatus(true), fetchEgress(true)]);
+    toast('状态同步成功', 'success');
+  };
+
   const updateConfig = async (updates: Partial<SystemConfig>) => {
     if (configUpdateInFlight.current) return;
     configUpdateInFlight.current = true;
     try {
-      const nextConfig = await api.patchConfig(updates);
-      setConfig(nextConfig);
-      if (updates.mode) setActiveMode(updates.mode);
-      await Promise.all([fetchStatus(true), fetchEgress(true)]);
-      toast('状态同步成功', 'success');
-    } catch {
-      toast('同步失败', 'error');
+      await applyConfigUpdate(updates);
+    } catch (error) {
+      toast(error instanceof ApiError ? error.message : '同步失败', 'error');
+    } finally {
+      configUpdateInFlight.current = false;
+    }
+  };
+
+  const toggleTun = async () => {
+    if (configUpdateInFlight.current) return;
+    configUpdateInFlight.current = true;
+    try {
+      if (!config.tun) await api.checkTun();
+      await applyConfigUpdate({ tun: !config.tun });
+    } catch (error) {
+      toast(error instanceof ApiError ? error.message : 'TUN 状态同步失败', 'error');
     } finally {
       configUpdateInFlight.current = false;
     }
@@ -508,7 +586,7 @@ export const Dashboard = () => {
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 md:gap-8 px-1">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-8 xl:col-span-2">
           <MasterSwitch icon={Shield} label="系统代理" active={config.system_proxy} onClick={() => updateConfig({ system_proxy: !config.system_proxy })} />
-          <MasterSwitch icon={Zap} label="TUN 模式" active={config.tun} onClick={() => updateConfig({ tun: !config.tun })} />
+          <MasterSwitch icon={Zap} label="TUN 模式" active={config.tun} onClick={() => void toggleTun()} accessory={<TunHelpBadge />} />
           <MasterSwitch icon={Power} label="自动启动" active={config.auto_start} onClick={() => updateConfig({ auto_start: !config.auto_start })} />
         </div>
         <CoreControl status={coreStatus} busyAction={coreAction} onAction={runCoreAction} />

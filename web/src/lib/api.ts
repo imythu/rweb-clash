@@ -472,6 +472,7 @@ export const api = {
   setupStatus: () => request<SetupStatus>('/setup/status'),
   systemStatus: (signal?: AbortSignal) => request<SystemStatus>('/system/status', { signal }),
   systemEgress: (signal?: AbortSignal) => request<Egress>('/system/egress', { signal }),
+  checkTun: () => request<void>('/tun/check'),
   coreStatus: () => request<CoreStatus>('/core/status'),
   startCore: () => request<CoreStatus>('/core/start', { method: 'POST' }),
   stopCore: () => request<CoreStatus>('/core/stop', { method: 'POST' }),

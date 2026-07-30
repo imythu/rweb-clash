@@ -35,6 +35,7 @@ pub fn router(app: App) -> Router {
         .route("/api/system/status", get(system_status))
         .route("/api/setup/status", get(setup_status))
         .route("/api/system/egress", get(system_egress))
+        .route("/api/tun/check", get(tun_check))
         .route("/api/core/status", get(core_status))
         .route("/api/core/start", post(core_start))
         .route("/api/core/stop", post(core_stop))
@@ -638,6 +639,11 @@ async fn system_egress(
     State(app): State<App>,
 ) -> Result<Json<crate::types::EgressResponse>, AppError> {
     Ok(Json(app.egress().await?))
+}
+
+async fn tun_check() -> Result<StatusCode, AppError> {
+    crate::platform::validate_tun_permissions().await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn core_status(

@@ -264,6 +264,9 @@ impl App {
         let mut config = current.clone();
         patch.apply(&mut config);
         validate_config(&config)?;
+        if !current.tun && config.tun {
+            validate_tun_permissions().await?;
+        }
         info!(
             mode = %config.mode,
             mixed_port = config.mixed_port,

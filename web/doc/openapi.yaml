@@ -38,6 +38,16 @@ paths:
               schema:
                 $ref: '#/components/schemas/SystemConfig'
 
+  /tun/check:
+    get:
+      summary: 检查 TUN 开启条件
+      description: 按当前操作系统检查 TUN 所需权限、设备及系统辅助工具是否可用。
+      responses:
+        '204':
+          description: 当前环境具备开启 TUN 的条件
+        '503':
+          description: 当前环境不具备开启 TUN 的条件
+
   /proxies:
     get:
       summary: 获取代理拓扑结构
