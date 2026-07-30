@@ -28,7 +28,7 @@ fn main() {
     let exit_state = backend_state.clone();
     let tray_state = backend_state.clone();
     let started_from_autostart = std::env::args_os().any(|arg| arg == "--autostart");
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(
             tauri_plugin_autostart::Builder::new()
                 .arg("--autostart")
@@ -150,14 +150,24 @@ fn main() {
 
             Ok(())
         })
-        .on_window_event(move |window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(move |window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
-                let _ = window.hide();
+                hide_window(window);
             }
+            tauri::WindowEvent::Focused(false) => {
+                hide_window_if_minimized(window);
+            }
+            tauri::WindowEvent::Resized(_) => hide_window_if_minimized(window),
+            _ => {}
         })
-        .run(tauri::generate_context!())
-        .expect("error while running rweb-clash desktop");
+        .build(tauri::generate_context!())
+        .expect("error while building rweb-clash desktop");
+    app.run(|_app_handle, event| match event {
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } => show_main_window(_app_handle),
+        _ => {}
+    });
     shutdown_backend(&exit_state);
 }
 
@@ -447,6 +457,7 @@ fn install_tray(
     TrayIconBuilder::with_id("main")
         .tooltip("R-Clash")
         .icon(icon)
+        .icon_as_template(cfg!(target_os = "macos"))
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
@@ -486,8 +497,47 @@ fn install_tray(
     })
 }
 
+fn hide_main_window(window: &tauri::WebviewWindow) {
+    if window.is_minimized().unwrap_or(false) {
+        let _ = window.unminimize();
+    }
+    let _ = window.hide();
+    #[cfg(target_os = "macos")]
+    let _ = window
+        .app_handle()
+        .set_activation_policy(tauri::ActivationPolicy::Accessory);
+}
+
+fn hide_window(window: &tauri::Window) {
+    if window.is_minimized().unwrap_or(false) {
+        let _ = window.unminimize();
+    }
+    let _ = window.hide();
+    #[cfg(target_os = "macos")]
+    let _ = window
+        .app_handle()
+        .set_activation_policy(tauri::ActivationPolicy::Accessory);
+}
+
+fn hide_window_if_minimized(window: &tauri::Window) {
+    if window.is_minimized().unwrap_or(false) {
+        hide_window(window);
+    }
+}
+
+fn hide_main_window_if_minimized(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        if window.is_minimized().unwrap_or(false) {
+            hide_main_window(&window);
+        }
+    }
+}
+
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        #[cfg(target_os = "macos")]
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+        let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
@@ -578,23 +628,36 @@ fn start_tray_monitor(
             }
         };
 
+        let refresh_interval = std::time::Duration::from_secs(1);
+        let mut next_refresh = std::time::Instant::now();
         while !stop.load(Ordering::Acquire) {
-            let backend = backend_state
-                .lock()
-                .ok()
-                .and_then(|state| state.app.clone());
-            let (config, up, down) = if let Some(backend) = backend {
-                runtime.block_on(async move {
-                    let config = backend.config().await.ok();
-                    let traffic = backend.traffic().await;
-                    (config, traffic.up, traffic.down)
-                })
-            } else {
-                (None, 0, 0)
-            };
+            // Tauri has no portable minimized event, and window state must be read on the UI thread.
+            let callback_app = app_handle.clone();
+            if let Err(err) = app_handle.run_on_main_thread(move || {
+                hide_main_window_if_minimized(&callback_app);
+            }) {
+                tracing::warn!("failed to schedule minimize-to-tray check: {err}");
+            }
 
-            update_tray(&app_handle, &items, config, up, down);
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            if std::time::Instant::now() >= next_refresh {
+                let backend = backend_state
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.app.clone());
+                let (config, up, down) = if let Some(backend) = backend {
+                    runtime.block_on(async move {
+                        let config = backend.config().await.ok();
+                        let traffic = backend.traffic().await;
+                        (config, traffic.up, traffic.down)
+                    })
+                } else {
+                    (None, 0, 0)
+                };
+
+                update_tray(&app_handle, &items, config, up, down);
+                next_refresh = std::time::Instant::now() + refresh_interval;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     })
 }
