@@ -45,6 +45,25 @@ docker compose -f docker-compose.yml -f docker-compose.tun.yml up -d
 
 直接运行镜像时，对应参数为 `--cap-add NET_ADMIN --device /dev/net/tun:/dev/net/tun`。
 
+### 非 TUN 模式下的局域网连接
+
+未启用 TUN 时，进入 mixed port 的流量是客户端主动发出的 HTTP/SOCKS 代理请求。规则命中 `DIRECT` 只表示由 Mihomo 所在容器直接连接目标，并不会通知原客户端改为本地直连。因此，使用远程容器作为显式代理时，还应在发起请求的客户端配置局域网旁路；至少旁路回环地址和 RFC 1918 网段：
+
+```text
+localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+```
+
+Windows 客户端应启用“不对本地地址使用代理”，并按其代理设置支持的格式加入上述网段。日志中目标端口为 `7680` 的局域网连接通常来自 Windows 传递优化（Delivery Optimization）；如果不需要与其他电脑共享更新，也可以在 Windows 的传递优化设置中关闭该功能。否则，离线节点或防火墙丢弃连接时会正常产生 `dial DIRECT ... no route to host` 或 `i/o timeout`，不需要增加 TUN 排除项。
+
+如果业务确实要求容器代为访问局域网目标，应确认 Docker bridge 网段没有与物理局域网重叠，并检查宿主机的转发防火墙。可以在与服务容器相同的网络命名空间中检查路由和端口连通性：
+
+```text
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{.Gateway}}{{end}}' rweb-clash
+docker run --rm --network container:rweb-clash alpine:3.22 sh -c 'ip route; nc -vz -w 3 192.168.1.154 7680'
+```
+
+若第二条命令也失败，问题位于目标主机状态、目标防火墙或 Docker/宿主机路由，不是 Mihomo 分流规则。不要通过降低日志级别掩盖该故障。
+
 从旧版 root 容器升级时，已有卷可能仍由 root 持有。首次启动新版前执行一次权限迁移：
 
 ```text
@@ -128,7 +147,7 @@ Docker daemon 应代理到 Mihomo mixed port（默认 `127.0.0.1:7890`），不�
 [Service]
 Environment="HTTP_PROXY=http://127.0.0.1:7890"
 Environment="HTTPS_PROXY=http://127.0.0.1:7890"
-Environment="NO_PROXY=localhost,127.0.0.1,::1"
+Environment="NO_PROXY=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 ```
 
 修改后执行 `systemctl daemon-reload`。只在可以中断现有容器时再重启 Docker；安装器不会擅自重启 Docker。若在 UI 中修改了 mixed port，也必须同步修改 Docker 配置。
