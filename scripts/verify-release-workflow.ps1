@@ -256,6 +256,11 @@ if ($macosSigningScript -notmatch 'codesign[\s\S]*resources/core/mihomo' -and
     $macosSigningScript -notmatch 'resources/core/mihomo[\s\S]*codesign') {
   throw "macOS signing setup must sign the packaged Mihomo core"
 }
+$desktopBuildScript = Get-Content -LiteralPath (Join-Path $repoRoot "apps/desktop/src-tauri/build.rs") -Raw
+if ($desktopBuildScript -notmatch 'resources/core' -or
+    $desktopBuildScript -notmatch 'include_bytes!') {
+  throw "Tauri desktop build must embed the packaged Mihomo core"
+}
 
 Assert-Contains "package_target:\s*windows-amd64" "Windows amd64 Tauri target"
 Assert-Contains "rust_target:\s*x86_64-pc-windows-msvc" "Windows amd64 Rust target"

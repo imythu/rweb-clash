@@ -38,16 +38,33 @@ async fn bootstrap_core(
     embedded_assets: Option<&'static EmbeddedAssets>,
 ) -> Result<(), AppError> {
     let target = paths.mihomo_binary();
-    if target.is_file() {
-        return Ok(());
-    }
-
     let file_name = if cfg!(windows) {
         "mihomo.exe"
     } else {
         "mihomo"
     };
     let resource_path = format!("core/{file_name}");
+    if let Some(bytes) = embedded_assets.and_then(|assets| assets.get(&resource_path)) {
+        let (exists, refresh) = embedded_core_refresh_state(&target, bytes).await?;
+        if refresh {
+            if exists {
+                replace_file_atomically(&target, bytes).await?;
+            } else {
+                write_new_file_atomically(&target, bytes).await?;
+            }
+            make_executable(&target).await;
+            info!(
+                mihomo_binary = %AppPaths::display(&target),
+                "materialized embedded mihomo core"
+            );
+        }
+        return Ok(());
+    }
+
+    if target.is_file() {
+        return Ok(());
+    }
+
     if copy_packaged_file(packaged_resources, &resource_path, &target).await? {
         make_executable(&target).await;
         info!(
@@ -71,6 +88,49 @@ async fn bootstrap_core(
         "no packaged mihomo core found"
     );
     Ok(())
+}
+
+async fn embedded_core_refresh_state(
+    target: &Path,
+    embedded: &[u8],
+) -> Result<(bool, bool), AppError> {
+    let metadata = match tokio::fs::symlink_metadata(target).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok((false, true)),
+        Err(error) => return Err(AppError::from(error)),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(AppError::internal(format!(
+            "Mihomo core path is not a regular file: {}",
+            AppPaths::display(target)
+        )));
+    }
+
+    let current = tokio::fs::read(target).await?;
+    #[cfg(target_os = "macos")]
+    let quarantined = macos_file_is_quarantined(target).await?;
+    #[cfg(not(target_os = "macos"))]
+    let quarantined = false;
+    Ok((
+        true,
+        embedded_core_requires_refresh(&current, embedded, quarantined),
+    ))
+}
+
+fn embedded_core_requires_refresh(current: &[u8], embedded: &[u8], quarantined: bool) -> bool {
+    quarantined || current != embedded
+}
+
+#[cfg(target_os = "macos")]
+async fn macos_file_is_quarantined(path: &Path) -> Result<bool, AppError> {
+    let status = tokio::process::Command::new("/usr/bin/xattr")
+        .args(["-p", "com.apple.quarantine"])
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await?;
+    Ok(status.success())
 }
 
 async fn bootstrap_geoip_database(
@@ -305,6 +365,68 @@ async fn write_new_file_atomically(target: &Path, bytes: &[u8]) -> Result<bool, 
     result
 }
 
+async fn replace_file_atomically(target: &Path, bytes: &[u8]) -> Result<(), AppError> {
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let staging = staging_path(target);
+    let result = async {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(crate::paths::PRIVATE_FILE_MODE);
+        let mut file = options.open(&staging).await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        restrict_sensitive_file_permissions(&staging)?;
+        commit_replacement_file(&staging, target).await?;
+        restrict_sensitive_file_permissions(target)?;
+        Ok::<(), AppError>(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&staging).await;
+    }
+    result
+}
+
+#[cfg(not(windows))]
+async fn commit_replacement_file(staging: &Path, target: &Path) -> Result<(), AppError> {
+    tokio::fs::rename(staging, target).await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn commit_replacement_file(staging: &Path, target: &Path) -> Result<(), AppError> {
+    let backup = target.with_file_name(format!(
+        ".{}.{}.bak",
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("mihomo"),
+        uuid::Uuid::new_v4().simple()
+    ));
+    tokio::fs::rename(target, &backup).await?;
+    if let Err(replace_error) = tokio::fs::rename(staging, target).await {
+        if let Err(restore_error) = tokio::fs::rename(&backup, target).await {
+            return Err(AppError::internal(format!(
+                "Mihomo core replace failed ({replace_error}); restoring the previous core failed ({restore_error}); backup retained at {}",
+                AppPaths::display(&backup)
+            )));
+        }
+        return Err(AppError::from(replace_error));
+    }
+    if let Err(error) = tokio::fs::remove_file(&backup).await {
+        warn!(
+            backup = %AppPaths::display(&backup),
+            error = %error,
+            "failed to remove replaced Mihomo core backup"
+        );
+    }
+    Ok(())
+}
+
 async fn commit_staging_file(staging: &Path, target: &Path) -> Result<bool, AppError> {
     if target.exists() {
         tokio::fs::remove_file(staging).await?;
@@ -381,7 +503,8 @@ fn normalize_rule_set_line(line: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bootstrap_core, bootstrap_geoip_database, bootstrap_rule_sets, MIN_GEOIP_DATABASE_BYTES,
+        bootstrap_core, bootstrap_geoip_database, bootstrap_rule_sets,
+        embedded_core_requires_refresh, MIN_GEOIP_DATABASE_BYTES,
     };
     use crate::assets::{EmbeddedAssets, EmbeddedFile};
     use crate::paths::AppPaths;
@@ -431,6 +554,34 @@ mod tests {
             tokio::fs::read(paths.mihomo_binary()).await.unwrap(),
             b"mihomo-embedded"
         );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_core_refreshes_an_existing_core_from_embedded_bytes() {
+        let temp = TestDir::new("rweb-clash-bootstrap-refresh-core");
+        let paths = AppPaths::from_root(temp.path().join("runtime"));
+        let target = paths.mihomo_binary();
+        tokio::fs::create_dir_all(target.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&target, b"stale-core").await.unwrap();
+
+        bootstrap_core(&paths, None, Some(&EMBEDDED_CORE_ASSETS))
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(target).await.unwrap(), b"mihomo-embedded");
+    }
+
+    #[test]
+    fn quarantined_embedded_core_is_refreshed_even_when_bytes_match() {
+        assert!(!embedded_core_requires_refresh(b"mihomo", b"mihomo", false));
+        assert!(embedded_core_requires_refresh(b"mihomo", b"mihomo", true));
+        assert!(embedded_core_requires_refresh(
+            b"old-mihomo",
+            b"mihomo",
+            false
+        ));
     }
 
     #[tokio::test]

@@ -14,6 +14,8 @@ use tauri_plugin_autostart::ManagerExt;
 use tokio::sync::oneshot;
 use tracing::Level;
 
+include!(concat!(env!("OUT_DIR"), "/desktop_embedded_assets.rs"));
+
 fn main() {
     init_logging();
     let instance_lock = match InstanceLock::acquire() {
@@ -96,7 +98,7 @@ fn main() {
                     let app = App::initialize(AppOptions {
                         root_dir: Some(app_data_dir),
                         packaged_resources: resource_dir,
-                        embedded_assets: None,
+                        embedded_assets: Some(&DESKTOP_EMBEDDED_ASSETS),
                         listen_addr,
                     })
                     .await;
