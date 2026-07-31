@@ -1,7 +1,9 @@
 # macOS privileged TUN helper
 
-`rweb-clash-macos-helper` is installed once into `/Library/PrivilegedHelperTools`
-and launched by `com.rweb-clash.tun-helper.plist`. The desktop process talks to
-`/var/run/rweb-clash-tun.sock` using JSON operations (`ping`, `start`, `stop`);
-it never sends arbitrary shell commands. Production installers must sign both
-binaries and perform the one-time authorization during installation.
+The signed macOS app bundles `rweb-clash-macos-helper` and its launchd plist. The
+first TUN start installs the helper into `/Library/PrivilegedHelperTools` and
+launches it through `/Library/LaunchDaemons`; that is the only expected password
+prompt. The desktop process then talks to `/var/run/rweb-clash-tun.sock` using
+JSON operations (`ping`, `start`, `stop`), and never sends arbitrary shell
+commands. `install-privileged-helper.sh` remains available for manual package
+integration.

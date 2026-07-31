@@ -75,7 +75,12 @@ case "$target" in
   windows-amd64|windows-x86_64|macos-arm64|macos-aarch64|macos-x86_64)
     "$repo_root/scripts/prepare-tauri-resources.sh" --target "$target"
     "$repo_root/scripts/verify-tauri-resources.sh" --target "$target"
-    pnpm --dir "$repo_root/apps/desktop" tauri build
+    if [[ "$target" == macos-* ]]; then
+      pnpm --dir "$repo_root/apps/desktop" tauri build \
+        --config src-tauri/tauri.macos.conf.json
+    else
+      pnpm --dir "$repo_root/apps/desktop" tauri build
+    fi
     ;;
   *)
     echo "unsupported target: $target" >&2

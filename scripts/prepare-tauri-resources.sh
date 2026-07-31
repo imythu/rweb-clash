@@ -28,6 +28,7 @@ runtime_source="$repo_root/packaging/cache/runtime"
 core_dest="$resource_root/core"
 rule_set_dest="$resource_root/rule-sets"
 runtime_dest="$resource_root/runtime"
+macos_helper_dest="$resource_root/macos"
 
 if [[ ! -d "$core_source" ]]; then
   echo "core cache not found: $core_source" >&2
@@ -63,5 +64,25 @@ fi
 cp "${rule_files[@]}" "$rule_set_dest/"
 cp "$rule_set_source/manifest.json" "$rule_set_dest/"
 cp "$runtime_source/geoip.metadb" "$runtime_source/manifest.json" "$runtime_dest/"
+
+case "$target" in
+  macos-arm64|macos-aarch64)
+    helper_rust_target="aarch64-apple-darwin"
+    ;;
+  macos-x86_64)
+    helper_rust_target="x86_64-apple-darwin"
+    ;;
+esac
+
+if [[ -n "${helper_rust_target:-}" ]]; then
+  cargo build \
+    --manifest-path "$repo_root/crates/rweb-clash-macos-helper/Cargo.toml" \
+    --release --locked --target "$helper_rust_target"
+  mkdir -p "$macos_helper_dest"
+  cp "$repo_root/target/$helper_rust_target/release/rweb-clash-macos-helper" \
+    "$macos_helper_dest/rweb-clash-macos-helper"
+  cp "$repo_root/packaging/macos/com.rweb-clash.tun-helper.plist" "$macos_helper_dest/"
+  chmod 755 "$macos_helper_dest/rweb-clash-macos-helper"
+fi
 
 echo "Prepared Tauri resources for $target at $resource_root"

@@ -64,3 +64,12 @@ fi
 /usr/bin/codesign --force --timestamp --options runtime --sign "$identity" "$core_path"
 /usr/bin/codesign --verify --strict --verbose=2 "$core_path"
 echo "Signed packaged macOS Mihomo core: $core_path"
+
+helper_path="$repo_root/apps/desktop/src-tauri/resources/macos/rweb-clash-macos-helper"
+if [[ ! -x "$helper_path" ]]; then
+  echo "Packaged macOS TUN helper is missing or not executable: $helper_path" >&2
+  exit 1
+fi
+/usr/bin/codesign --force --timestamp --options runtime --sign "$identity" "$helper_path"
+/usr/bin/codesign --verify --strict --verbose=2 "$helper_path"
+echo "Signed packaged macOS TUN helper: $helper_path"

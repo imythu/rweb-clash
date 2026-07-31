@@ -108,7 +108,11 @@ switch ($Target) {
   { $_ -in @("windows-amd64", "windows-x86_64", "macos-arm64", "macos-aarch64", "macos-x86_64") } {
     & (Join-Path $PSScriptRoot "prepare-tauri-resources.ps1") -Target $Target
     & (Join-Path $PSScriptRoot "verify-tauri-resources.ps1") -Target $Target
-    Invoke-Native { pnpm --dir (Join-Path $repoRoot "apps/desktop") tauri build }
+    if ($Target -like "macos-*") {
+      Invoke-Native { pnpm --dir (Join-Path $repoRoot "apps/desktop") tauri build --config src-tauri/tauri.macos.conf.json }
+    } else {
+      Invoke-Native { pnpm --dir (Join-Path $repoRoot "apps/desktop") tauri build }
+    }
     break
   }
 }

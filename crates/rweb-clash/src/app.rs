@@ -2408,7 +2408,7 @@ fn controller_host_is_loopback(url: &reqwest::Url) -> bool {
 }
 
 async fn ensure_runtime_ports_available(config: &SystemConfig) -> Result<(), AppError> {
-    if !port_available(config.mixed_port).await {
+    if !wait_for_port_available(config.mixed_port).await {
         return Err(AppError::conflict(
             "port_in_use",
             format!(
@@ -2417,7 +2417,15 @@ async fn ensure_runtime_ports_available(config: &SystemConfig) -> Result<(), App
             ),
         ));
     }
-    if !controller_port_available(config).await {
+    let controller_port_in_use = if config.external_controller_enabled {
+        match parse_controller_port(&config.external_controller) {
+            Some(port) => !wait_for_port_available(port).await,
+            None => false,
+        }
+    } else {
+        false
+    };
+    if controller_port_in_use {
         return Err(AppError::conflict(
             "controller_port_in_use",
             format!(
@@ -2448,6 +2456,21 @@ async fn port_available(port: u16) -> bool {
     tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .is_ok()
+}
+
+async fn wait_for_port_available(port: u16) -> bool {
+    const ATTEMPTS: usize = 30;
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    for attempt in 0..ATTEMPTS {
+        if port_available(port).await {
+            return true;
+        }
+        if attempt + 1 < ATTEMPTS {
+            tokio::time::sleep(INTERVAL).await;
+        }
+    }
+    false
 }
 
 fn validate_subscription_input(input: &SubscriptionInput) -> Result<(), AppError> {
@@ -2706,6 +2729,23 @@ mod tests {
         assert!(runtime_change_requires_restart(&current, &attempted));
         assert!(runtime_change_requires_restart(&attempted, &current));
         assert!(runtime_change_requires_restart(&attempted, &attempted));
+    }
+
+    #[tokio::test]
+    async fn waits_for_a_recently_released_port_before_reporting_conflict() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind temporary port");
+        let port = listener
+            .local_addr()
+            .expect("temporary port address")
+            .port();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(listener);
+        });
+
+        assert!(wait_for_port_available(port).await);
     }
 
     #[test]

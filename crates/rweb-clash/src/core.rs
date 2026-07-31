@@ -25,6 +25,10 @@ use tokio::net::UnixStream;
 
 #[cfg(any(target_os = "macos", test))]
 const MACOS_HELPER_SOCKET: &str = "/var/run/rweb-clash-tun.sock";
+#[cfg(any(target_os = "macos", test))]
+const MACOS_HELPER_BINARY: &str = "/Library/PrivilegedHelperTools/dev.rweb-clash.tun-helper";
+#[cfg(any(target_os = "macos", test))]
+const MACOS_HELPER_PLIST: &str = "/Library/LaunchDaemons/com.rweb-clash.tun-helper.plist";
 
 #[cfg(any(target_os = "macos", test))]
 #[derive(serde::Deserialize)]
@@ -93,6 +97,118 @@ async fn macos_helper_request(request: serde_json::Value) -> Result<MacosHelperR
                 .error
                 .unwrap_or_else(|| "macOS privileged helper rejected the request".into()),
         ))
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn macos_helper_available() -> bool {
+    UnixStream::connect(MACOS_HELPER_SOCKET).await.is_ok()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_helper_resource_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let executable = std::env::current_exe().ok()?;
+    let contents_dir = executable.parent()?.parent()?;
+    let resource_dir = contents_dir.join("Resources/resources/macos");
+    Some((
+        resource_dir.join("rweb-clash-macos-helper"),
+        resource_dir.join("com.rweb-clash.tun-helper.plist"),
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn macos_client_is_code_signed() -> bool {
+    let Ok(client) = std::env::current_exe() else {
+        return false;
+    };
+    tokio::process::Command::new("/usr/bin/codesign")
+        .args(["--verify", "--deep", "--strict"])
+        .arg(client)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn macos_helper_resources_available() -> bool {
+    let Some((helper, plist)) = macos_helper_resource_paths() else {
+        return false;
+    };
+    match (
+        tokio::fs::metadata(helper).await,
+        tokio::fs::metadata(plist).await,
+    ) {
+        (Ok(helper), Ok(plist)) => helper.is_file() && plist.is_file(),
+        _ => false,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn install_macos_privileged_helper() -> Result<(), AppError> {
+    let Some((helper, plist)) = macos_helper_resource_paths() else {
+        return Err(macos_tun_setup_error(
+            "cannot locate the macOS App resources",
+        ));
+    };
+    for (path, label) in [(&helper, "helper"), (&plist, "helper launchd plist")] {
+        let metadata = tokio::fs::metadata(path).await.map_err(|error| {
+            macos_tun_setup_error(format!(
+                "packaged macOS TUN {label} is unavailable at {}: {error}",
+                path.display()
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(macos_tun_setup_error(format!(
+                "packaged macOS TUN {label} is not a regular file: {}",
+                path.display()
+            )));
+        }
+    }
+
+    let script = format!(
+        concat!(
+            "/bin/mkdir -p '/Library/PrivilegedHelperTools' '/Library/LaunchDaemons' && ",
+            "/bin/cp {helper} {installed_helper} && /bin/chmod 755 {installed_helper} && ",
+            "/bin/cp {plist} {installed_plist} && /bin/chmod 644 {installed_plist} && ",
+            "(/bin/launchctl bootout system/com.rweb-clash.tun-helper >/dev/null 2>&1 || true) && ",
+            "/bin/launchctl bootstrap system {installed_plist}"
+        ),
+        helper = shell_single_quote(&helper.to_string_lossy()),
+        plist = shell_single_quote(&plist.to_string_lossy()),
+        installed_helper = shell_single_quote(MACOS_HELPER_BINARY),
+        installed_plist = shell_single_quote(MACOS_HELPER_PLIST),
+    );
+    let script = format!(
+        "do shell script \"{}\" with administrator privileges",
+        escape_applescript_string(&script)
+    );
+    let output = tokio::process::Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .output()
+        .await
+        .map_err(|error| {
+            macos_tun_setup_error(format!(
+                "failed to install the macOS privileged TUN helper: {error}"
+            ))
+        })?;
+    let status = output.status;
+    if status.success() {
+        Ok(())
+    } else {
+        let detail = [output.stderr, output.stdout]
+            .into_iter()
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(macos_tun_setup_error(if detail.is_empty() {
+            format!("macOS privileged TUN helper installation exited with {status}")
+        } else {
+            format!("macOS privileged TUN helper installation failed: {detail}")
+        }))
     }
 }
 
@@ -314,32 +430,21 @@ impl CoreManager {
         &self,
         config: &CoreStartConfig,
     ) -> Result<Option<u32>, AppError> {
-        if std::env::var_os("RWEB_CLASH_USE_PRIVILEGED_HELPER").is_some()
-            && config
-                .mihomo_binary
-                .starts_with("/Library/Application Support/rweb-clash/")
-        {
-            let hash = content_hash(tokio::fs::read(&config.mihomo_binary).await?);
-            let client_path = std::env::current_exe().map_err(macos_tun_setup_error)?;
-            let response = macos_helper_request(serde_json::json!({
-                "op": "start",
-                "binary": config.mihomo_binary,
-                "config": config.runtime_yaml,
-                "state_dir": config.runtime_dir,
-                "binary_sha256": hash,
-                "client_path": client_path,
-            }))
-            .await?;
-            let log_path = config.runtime_dir.join("mihomo.log");
-            if let Ok(log) = tokio::fs::File::open(log_path).await {
-                self.spawn_log_reader(
-                    log,
-                    "info".into(),
-                    "mihomo-helper".into(),
-                    config.log_level.clone(),
-                );
+        if macos_helper_available().await {
+            return self.start_macos_helper_process(config).await;
+        }
+        if macos_helper_resources_available().await && macos_client_is_code_signed().await {
+            install_macos_privileged_helper().await?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !macos_helper_available().await {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(macos_tun_setup_error(
+                        "macOS privileged TUN helper did not become available after installation",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            return Ok(response.pid);
+            return self.start_macos_helper_process(config).await;
         }
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -476,6 +581,34 @@ impl CoreManager {
     }
 
     #[cfg(any(target_os = "macos", test))]
+    async fn start_macos_helper_process(
+        &self,
+        config: &CoreStartConfig,
+    ) -> Result<Option<u32>, AppError> {
+        let hash = content_hash(tokio::fs::read(&config.mihomo_binary).await?);
+        let client_path = std::env::current_exe().map_err(macos_tun_setup_error)?;
+        let response = macos_helper_request(serde_json::json!({
+            "op": "start",
+            "binary": config.mihomo_binary,
+            "config": config.runtime_yaml,
+            "state_dir": config.runtime_dir,
+            "binary_sha256": hash,
+            "client_path": client_path,
+        }))
+        .await?;
+        let log_path = config.runtime_dir.join("mihomo.log");
+        if let Ok(log) = tokio::fs::File::open(log_path).await {
+            self.spawn_log_reader(
+                log,
+                "info".into(),
+                "mihomo-helper".into(),
+                config.log_level.clone(),
+            );
+        }
+        Ok(response.pid)
+    }
+
+    #[cfg(any(target_os = "macos", test))]
     async fn signal_macos_tun_stop(&self) -> Option<std::path::PathBuf> {
         let session = {
             let mut guard = self.inner.macos_tun.lock().await;
@@ -592,9 +725,7 @@ impl CoreManager {
             info!("core stop requested, no child process was tracked");
             #[cfg(target_os = "macos")]
             {
-                if std::env::var_os("RWEB_CLASH_USE_PRIVILEGED_HELPER").is_some() {
-                    macos_helper_request(serde_json::json!({"op":"stop"})).await?;
-                }
+                self.stop_macos_helper_process().await?;
                 self.clear_macos_tun_session().await;
             }
         }
@@ -746,8 +877,21 @@ impl CoreManager {
             }
         } else {
             #[cfg(target_os = "macos")]
-            self.clear_macos_tun_session().await;
+            {
+                if let Err(error) = self.stop_macos_helper_process().await {
+                    warn!(%error, "failed stopping macOS helper process after startup failure");
+                }
+                self.clear_macos_tun_session().await;
+            }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn stop_macos_helper_process(&self) -> Result<(), AppError> {
+        if macos_helper_available().await {
+            macos_helper_request(serde_json::json!({"op":"stop"})).await?;
+        }
+        Ok(())
     }
 
     async fn binary_version(&self, binary: &std::path::Path) -> Option<String> {

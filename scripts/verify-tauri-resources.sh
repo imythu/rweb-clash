@@ -74,6 +74,18 @@ if [[ -f "$core_dir/$unexpected_core" ]]; then
   exit 1
 fi
 
+case "$target" in
+  macos-arm64|macos-aarch64|macos-x86_64)
+    macos_helper_dir="$resource_root/macos"
+    macos_helper="$macos_helper_dir/rweb-clash-macos-helper"
+    macos_helper_plist="$macos_helper_dir/com.rweb-clash.tun-helper.plist"
+    if [[ ! -x "$macos_helper" || ! -s "$macos_helper_plist" ]]; then
+      echo "macOS privileged TUN helper resource is missing or not executable: $macos_helper" >&2
+      exit 1
+    fi
+    ;;
+esac
+
 shopt -s nullglob
 rule_files=("$rule_set_dir"/*.list)
 rule_manifest="$rule_set_dir/manifest.json"

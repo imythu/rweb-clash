@@ -429,7 +429,7 @@ jobs:
             os: macos-15
             package_target: macos-arm64
             rust_target: aarch64-apple-darwin
-            args: --target aarch64-apple-darwin --bundles dmg --ci
+            args: --target aarch64-apple-darwin --bundles dmg --config src-tauri/tauri.macos.conf.json --ci
           - name: windows-amd64
             os: windows-2025
             package_target: windows-amd64
