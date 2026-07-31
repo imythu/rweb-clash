@@ -24,6 +24,8 @@ use tokio::net::TcpListener;
 const DEFAULT_MIHOMO_VALIDATION_TIMEOUT_SECS: u64 = 120;
 const MAX_MIHOMO_VALIDATION_TIMEOUT_SECS: u64 = 3_600;
 const MIHOMO_VALIDATION_TIMEOUT_ENV: &str = "RWEB_CLASH_MIHOMO_VALIDATION_TIMEOUT_SECS";
+const CORE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const CORE_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 #[cfg(any(target_os = "macos", test))]
 const MACOS_TUN_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -556,8 +558,8 @@ impl CoreManager {
             .build()
             .map_err(AppError::internal)?;
         let url = controller_url(&config.controller_addr, "/version");
-        let mut last_error = None;
-        for _ in 0..30 {
+        let deadline = tokio::time::Instant::now() + CORE_STARTUP_TIMEOUT;
+        let last_error = loop {
             if let Some(status) = self.tracked_child_exit_status().await? {
                 return Err(AppError::service_unavailable(
                     "core_start_failed",
@@ -569,23 +571,35 @@ impl CoreManager {
             if !config.controller_secret.trim().is_empty() {
                 request = request.bearer_auth(config.controller_secret.trim());
             }
-            match tokio::time::timeout(Duration::from_millis(300), request.send()).await {
-                Ok(Ok(response)) if response.status().is_success() => return Ok(()),
-                Ok(Ok(response)) => {
-                    last_error = Some(format!("controller returned {}", response.status()))
-                }
-                Ok(Err(err)) => last_error = Some(err.to_string()),
-                Err(_) => last_error = Some("controller health check timed out".into()),
+            let attempt_error =
+                match tokio::time::timeout(Duration::from_millis(300), request.send()).await {
+                    Ok(Ok(response)) if response.status().is_success() => return Ok(()),
+                    Ok(Ok(response)) => format!("controller returned {}", response.status()),
+                    Ok(Err(err)) => err.to_string(),
+                    Err(_) => "controller health check timed out".into(),
+                };
+            if tokio::time::Instant::now() >= deadline {
+                break attempt_error;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(CORE_STARTUP_POLL_INTERVAL).await;
+        };
+
+        // The privileged macOS wrapper can exit just after the last request fails.
+        // Give process state propagation one final chance so callers see the exit
+        // instead of the less useful controller-unreachable message.
+        tokio::time::sleep(CORE_STARTUP_POLL_INTERVAL).await;
+        if let Some(status) = self.tracked_child_exit_status().await? {
+            return Err(AppError::service_unavailable(
+                "core_start_failed",
+                format!("mihomo exited during startup with status {status}"),
+            ));
         }
 
         Err(AppError::service_unavailable(
             "controller_unreachable",
             format!(
                 "mihomo started but external-controller was not reachable at {}: {}",
-                config.controller_addr,
-                last_error.unwrap_or_else(|| "unknown error".into())
+                config.controller_addr, last_error
             ),
         ))
     }
