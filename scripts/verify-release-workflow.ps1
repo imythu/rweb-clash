@@ -156,7 +156,7 @@ Assert-Contains 'windows_bundle_version="\$\(\(10#\$year_short\)\)\.\$month\.\$d
 Assert-Contains 'Reject an existing generated release tag\s*\r?\n\s*if:\s*github\.ref_type != ''tag''' "generated tag collision guard excludes pushed tags"
 Assert-Contains 'name:\s*Resolve Mihomo release tag' "single Mihomo release resolution step"
 Assert-Contains 'mihomo_version:\s*\$\{\{\s*steps\.mihomo\.outputs\.version\s*\}\}' "resolved Mihomo metadata output"
-foreach ($lockPackage in @("rweb-clash", "rweb-clash-bin", "rweb-clash-desktop")) {
+foreach ($lockPackage in @("rweb-clash", "rweb-clash-bin", "rweb-clash-macos-helper", "rweb-clash-desktop")) {
   if ($versionScript -notmatch [regex]::Escape($lockPackage)) {
     throw "Release version synchronization must update Cargo.lock for $lockPackage."
   }
