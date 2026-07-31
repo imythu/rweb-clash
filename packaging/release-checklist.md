@@ -3,6 +3,7 @@
 Use this checklist for every automatic snapshot and semantic stable release run.
 
 - A push to `master` creates a Beijing-time snapshot tag named `snapshot-YYYYMMDD-HHmm` and a prerelease.
+- A pushed `vMAJOR.MINOR.PATCH-beta.N` tag creates a beta GitHub prerelease without moving the stable `latest` channel.
 - A pushed `vMAJOR.MINOR.PATCH` tag creates that stable release and marks it as latest.
 - A manual `workflow_dispatch` from `master` requires the same numeric `release_version` and can optionally enable desktop signing.
 - Stable release tags are synchronized into Cargo and desktop package versions; snapshots use sortable `YYYY.MDD.HHmm` package versions.
@@ -12,7 +13,8 @@ Use this checklist for every automatic snapshot and semantic stable release run.
 ## Workflow Semantics
 
 - Pushes to `master` publish all target artifacts, the timestamped Docker tag, the moving `snapshot` Docker tag, and a GitHub prerelease.
-- Semantic tag pushes and manual runs publish all target artifacts, the SemVer Docker tag, the moving `latest` Docker tag, and a stable GitHub Release.
+- Beta tag pushes publish all target artifacts and a GitHub prerelease without updating the moving `latest` Docker tag.
+- Stable semantic tag pushes and manual runs publish all target artifacts, the SemVer Docker tag, the moving `latest` Docker tag, and a stable GitHub Release.
 - Automatic snapshots and tag-triggered stable releases are unsigned. Manual stable releases are unsigned unless `sign_desktop` is explicitly enabled and all platform secrets are configured.
 - Rule URLs intentionally track their mutable `@release` branches, so each build fetches and records the latest available snapshots.
 - A shared asset job resolves one rule commit and one GeoIP release, then every platform and Docker build consumes that same verified artifact.

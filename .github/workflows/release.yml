@@ -62,7 +62,11 @@ jobs:
             <<< "$(TZ=Asia/Shanghai date '+%Y%m%d-%H%M|%Y|%y|%-m|%-d|%H%M|%Y-%m-%d %H:%M CST')"
           if [ "$GIT_REF_TYPE" = "tag" ]; then
             release_version="${GIT_REF_NAME#v}"
-            channel="stable"
+            if [[ "$release_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-beta\.(0|[1-9][0-9]*)$ ]]; then
+              channel="beta"
+            else
+              channel="stable"
+            fi
             release_tag="$GIT_REF_NAME"
           elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             release_version="${REQUESTED_RELEASE_VERSION#v}"
@@ -77,9 +81,14 @@ jobs:
             echo "Stable release version must be numeric SemVer (for example, 1.0.0): $release_version" >&2
             exit 1
           fi
+          if [ "$channel" = "beta" ] &&
+             [[ ! "$release_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-beta\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Beta release version must use SemVer beta.N (for example, 1.0.0-beta.1): $release_version" >&2
+            exit 1
+          fi
           month_day="$((10#$month * 100 + 10#$day))"
           clock_number="$((10#$clock))"
-          if [ "$channel" = "stable" ]; then
+          if [ "$channel" != "snapshot" ]; then
             package_version="$release_version"
           else
             package_version="$((10#$year)).$month_day.$clock_number"
@@ -699,7 +708,7 @@ jobs:
           name: rweb-clash ${{ needs.metadata.outputs.release_tag }}
           tag_name: ${{ needs.metadata.outputs.release_tag }}
           target_commitish: ${{ github.sha }}
-          prerelease: ${{ needs.metadata.outputs.channel == 'snapshot' }}
+          prerelease: ${{ needs.metadata.outputs.channel != 'stable' }}
           make_latest: ${{ needs.metadata.outputs.channel == 'stable' && 'true' || 'false' }}
           body: |
             ## rweb-clash
@@ -708,7 +717,7 @@ jobs:
             Built at: `${{ needs.metadata.outputs.display_version }}`
             Package version: `${{ needs.metadata.outputs.package_version }}`
 
-            ${{ needs.metadata.outputs.channel == 'snapshot' && '> Snapshot build generated automatically from master.' || '> Stable build generated from a semantic version tag or manual release dispatch.' }}
+            ${{ needs.metadata.outputs.channel == 'snapshot' && '> Snapshot build generated automatically from master.' || needs.metadata.outputs.channel == 'beta' && '> Beta prerelease generated from a beta SemVer tag.' || '> Stable build generated from a semantic version tag or manual release dispatch.' }}
             ${{ (github.event_name == 'workflow_dispatch' && inputs.sign_desktop) && '> Desktop packages were built with the configured signing credentials.' || '> Desktop packages are unsigned; Windows SmartScreen and macOS Gatekeeper may warn.' }}
 
             Supported release targets:

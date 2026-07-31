@@ -143,6 +143,8 @@ Assert-Contains 'release_tag="snapshot-\$compact"' "automatic timestamped snapsh
 Assert-Contains 'release_tag="\$GIT_REF_NAME"' "pushed semantic stable tag"
 Assert-Contains 'release_tag="v\$release_version"' "manual semantic stable tag"
 Assert-Contains 'release_version="\$\{GIT_REF_NAME#v\}"' "tag SemVer extraction"
+Assert-Contains 'channel="beta"' "beta tag channel"
+Assert-Contains 'Beta release version must use SemVer beta\.N' "strict beta SemVer validation"
 Assert-Contains 'release_version="\$\{REQUESTED_RELEASE_VERSION#v\}"' "manual SemVer normalization"
 Assert-Contains 'Stable release version must be numeric SemVer' "strict stable SemVer validation"
 Assert-Contains 'GIT_REF.*github\.ref' "manual release source ref input"
@@ -293,7 +295,7 @@ if ($publishSection -match "(?m)^    if:") {
   throw "Snapshot and stable builds must both publish GitHub Releases after successful dependencies."
 }
 Assert-Contains "tag_name:\s*\$\{\{\s*needs\.metadata\.outputs\.release_tag\s*\}\}" "GitHub Release uses metadata tag"
-Assert-Contains "prerelease:\s*\$\{\{\s*needs\.metadata\.outputs\.channel == 'snapshot'\s*\}\}" "automatic snapshots are GitHub prereleases"
+Assert-Contains "prerelease:\s*\$\{\{\s*needs\.metadata\.outputs\.channel != 'stable'\s*\}\}" "snapshots and beta builds are GitHub prereleases"
 Assert-Contains "make_latest:\s*\$\{\{\s*needs\.metadata\.outputs\.channel == 'stable'[^\r\n]*'true'[^\r\n]*'false'[^\r\n]*\}\}" "only stable releases become latest"
 Assert-DockerfileContains "pnpm --dir web build" "web build stage"
 Assert-DockerfileContains "package-core\.sh --target linux-amd64" "Linux amd64 Mihomo core packaging"
