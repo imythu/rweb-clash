@@ -845,6 +845,7 @@ fn macos_tun_shell_command(
 
     let binary = quoted_path(&config.mihomo_binary, "binary")?;
     let runtime_yaml = quoted_path(&config.runtime_yaml, "runtime config")?;
+    let safe_paths = quoted_path(&config.runtime_dir, "runtime directory")?;
     let stop_path = quoted_path(params.stop_path, "stop marker")?;
     let token = shell_single_quote(params.token);
     let binary_hash = shell_single_quote(params.binary_hash);
@@ -882,7 +883,7 @@ fn macos_tun_shell_command(
             "/bin/cp {runtime_yaml} \"$runtime_home/runtime.yaml\" || exit 1; ",
             "[ \"$(/usr/bin/shasum -a 256 \"$runtime_home/runtime.yaml\" | /usr/bin/awk '{{print $1}}')\" = {runtime_hash} ] || exit 1; ",
             "{geoip_stage}",
-            "\"$runtime_home/mihomo\" -d \"$runtime_home\" -f \"$runtime_home/runtime.yaml\" >\"$log_file\" 2>&1 & core_pid=$!; ",
+            "SAFE_PATHS={safe_paths} \"$runtime_home/mihomo\" -d \"$runtime_home\" -f \"$runtime_home/runtime.yaml\" >\"$log_file\" 2>&1 & core_pid=$!; ",
             "( /usr/bin/printf '%s\\n%s\\n' {token} \"$core_pid\"; /usr/bin/tail -n +1 -f \"$log_file\"; ) | /usr/bin/nc 127.0.0.1 {port} & bridge_pid=$!; ",
             "while /bin/kill -0 \"$core_pid\" 2>/dev/null; do ",
             "if ! /bin/kill -0 {owner_pid} 2>/dev/null || ! /bin/kill -0 \"$bridge_pid\" 2>/dev/null || [ -e {stop_path} ]; then ",
@@ -895,6 +896,7 @@ fn macos_tun_shell_command(
         ),
         binary = binary,
         runtime_yaml = runtime_yaml,
+        safe_paths = safe_paths,
         binary_hash = binary_hash,
         runtime_hash = runtime_hash,
         geoip_stage = geoip_stage,
@@ -1123,6 +1125,10 @@ mod tests {
                 .expect("GeoIP path")
         )));
         assert!(command.contains(r#""$runtime_home/mihomo" -d "$runtime_home""#));
+        assert!(command.contains(&format!(
+            "SAFE_PATHS={} ",
+            shell_single_quote(config.runtime_dir.to_str().expect("runtime directory"))
+        )));
         assert!(command.contains("/usr/bin/shasum -a 256"));
         assert!(command.contains(r#"/usr/bin/tail -n +1 -f "$log_file""#));
         assert!(!command.contains("mkfifo"));
