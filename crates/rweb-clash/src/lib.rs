@@ -11,6 +11,7 @@ mod instance_lock;
 mod manual;
 mod paths;
 mod platform;
+mod probe;
 mod proxy;
 mod remote;
 mod rule;

@@ -324,6 +324,12 @@ fn build_groups_from_members(
             };
             insert(&mut mapping, "interval", yaml_value(interval));
         }
+        if matches!(
+            item.group_type.as_deref(),
+            Some("url-test" | "fallback" | "load-balance")
+        ) {
+            insert(&mut mapping, "lazy", yaml_value(true));
+        }
         if let Some(tolerance) = item.tolerance_ms {
             insert(&mut mapping, "tolerance", yaml_value(tolerance));
         }
@@ -849,8 +855,13 @@ mod tests {
             .as_mapping()
             .and_then(|mapping| mapping.get(Value::String("interval".into())))
             .and_then(Value::as_i64);
+        let lazy = groups[0]
+            .as_mapping()
+            .and_then(|mapping| mapping.get(Value::String("lazy".into())))
+            .and_then(Value::as_bool);
 
         assert_eq!(interval, Some(MIN_ACTIVE_PROBE_INTERVAL_SECONDS));
+        assert_eq!(lazy, Some(true));
     }
 
     #[tokio::test]

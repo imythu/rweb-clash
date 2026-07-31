@@ -10,6 +10,10 @@ use crate::platform::{
     apply_system_proxy, begin_system_proxy_disable, complete_system_proxy_recovery,
     system_proxy_backup_exists, validate_tun_permissions, SystemProxyRestoreOutcome,
 };
+use crate::probe::{
+    ProbeCoordinator, ProbeLane, AUTO_PROBE_BATCH_SIZE, AUTO_PROBE_TICK_SECONDS,
+    MANUAL_GROUP_CONCURRENCY, MAX_DIRECT_GROUP_PROBES,
+};
 use crate::proxy::ProxyService;
 use crate::rule::RuleService;
 use crate::runtime::compile_runtime_yaml;
@@ -23,6 +27,7 @@ use crate::types::{
     SubscriptionResponse, SystemConfig, SystemConfigPatch, SystemStatusResponse, TrafficResponse,
 };
 use crate::util::{new_id, parse_host_from_log, validate_url};
+use futures_util::stream::{self, StreamExt};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -46,6 +51,7 @@ struct AppInner {
     rule_service: RuleService,
     egress_probe: EgressProbe,
     backup_service: BackupService,
+    probe: ProbeCoordinator,
     config_update: Mutex<()>,
     runtime_operation: Mutex<()>,
     rule_set_operation: Mutex<()>,
@@ -156,6 +162,7 @@ impl App {
                 rule_service,
                 egress_probe: EgressProbe::new(),
                 backup_service,
+                probe: ProbeCoordinator::new(),
                 storage,
                 core,
                 config_update: Mutex::new(()),
@@ -993,41 +1000,151 @@ impl App {
                 delay: 0,
             });
         }
-        let config = self.config().await?;
-        let controller = self.controller_client().await?;
-        let result = controller
-            .proxy_delay(name, &config.delay_test_url, config.delay_test_timeout_ms)
-            .await?;
-        self.inner
-            .storage
-            .set_node_delay(name, result.delay)
-            .await?;
-        Ok(result)
+        self.probe_node_once(name, ProbeLane::Manual).await
     }
 
     pub async fn test_group(&self, name: &str) -> Result<Vec<DelayResponse>, AppError> {
         if !self.inner.core.is_running().await {
             return Ok(Vec::new());
         }
-        let config = self.config().await?;
-        let controller = self.controller_client().await?;
-        let result = controller
-            .group_delay(name, &config.delay_test_url, config.delay_test_timeout_ms)
+        let topology = self.proxy_topology().await?;
+        let group = topology
+            .groups
+            .iter()
+            .find(|group| group.name == name)
+            .ok_or_else(|| {
+                AppError::not_found(
+                    "proxy_group_not_found",
+                    format!("proxy group {name} not found"),
+                )
+            })?;
+        let available_nodes = topology
+            .nodes
+            .iter()
+            .map(|node| node.name.clone())
+            .collect::<HashSet<_>>();
+        let node_names = expanded_group_node_names(group, &topology.groups, &available_nodes);
+
+        if node_names.len() > MAX_DIRECT_GROUP_PROBES {
+            let results = stream::iter(node_names.into_iter().map(|node_name| {
+                let app = self.clone();
+                async move {
+                    match app.test_node(&node_name).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            warn!(node = %node_name, %error, "manual group node probe failed");
+                            DelayResponse {
+                                name: node_name,
+                                delay: 0,
+                            }
+                        }
+                    }
+                }
+            }))
+            .buffer_unordered(MANUAL_GROUP_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+            self.update_group_delay_from_results(name, &results).await?;
+            return Ok(results);
+        }
+
+        let group_probe_key = format!("group:{name}");
+        let app = self.clone();
+        let result = self
+            .inner
+            .probe
+            .run_group(&group_probe_key, move || async move {
+                let config = app.config().await?;
+                let controller = app.controller_client().await?;
+                controller
+                    .group_delay(name, &config.delay_test_url, config.delay_test_timeout_ms)
+                    .await
+            })
             .await?;
-        if let Some(best) = result
+        for item in &result {
+            let update = if item.delay > 0 {
+                self.inner
+                    .storage
+                    .record_node_probe_success(&item.name, item.delay)
+                    .await
+            } else {
+                self.inner
+                    .storage
+                    .record_node_probe_failure(&item.name, "group probe returned no delay")
+                    .await
+            };
+            if let Err(error) = update {
+                warn!(node = %item.name, %error, "failed to persist group probe result");
+            }
+        }
+        self.update_group_delay_from_results(name, &result).await?;
+        Ok(result)
+    }
+
+    async fn update_group_delay_from_results(
+        &self,
+        name: &str,
+        results: &[DelayResponse],
+    ) -> Result<(), AppError> {
+        if let Some(best) = results
             .iter()
             .filter(|item| item.delay > 0)
             .min_by_key(|item| item.delay)
         {
             self.inner.storage.set_group_delay(name, best.delay).await?;
         }
-        for item in &result {
-            self.inner
-                .storage
-                .set_node_delay(&item.name, item.delay)
-                .await?;
-        }
-        Ok(result)
+        Ok(())
+    }
+
+    async fn probe_node_once(
+        &self,
+        name: &str,
+        lane: ProbeLane,
+    ) -> Result<DelayResponse, AppError> {
+        let app = self.clone();
+        self.inner
+            .probe
+            .run(name, lane, move || async move {
+                let config = app.config().await?;
+                let controller = app.controller_client().await?;
+                let result = controller
+                    .proxy_delay(name, &config.delay_test_url, config.delay_test_timeout_ms)
+                    .await;
+                match &result {
+                    Ok(response) if response.delay > 0 => {
+                        if let Err(error) = app
+                            .inner
+                            .storage
+                            .record_node_probe_success(name, response.delay)
+                            .await
+                        {
+                            warn!(node = %name, %error, "failed to persist successful node probe");
+                        }
+                    }
+                    Ok(_) => {
+                        if let Err(error) = app
+                            .inner
+                            .storage
+                            .record_node_probe_failure(name, "probe returned no delay")
+                            .await
+                        {
+                            warn!(node = %name, %error, "failed to persist failed node probe");
+                        }
+                    }
+                    Err(error) => {
+                        if let Err(storage_error) = app
+                            .inner
+                            .storage
+                            .record_node_probe_failure(name, &error.message)
+                            .await
+                        {
+                            warn!(node = %name, %storage_error, "failed to persist node probe failure");
+                        }
+                    }
+                }
+                result
+            })
+            .await
     }
 
     pub async fn list_rules(&self) -> Result<Vec<RuleResponse>, AppError> {
@@ -1822,6 +1939,10 @@ impl App {
                 tokio::spawn(async move {
                     watchdog.system_proxy_watchdog().await;
                 });
+                let probe_app = app.clone();
+                tokio::spawn(async move {
+                    probe_app.node_probe_loop().await;
+                });
                 tokio::spawn(async move {
                     app.refresh_startup_assets().await;
                     app.background_loop().await;
@@ -1902,6 +2023,43 @@ impl App {
         }
     }
 
+    async fn node_probe_loop(self) {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(AUTO_PROBE_TICK_SECONDS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if !self.inner.core.is_running().await {
+                continue;
+            }
+            let names = match self
+                .inner
+                .storage
+                .due_probe_node_names(AUTO_PROBE_BATCH_SIZE)
+                .await
+            {
+                Ok(names) => names,
+                Err(error) => {
+                    warn!(%error, "failed to load due node probes");
+                    continue;
+                }
+            };
+            for name in names {
+                if !self.inner.probe.try_claim_automatic(&name).await {
+                    continue;
+                }
+                let app = self.clone();
+                let probe = self.inner.probe.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = app.probe_node_once(&name, ProbeLane::Automatic).await {
+                        warn!(node = %name, %error, "automatic node probe failed");
+                    }
+                    probe.release_automatic(&name).await;
+                });
+            }
+        }
+    }
+
     async fn background_loop(self) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
@@ -1953,6 +2111,60 @@ impl App {
             .storage
             .append_log(level, payload, parsed.as_deref())
             .await;
+    }
+}
+
+fn expanded_group_node_names(
+    group: &crate::types::ProxyGroupResponse,
+    groups: &[crate::types::ProxyGroupResponse],
+    available_nodes: &HashSet<String>,
+) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut seen_nodes = HashSet::new();
+    let mut seen_groups = HashSet::new();
+    seen_groups.insert(group.name.clone());
+    for member in &group.all {
+        collect_group_node_names(
+            member,
+            groups,
+            available_nodes,
+            &mut seen_nodes,
+            &mut seen_groups,
+            &mut output,
+        );
+    }
+    output
+}
+
+fn collect_group_node_names(
+    member: &str,
+    groups: &[crate::types::ProxyGroupResponse],
+    available_nodes: &HashSet<String>,
+    seen_nodes: &mut HashSet<String>,
+    seen_groups: &mut HashSet<String>,
+    output: &mut Vec<String>,
+) {
+    if available_nodes.contains(member) {
+        if seen_nodes.insert(member.to_string()) {
+            output.push(member.to_string());
+        }
+        return;
+    }
+    let Some(group) = groups.iter().find(|group| group.name == member) else {
+        return;
+    };
+    if !seen_groups.insert(group.name.clone()) {
+        return;
+    }
+    for nested_member in &group.all {
+        collect_group_node_names(
+            nested_member,
+            groups,
+            available_nodes,
+            seen_nodes,
+            seen_groups,
+            output,
+        );
     }
 }
 
@@ -2343,6 +2555,7 @@ mod tests {
                 rule_service: RuleService::new(storage.clone(), paths),
                 egress_probe: EgressProbe::new(),
                 backup_service,
+                probe: ProbeCoordinator::new(),
                 storage,
                 core,
                 config_update: Mutex::new(()),

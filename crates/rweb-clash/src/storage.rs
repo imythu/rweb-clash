@@ -564,6 +564,12 @@ CREATE TABLE IF NOT EXISTS proxy_items (
   content_hash TEXT,
   latency_ms INTEGER,
   last_test_at TEXT,
+  last_good_latency_ms INTEGER,
+  probe_status TEXT NOT NULL DEFAULT 'unknown',
+  probe_failures INTEGER NOT NULL DEFAULT 0,
+  next_probe_at TEXT,
+  last_success_at TEXT,
+  last_probe_error TEXT,
   alive INTEGER NOT NULL DEFAULT 1,
   filtered_out INTEGER NOT NULL DEFAULT 0,
   filter_reason TEXT,
@@ -697,6 +703,23 @@ CREATE TABLE IF NOT EXISTS log_entries (
         self.ensure_integer_column("subscriptions", "ready", "1")
             .await?;
         self.ensure_proxy_item_builtin_column().await?;
+        self.ensure_nullable_column("proxy_items", "last_good_latency_ms", "INTEGER")
+            .await?;
+        self.ensure_text_column("proxy_items", "probe_status", "'unknown'")
+            .await?;
+        self.ensure_integer_column("proxy_items", "probe_failures", "0")
+            .await?;
+        self.ensure_nullable_column("proxy_items", "next_probe_at", "TEXT")
+            .await?;
+        self.ensure_nullable_column("proxy_items", "last_success_at", "TEXT")
+            .await?;
+        self.ensure_nullable_column("proxy_items", "last_probe_error", "TEXT")
+            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_proxy_items_probe_due ON proxy_items(kind, enabled, filtered_out, next_probe_at)",
+        )
+        .execute(&self.pool)
+        .await?;
         self.ensure_integer_column("rule_sets", "ready", "1")
             .await?;
         self.ensure_rule_set_staging_columns().await?;
@@ -2516,15 +2539,127 @@ SELECT EXISTS(SELECT 1 FROM dependencies WHERE name = ?)
         Ok(())
     }
 
-    pub async fn set_node_delay(&self, node_name: &str, delay: i64) -> Result<(), AppError> {
+    pub async fn due_probe_node_names(&self, limit: i64) -> Result<Vec<String>, AppError> {
+        let rows = sqlx::query(
+            r#"
+SELECT proxy_items.name
+FROM proxy_items
+WHERE proxy_items.kind = 'node'
+  AND proxy_items.enabled = 1
+  AND proxy_items.filtered_out = 0
+  AND (
+    proxy_items.subscription_id IS NULL
+    OR EXISTS (
+      SELECT 1 FROM subscriptions
+      WHERE subscriptions.id = proxy_items.subscription_id
+        AND subscriptions.ready = 1
+    )
+  )
+  AND (
+    proxy_items.next_probe_at IS NULL
+    OR proxy_items.next_probe_at <= ?
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM proxy_group_members
+    JOIN proxy_items AS active_groups
+      ON active_groups.name = proxy_group_members.group_name
+     AND active_groups.kind = 'group'
+    WHERE proxy_group_members.member_name = proxy_items.name
+      AND active_groups.group_type IN ('url-test', 'fallback', 'load-balance')
+  )
+ORDER BY
+  CASE WHEN proxy_items.probe_status = 'unknown' THEN 0 ELSE 1 END,
+  COALESCE(proxy_items.next_probe_at, '1970-01-01T00:00:00Z'),
+  proxy_items.position,
+  proxy_items.name
+LIMIT ?
+"#,
+        )
+        .bind(now_iso())
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| row.try_get("name").map_err(AppError::from))
+            .collect()
+    }
+
+    pub async fn record_node_probe_success(
+        &self,
+        node_name: &str,
+        delay: i64,
+    ) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
         let now = now_iso();
-        sqlx::query("UPDATE proxy_items SET latency_ms = ?, last_test_at = ?, updated_at = ? WHERE name = ? AND kind = 'node'")
-            .bind(delay)
-            .bind(&now)
-            .bind(&now)
-            .bind(node_name)
-            .execute(&self.pool)
-            .await?;
+        let next_probe_at = crate::probe::next_probe_at(node_name, true, 0);
+        sqlx::query(
+            r#"
+UPDATE proxy_items
+SET latency_ms = ?,
+    last_good_latency_ms = ?,
+    last_test_at = ?,
+    probe_status = 'healthy',
+    probe_failures = 0,
+    next_probe_at = ?,
+    last_success_at = ?,
+    last_probe_error = NULL,
+    updated_at = ?
+WHERE name = ? AND kind = 'node'
+"#,
+        )
+        .bind(delay)
+        .bind(delay)
+        .bind(&now)
+        .bind(next_probe_at)
+        .bind(&now)
+        .bind(&now)
+        .bind(node_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn record_node_probe_failure(
+        &self,
+        node_name: &str,
+        error: &str,
+    ) -> Result<(), AppError> {
+        let _mutation = self.topology_mutation.lock().await;
+        let current_failures = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(probe_failures, 0) FROM proxy_items WHERE name = ? AND kind = 'node'",
+        )
+        .bind(node_name)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(0)
+        .max(0) as u32;
+        let failures = current_failures.saturating_add(1);
+        let next_probe_at = crate::probe::next_probe_at(node_name, false, failures);
+        let now = now_iso();
+        let error = error.chars().take(512).collect::<String>();
+        sqlx::query(
+            r#"
+UPDATE proxy_items
+SET latency_ms = 0,
+    last_test_at = ?,
+    probe_status = CASE WHEN ? >= 3 THEN 'unhealthy' ELSE 'degraded' END,
+    probe_failures = ?,
+    next_probe_at = ?,
+    last_probe_error = ?,
+    updated_at = ?
+WHERE name = ? AND kind = 'node'
+"#,
+        )
+        .bind(&now)
+        .bind(failures as i64)
+        .bind(failures as i64)
+        .bind(next_probe_at)
+        .bind(error)
+        .bind(&now)
+        .bind(node_name)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
