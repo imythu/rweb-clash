@@ -7,8 +7,8 @@ pub const BUILTIN_DIRECT: &str = "DIRECT";
 pub const BUILTIN_REJECT: &str = "REJECT";
 pub const BUILTIN_GLOBAL: &str = "GLOBAL";
 pub const BUILTIN_PROXY: &str = "PROXY";
-pub const DEFAULT_DELAY_TEST_URL: &str = "http://www.gstatic.com/generate_204";
-pub const DEFAULT_DELAY_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_DELAY_TEST_URL: &str = "https://cp.cloudflare.com/generate_204";
+pub const DEFAULT_DELAY_TIMEOUT_MS: u64 = 10_000;
 pub const MIN_REMOTE_REFRESH_INTERVAL_SECONDS: u64 = 21_600;
 pub const DEFAULT_SUBSCRIPTION_REFRESH_INTERVAL_SECONDS: u64 = 21_600;
 pub const DEFAULT_RULE_SET_REFRESH_INTERVAL_SECONDS: u64 = 86_400;
@@ -36,6 +36,8 @@ pub struct SystemConfig {
     pub store_selected: bool,
     pub unified_delay: bool,
     pub tcp_concurrent: bool,
+    pub delay_test_url: String,
+    pub delay_test_timeout_ms: u64,
     pub tun: bool,
     pub system_proxy: bool,
     pub mode: String,
@@ -65,6 +67,8 @@ impl Default for SystemConfig {
             store_selected: true,
             unified_delay: true,
             tcp_concurrent: false,
+            delay_test_url: DEFAULT_DELAY_TEST_URL.into(),
+            delay_test_timeout_ms: DEFAULT_DELAY_TIMEOUT_MS,
             tun: false,
             system_proxy: false,
             mode: "rule".into(),
@@ -93,6 +97,8 @@ pub struct SystemConfigPatch {
     pub store_selected: Option<bool>,
     pub unified_delay: Option<bool>,
     pub tcp_concurrent: Option<bool>,
+    pub delay_test_url: Option<String>,
+    pub delay_test_timeout_ms: Option<u64>,
     pub tun: Option<bool>,
     pub system_proxy: Option<bool>,
     pub mode: Option<String>,
@@ -151,6 +157,12 @@ impl SystemConfigPatch {
         }
         if let Some(value) = self.tcp_concurrent {
             config.tcp_concurrent = value;
+        }
+        if let Some(value) = self.delay_test_url {
+            config.delay_test_url = value;
+        }
+        if let Some(value) = self.delay_test_timeout_ms {
+            config.delay_test_timeout_ms = value;
         }
         if let Some(value) = self.tun {
             config.tun = value;

@@ -16,6 +16,8 @@ export type SystemConfig = {
   store_selected: boolean;
   unified_delay: boolean;
   tcp_concurrent: boolean;
+  delay_test_url: string;
+  delay_test_timeout_ms: number;
   tun: boolean;
   system_proxy: boolean;
   mode: 'rule' | 'global' | 'direct';

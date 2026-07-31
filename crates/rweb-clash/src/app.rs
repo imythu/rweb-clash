@@ -21,7 +21,6 @@ use crate::types::{
     ProxyTopologyResponse, RuleInput, RuleResponse, RuleSetInput, RuleSetResponse, RuleTestRequest,
     RuleTestResponse, SelectProxyRequest, SetupStatusResponse, SubscriptionInput,
     SubscriptionResponse, SystemConfig, SystemConfigPatch, SystemStatusResponse, TrafficResponse,
-    DEFAULT_DELAY_TEST_URL, DEFAULT_DELAY_TIMEOUT_MS,
 };
 use crate::util::{new_id, parse_host_from_log, validate_url};
 use std::collections::HashSet;
@@ -994,9 +993,10 @@ impl App {
                 delay: 0,
             });
         }
+        let config = self.config().await?;
         let controller = self.controller_client().await?;
         let result = controller
-            .proxy_delay(name, DEFAULT_DELAY_TEST_URL, DEFAULT_DELAY_TIMEOUT_MS)
+            .proxy_delay(name, &config.delay_test_url, config.delay_test_timeout_ms)
             .await?;
         self.inner
             .storage
@@ -1009,9 +1009,10 @@ impl App {
         if !self.inner.core.is_running().await {
             return Ok(Vec::new());
         }
+        let config = self.config().await?;
         let controller = self.controller_client().await?;
         let result = controller
-            .group_delay(name, DEFAULT_DELAY_TEST_URL, DEFAULT_DELAY_TIMEOUT_MS)
+            .group_delay(name, &config.delay_test_url, config.delay_test_timeout_ms)
             .await?;
         if let Some(best) = result
             .iter()
@@ -2030,6 +2031,24 @@ fn validate_config(config: &SystemConfig) -> Result<(), AppError> {
         return Err(AppError::bad_request(
             "config_invalid",
             format!("unsupported dns mode {}", config.dns_mode),
+        ));
+    }
+    let delay_url = reqwest::Url::parse(&config.delay_test_url).map_err(|_| {
+        AppError::bad_request(
+            "config_invalid_delay_test_url",
+            "delay_test_url must be a valid URL",
+        )
+    })?;
+    if delay_url.scheme() != "https" {
+        return Err(AppError::bad_request(
+            "config_invalid_delay_test_url",
+            "delay_test_url must use HTTPS",
+        ));
+    }
+    if !(1_000..=60_000).contains(&config.delay_test_timeout_ms) {
+        return Err(AppError::bad_request(
+            "config_invalid_delay_timeout",
+            "delay_test_timeout_ms must be between 1000 and 60000",
         ));
     }
     validate_dns_config(config)?;

@@ -74,6 +74,8 @@ const DEFAULT_SYSTEM_CONFIG: SystemConfig = {
   store_selected: true,
   unified_delay: true,
   tcp_concurrent: false,
+  delay_test_url: 'https://cp.cloudflare.com/generate_204',
+  delay_test_timeout_ms: 10000,
   tun: false,
   system_proxy: false,
   mode: 'rule',
