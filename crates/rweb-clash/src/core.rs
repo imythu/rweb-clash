@@ -874,7 +874,7 @@ fn macos_tun_shell_command(
             "/bin/rm -rf \"$tmpdir\"; ",
             "}}; ",
             "trap cleanup EXIT; trap 'requested_stop=1; exit 0' HUP INT TERM; ",
-            "fifo=\"$tmpdir/log\"; /usr/bin/mkfifo \"$fifo\" || exit 1; ",
+            "log_file=\"$tmpdir/mihomo.log\"; /usr/bin/touch \"$log_file\" || exit 1; ",
             "runtime_home=\"$tmpdir/home\"; /bin/mkdir -m 700 \"$runtime_home\" || exit 1; ",
             "/bin/cp {binary} \"$runtime_home/mihomo\" || exit 1; ",
             "[ \"$(/usr/bin/shasum -a 256 \"$runtime_home/mihomo\" | /usr/bin/awk '{{print $1}}')\" = {binary_hash} ] || exit 1; ",
@@ -882,8 +882,8 @@ fn macos_tun_shell_command(
             "/bin/cp {runtime_yaml} \"$runtime_home/runtime.yaml\" || exit 1; ",
             "[ \"$(/usr/bin/shasum -a 256 \"$runtime_home/runtime.yaml\" | /usr/bin/awk '{{print $1}}')\" = {runtime_hash} ] || exit 1; ",
             "{geoip_stage}",
-            "\"$runtime_home/mihomo\" -d \"$runtime_home\" -f \"$runtime_home/runtime.yaml\" >\"$fifo\" 2>&1 & core_pid=$!; ",
-            "( /usr/bin/printf '%s\\n%s\\n' {token} \"$core_pid\"; /bin/cat \"$fifo\"; ) | /usr/bin/nc 127.0.0.1 {port} & bridge_pid=$!; ",
+            "\"$runtime_home/mihomo\" -d \"$runtime_home\" -f \"$runtime_home/runtime.yaml\" >\"$log_file\" 2>&1 & core_pid=$!; ",
+            "( /usr/bin/printf '%s\\n%s\\n' {token} \"$core_pid\"; /usr/bin/tail -n +1 -f \"$log_file\"; ) | /usr/bin/nc 127.0.0.1 {port} & bridge_pid=$!; ",
             "while /bin/kill -0 \"$core_pid\" 2>/dev/null; do ",
             "if ! /bin/kill -0 {owner_pid} 2>/dev/null || ! /bin/kill -0 \"$bridge_pid\" 2>/dev/null || [ -e {stop_path} ]; then ",
             "requested_stop=1; /bin/kill -TERM \"$core_pid\" 2>/dev/null || true; break; fi; ",
@@ -1124,6 +1124,8 @@ mod tests {
         )));
         assert!(command.contains(r#""$runtime_home/mihomo" -d "$runtime_home""#));
         assert!(command.contains("/usr/bin/shasum -a 256"));
+        assert!(command.contains(r#"/usr/bin/tail -n +1 -f "$log_file""#));
+        assert!(!command.contains("mkfifo"));
         assert!(command.contains("/usr/bin/nc 127.0.0.1 32123"));
         assert!(command.contains("/bin/kill -0 42"));
         assert!(command.contains(r#"! /bin/kill -0 "$bridge_pid""#));

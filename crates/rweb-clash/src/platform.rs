@@ -696,7 +696,7 @@ async fn validate_tun_permissions_inner() -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 async fn validate_tun_permissions_inner() -> Result<(), String> {
-    for tool in ["/usr/bin/osascript", "/usr/bin/nc", "/usr/bin/mkfifo"] {
+    for tool in ["/usr/bin/osascript", "/usr/bin/nc", "/usr/bin/tail"] {
         let metadata = tokio::fs::metadata(tool)
             .await
             .map_err(|error| format!("macOS TUN authorization requires {tool}: {error}"))?;

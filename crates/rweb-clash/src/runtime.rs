@@ -585,6 +585,11 @@ fn tun_mapping() -> Value {
     insert(&mut tun, "stack", Value::String("system".into()));
     insert(&mut tun, "auto-route", yaml_value(true));
     insert(&mut tun, "auto-detect-interface", yaml_value(true));
+    insert(
+        &mut tun,
+        "route-exclude-address",
+        yaml_string_sequence(&["127.0.0.0/8".into(), "::1/128".into()]),
+    );
     Value::Mapping(tun)
 }
 
@@ -737,6 +742,21 @@ mod tests {
 
             assert_eq!(actual, Some(expected));
         }
+    }
+
+    #[test]
+    fn tun_excludes_loopback_from_automatic_routes() {
+        let tun = tun_mapping();
+        let excluded = tun
+            .as_mapping()
+            .and_then(|mapping| mapping.get(Value::String("route-exclude-address".into())))
+            .and_then(Value::as_sequence)
+            .expect("TUN route exclusions")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(excluded, vec!["127.0.0.0/8", "::1/128"]);
     }
 
     #[test]
