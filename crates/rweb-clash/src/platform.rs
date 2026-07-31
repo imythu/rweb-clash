@@ -696,6 +696,9 @@ async fn validate_tun_permissions_inner() -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 async fn validate_tun_permissions_inner() -> Result<(), String> {
+    if tokio::net::UnixStream::connect("/var/run/rweb-clash-tun.sock").await.is_ok() {
+        return Ok(());
+    }
     for tool in ["/usr/bin/osascript", "/usr/bin/nc", "/usr/bin/tail"] {
         let metadata = tokio::fs::metadata(tool)
             .await

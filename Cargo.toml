@@ -2,6 +2,7 @@
 members = [
   "crates/rweb-clash",
   "crates/rweb-clash-bin",
+  "crates/rweb-clash-macos-helper",
 ]
 resolver = "2"
 

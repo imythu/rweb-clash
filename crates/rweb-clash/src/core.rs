@@ -20,6 +20,19 @@ use tokio::io::AsyncReadExt;
 use tokio::net::tcp::OwnedWriteHalf;
 #[cfg(any(target_os = "macos", test))]
 use tokio::net::TcpListener;
+#[cfg(any(target_os = "macos", test))]
+use tokio::net::UnixStream;
+
+#[cfg(any(target_os = "macos", test))]
+const MACOS_HELPER_SOCKET: &str = "/var/run/rweb-clash-tun.sock";
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(serde::Deserialize)]
+struct MacosHelperResponse {
+    ok: bool,
+    error: Option<String>,
+    pid: Option<u32>,
+}
 
 const DEFAULT_MIHOMO_VALIDATION_TIMEOUT_SECS: u64 = 120;
 const MAX_MIHOMO_VALIDATION_TIMEOUT_SECS: u64 = 3_600;
@@ -40,6 +53,23 @@ fn mihomo_command(binary: &std::path::Path) -> Command {
     {
         Command::new(binary)
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn macos_helper_request(request: serde_json::Value) -> Result<MacosHelperResponse, AppError> {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = UnixStream::connect(MACOS_HELPER_SOCKET).await.map_err(|error| {
+        AppError::service_unavailable("tun_helper_unavailable", format!("macOS privileged helper is unavailable: {error}"))
+    })?;
+    let mut payload = serde_json::to_vec(&request).map_err(AppError::internal)?;
+    payload.push(b'\n');
+    stream.write_all(&payload).await.map_err(AppError::from)?;
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(5), BufReader::new(stream).read_line(&mut response))
+        .await.map_err(|_| AppError::service_unavailable("tun_helper_timeout", "macOS privileged helper did not respond"))?
+        .map_err(AppError::from)?;
+    let response: MacosHelperResponse = serde_json::from_str(&response).map_err(AppError::internal)?;
+    if response.ok { Ok(response) } else { Err(AppError::service_unavailable("tun_helper_failed", response.error.unwrap_or_else(|| "macOS privileged helper rejected the request".into()))) }
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +290,25 @@ impl CoreManager {
         &self,
         config: &CoreStartConfig,
     ) -> Result<Option<u32>, AppError> {
+        if std::env::var_os("RWEB_CLASH_USE_PRIVILEGED_HELPER").is_some()
+            && config.mihomo_binary.starts_with("/Library/Application Support/rweb-clash/")
+        {
+            let hash = content_hash(tokio::fs::read(&config.mihomo_binary).await?);
+            let client_path = std::env::current_exe().map_err(macos_tun_setup_error)?;
+            let response = macos_helper_request(serde_json::json!({
+                "op": "start",
+                "binary": config.mihomo_binary,
+                "config": config.runtime_yaml,
+                "state_dir": config.runtime_dir,
+                "binary_sha256": hash,
+                "client_path": client_path,
+            })).await?;
+            let log_path = config.runtime_dir.join("mihomo.log");
+            if let Ok(log) = tokio::fs::File::open(log_path).await {
+                self.spawn_log_reader(log, "info".into(), "mihomo-helper".into(), config.log_level.clone());
+            }
+            return Ok(response.pid);
+        }
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .map_err(macos_tun_setup_error)?;
@@ -510,7 +559,12 @@ impl CoreManager {
         } else {
             info!("core stop requested, no child process was tracked");
             #[cfg(target_os = "macos")]
-            self.clear_macos_tun_session().await;
+            {
+                if std::env::var_os("RWEB_CLASH_USE_PRIVILEGED_HELPER").is_some() {
+                    macos_helper_request(serde_json::json!({"op":"stop"})).await?;
+                }
+                self.clear_macos_tun_session().await;
+            }
         }
 
         self.set_status(CoreStatus {

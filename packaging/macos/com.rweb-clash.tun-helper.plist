@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.rweb-clash.tun-helper</string>
+  <key>ProgramArguments</key><array><string>/Library/PrivilegedHelperTools/dev.rweb-clash.tun-helper</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>MachServices</key><dict><key>dev.rweb-clash.tun-helper</key><true/></dict>
+  <key>LimitLoadToSessionType</key><string>System</string>
+</dict></plist>
