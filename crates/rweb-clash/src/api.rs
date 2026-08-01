@@ -96,6 +96,7 @@ pub fn router(app: App) -> Router {
             "/api/connections",
             get(connections).delete(close_all_connections),
         )
+        .route("/api/connections/history", get(connection_history))
         .route("/api/connections/{id}", delete(close_connection))
         .route("/api/dns/flush", post(flush_dns))
         .layer(DefaultBodyLimit::max(MAX_API_BODY_BYTES))
@@ -978,6 +979,12 @@ async fn traffic(State(app): State<App>) -> Json<crate::types::TrafficResponse> 
 
 async fn connections(State(app): State<App>) -> Json<Vec<crate::types::ConnectionResponse>> {
     Json(app.connections().await)
+}
+
+async fn connection_history(
+    State(app): State<App>,
+) -> Result<Json<Vec<crate::types::ConnectionHistoryResponse>>, AppError> {
+    Ok(Json(app.connection_history().await?))
 }
 
 async fn close_connection(

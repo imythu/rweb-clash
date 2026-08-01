@@ -161,8 +161,8 @@ impl ControllerClient {
                     .metadata
                     .host
                     .clone()
-                    .filter(|host| !host.trim().is_empty())
-                    .or_else(|| destination_ip.clone());
+                    .and_then(normalize_connection_host)
+                    .or_else(|| conn.host.and_then(normalize_connection_host));
                 ConnectionResponse {
                     id: conn.id,
                     domain,
@@ -304,6 +304,8 @@ struct ControllerConnections {
 #[derive(Debug, Deserialize)]
 struct ControllerConnection {
     id: String,
+    #[serde(default)]
+    host: Option<String>,
     metadata: ControllerMetadata,
     #[serde(default)]
     rule: Option<String>,
@@ -321,9 +323,9 @@ struct ControllerConnection {
 
 #[derive(Debug, Deserialize)]
 struct ControllerMetadata {
-    #[serde(default)]
+    #[serde(alias = "Host", default)]
     host: Option<String>,
-    #[serde(rename = "destinationIP", default)]
+    #[serde(rename = "destinationIP", alias = "destinationIp", default)]
     destination_ip: Option<String>,
     #[serde(default)]
     network: Option<String>,
@@ -347,6 +349,20 @@ fn value_as_string(value: Option<serde_json::Value>) -> Option<String> {
         Some(serde_json::Value::Number(value)) => Some(value.to_string()),
         _ => None,
     }
+}
+
+fn normalize_connection_host(host: String) -> Option<String> {
+    let mut host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    if let Some((candidate, port)) = host.rsplit_once(':') {
+        if !candidate.contains(':') && port.parse::<u16>().is_ok() {
+            host = candidate;
+        }
+    }
+    let host = host.trim_end_matches('.');
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 fn append_traffic_chunk(payload: &mut Vec<u8>, chunk: &[u8]) -> Result<(), AppError> {

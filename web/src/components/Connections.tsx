@@ -9,7 +9,7 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import { api, type Connection, type Traffic } from '@/lib/api';
+import { api, type Connection, type ConnectionHistory, type Traffic } from '@/lib/api';
 import { usePageActivity } from '@/lib/usePageActivity';
 import { useToast } from './toast-context';
 import { Badge } from '@/components/ui/badge';
@@ -95,10 +95,40 @@ function formatRate(bytes: number) {
 }
 
 function targetLabel(connection: Connection) {
+  const domain = connection.domain?.trim();
+  const port = connection.destinationPort ? `:${connection.destinationPort}` : '';
   const destination = [connection.destinationIp, connection.destinationPort]
     .filter(Boolean)
     .join(':');
-  return connection.domain || destination || '未知目标';
+  if (domain) {
+    return connection.destinationIp && connection.destinationIp !== domain
+      ? `${domain}${port} (${connection.destinationIp})`
+      : `${domain}${port}`;
+  }
+  return destination || '未知目标';
+}
+
+function historyTargetLabel(connection: ConnectionHistory) {
+  const endpoint = connection.domain || connection.destinationIp || '未知目标';
+  return `${endpoint}:${connection.port}`;
+}
+
+function historySearchText(connection: ConnectionHistory) {
+  return [
+    historyTargetLabel(connection),
+    connection.protocol,
+    connection.network,
+    connection.policy,
+    connection.process,
+    connection.rule,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLocaleLowerCase();
+}
+
+function formatHistoryTime(value: string) {
+  return value.replace('T', ' ').replace('Z', '').slice(0, 19);
 }
 
 function connectionSearchText(connection: Connection) {
@@ -134,6 +164,7 @@ export function Connections() {
   const { toast } = useToast();
   const isPageActive = usePageActivity();
   const [connections, setConnections] = useState<LiveConnection[]>([]);
+  const [history, setHistory] = useState<ConnectionHistory[]>([]);
   const [traffic, setTraffic] = useState<Traffic>({ up: 0, down: 0 });
   const [search, setSearch] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('speed');
@@ -151,9 +182,10 @@ export function Connections() {
     if (!isPageActive || document.hidden || inFlight.current) return;
     inFlight.current = true;
     try {
-      const [nextConnections, nextTraffic] = await Promise.all([
+      const [nextConnections, nextTraffic, nextHistory] = await Promise.all([
         api.connections(),
         api.traffic(),
+        api.connectionHistory(),
       ]);
       const sampledAt = performance.now();
       const nextSamples = new Map<string, PreviousSample>();
@@ -176,6 +208,7 @@ export function Connections() {
       previousSamples.current = nextSamples;
       setConnections(live);
       setTraffic(nextTraffic);
+      setHistory(nextHistory);
     } catch {
       if (loading) toast('连接数据加载失败', 'error');
     } finally {
@@ -220,6 +253,13 @@ export function Connections() {
       }
     });
   }, [ascending, connections, search, sortKey]);
+
+  const visibleHistory = useMemo(() => {
+    const query = search.trim().toLocaleLowerCase();
+    return query
+      ? history.filter(connection => historySearchText(connection).includes(query))
+      : history;
+  }, [history, search]);
 
   const selected = connections.find(connection => connection.id === selectedId) ?? null;
   const totals = useMemo(() => connections.reduce(
@@ -464,6 +504,60 @@ export function Connections() {
           </div>
         </>
       )}
+
+      <section className="border-t pt-5">
+        <div className="mb-3 flex items-end justify-between gap-3">
+          <div>
+            <h3 className="text-lg font-semibold">连接历史</h3>
+            <p className="mt-1 text-sm text-muted-foreground">最近 7 天内更新的目标，按协议、域名/IP 和端口合并</p>
+          </div>
+          <span className="shrink-0 text-sm text-muted-foreground">{visibleHistory.length} 条</span>
+        </div>
+        {visibleHistory.length === 0 ? (
+          <p className="border-y py-8 text-center text-sm text-muted-foreground">
+            {search ? '没有匹配的历史连接' : '暂时没有历史连接'}
+          </p>
+        ) : (
+          <div className="overflow-x-auto rounded-lg border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>协议</TableHead>
+                  <TableHead>目标</TableHead>
+                  <TableHead>策略</TableHead>
+                  <TableHead>最近出现</TableHead>
+                  <TableHead>首次出现</TableHead>
+                  <TableHead className="text-right">次数</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {visibleHistory.map(connection => (
+                  <TableRow key={`${connection.protocol}:${historyTargetLabel(connection)}`}>
+                    <TableCell>
+                      <div className="flex flex-col gap-1">
+                        <span className="font-medium">{connection.protocol}</span>
+                        <span className="text-xs text-muted-foreground">{connection.network || '-'}</span>
+                      </div>
+                    </TableCell>
+                    <TableCell className="max-w-72">
+                      <div className="flex flex-col gap-1">
+                        <span className="truncate font-mono" title={historyTargetLabel(connection)}>{historyTargetLabel(connection)}</span>
+                        {connection.destinationIp && connection.domain && connection.destinationIp !== connection.domain && (
+                          <span className="font-mono text-xs text-muted-foreground">IP {connection.destinationIp}</span>
+                        )}
+                      </div>
+                    </TableCell>
+                    <TableCell>{connection.policy || '-'}</TableCell>
+                    <TableCell className="whitespace-nowrap font-mono text-xs">{formatHistoryTime(connection.lastSeenAt)}</TableCell>
+                    <TableCell className="whitespace-nowrap font-mono text-xs text-muted-foreground">{formatHistoryTime(connection.firstSeenAt)}</TableCell>
+                    <TableCell className="text-right font-mono">{connection.seenCount}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </section>
 
       <Sheet open={selected !== null} onOpenChange={open => { if (!open) setSelectedId(null); }}>
         <SheetContent className="flex w-full flex-col gap-0 overflow-y-auto sm:max-w-xl">

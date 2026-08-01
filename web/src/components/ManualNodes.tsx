@@ -1,6 +1,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
+  Copy,
   Edit3,
   Plus,
   Save,
@@ -835,21 +836,39 @@ export function ManualNodes() {
     setEditorOpen(true);
   };
 
-  const openEdit = (node: ManualNode) => {
+  const nodeDraft = (node: ManualNode, name: string): Draft => {
     const type = node.type in MANUAL_NODE_PROTOCOLS ? node.type : 'ss';
     const config = node.config;
     const nodeFields = protocolFields(type);
     const values: Record<string, DraftValue> = {};
     for (const field of nodeFields) values[field.key] = editValue(field, getNested(config, field.key));
 
-    setEditingName(node.name);
-    setDraft({
-      name: node.displayName,
+    return {
+      name,
       type,
       values,
       preservedConfig: cloneConfig(config),
       unknownPaths: unknownConfigPaths(config, nodeFields),
-    });
+    };
+  };
+
+  const openEdit = (node: ManualNode) => {
+    setEditingName(node.name);
+    setDraft(nodeDraft(node, node.displayName));
+    setInvalidKeys(new Set());
+    setEditorOpen(true);
+  };
+
+  const openCopy = (node: ManualNode) => {
+    const baseName = `${node.displayName} - 副本`;
+    let name = baseName;
+    let suffix = 2;
+    while (nodes.some(item => item.name === name || item.displayName === name)) {
+      name = `${baseName} ${suffix}`;
+      suffix += 1;
+    }
+    setEditingName(null);
+    setDraft(nodeDraft(node, name));
     setInvalidKeys(new Set());
     setEditorOpen(true);
   };
@@ -1073,6 +1092,10 @@ export function ManualNodes() {
                   >
                     {testingName === node.name ? <Spinner /> : <Activity />}
                     <span className="sr-only">测试节点延迟</span>
+                  </Button>
+                  <Button variant="ghost" size="icon" title="复制节点" onClick={() => openCopy(node)}>
+                    <Copy />
+                    <span className="sr-only">复制节点</span>
                   </Button>
                   <Button variant="ghost" size="icon" title="编辑节点" onClick={() => openEdit(node)}>
                     <Edit3 />

@@ -20,11 +20,12 @@ use crate::runtime::compile_runtime_yaml;
 use crate::storage::Storage;
 use crate::subscription::{cleanup_stale_subscription_candidates, SubscriptionSyncer};
 use crate::types::{
-    ConnectionResponse, CoreStatusResponse, DelayResponse, EgressResponse, FilterRuleInput,
-    ManualNodeInput, ManualNodeResponse, OperationResponse, ProxyGroupRequest,
-    ProxyTopologyResponse, RuleInput, RuleResponse, RuleSetInput, RuleSetResponse, RuleTestRequest,
-    RuleTestResponse, SelectProxyRequest, SetupStatusResponse, SubscriptionInput,
-    SubscriptionResponse, SystemConfig, SystemConfigPatch, SystemStatusResponse, TrafficResponse,
+    ConnectionHistoryResponse, ConnectionResponse, CoreStatusResponse, DelayResponse,
+    EgressResponse, FilterRuleInput, ManualNodeInput, ManualNodeResponse, OperationResponse,
+    ProxyGroupRequest, ProxyTopologyResponse, RuleInput, RuleResponse, RuleSetInput,
+    RuleSetResponse, RuleTestRequest, RuleTestResponse, SelectProxyRequest, SetupStatusResponse,
+    SubscriptionInput, SubscriptionResponse, SystemConfig, SystemConfigPatch, SystemStatusResponse,
+    TrafficResponse,
 };
 use crate::util::{new_id, parse_host_from_log, validate_url};
 use futures_util::stream::{self, StreamExt};
@@ -1487,12 +1488,40 @@ impl App {
     }
 
     pub async fn connections(&self) -> Vec<ConnectionResponse> {
+        self.fetch_connections().await.unwrap_or_default()
+    }
+
+    pub async fn connection_history(&self) -> Result<Vec<ConnectionHistoryResponse>, AppError> {
+        self.inner.storage.list_connection_history().await
+    }
+
+    async fn fetch_connections(&self) -> Result<Vec<ConnectionResponse>, AppError> {
         if !self.inner.core.is_running().await {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        match self.controller_client().await {
-            Ok(controller) => controller.connections().await.unwrap_or_default(),
-            Err(_) => Vec::new(),
+        let controller = self.controller_client().await?;
+        controller.connections().await
+    }
+
+    async fn connection_history_loop(self) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if !self.inner.core.is_running().await {
+                continue;
+            }
+            let Ok(connections) = self.fetch_connections().await else {
+                continue;
+            };
+            if let Err(error) = self
+                .inner
+                .storage
+                .record_connection_history(&connections)
+                .await
+            {
+                warn!(%error, "failed to record background connection history");
+            }
         }
     }
 
@@ -1947,6 +1976,10 @@ impl App {
                     app.refresh_startup_assets().await;
                     app.background_loop().await;
                 });
+                let history_app = self.clone();
+                tokio::spawn(async move {
+                    history_app.connection_history_loop().await;
+                });
             })
             .await;
     }
@@ -2100,6 +2133,9 @@ impl App {
                 }
                 Ok(false) => {}
                 Err(error) => warn!(%error, "failed to evaluate automatic WebDAV backup"),
+            }
+            if let Err(error) = self.inner.storage.cleanup_connection_history().await {
+                warn!(%error, "failed to clean up expired connection history");
             }
         }
     }

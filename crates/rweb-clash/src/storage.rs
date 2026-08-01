@@ -3,11 +3,11 @@ use crate::paths::{
     ensure_private_directory, restrict_sensitive_file_permissions, sqlite_companion_path, AppPaths,
 };
 use crate::types::{
-    DownloadRoute, FilterRule, FilterRuleInput, GroupFilterInput, LogEntryResponse,
-    ManualNodeResponse, ProxyGroupResponse, ProxyNodeResponse, RuleResponse, RuleSetResponse,
-    SubscriptionMemberGroup, SubscriptionMemberNode, SubscriptionMemberSection,
-    SubscriptionMembersResponse, SubscriptionResponse, SystemConfig, TrafficQuota, BUILTIN_DIRECT,
-    BUILTIN_GLOBAL, BUILTIN_PROXY, BUILTIN_REJECT, SUB_DELIMITER,
+    ConnectionHistoryResponse, ConnectionResponse, DownloadRoute, FilterRule, FilterRuleInput,
+    GroupFilterInput, LogEntryResponse, ManualNodeResponse, ProxyGroupResponse, ProxyNodeResponse,
+    RuleResponse, RuleSetResponse, SubscriptionMemberGroup, SubscriptionMemberNode,
+    SubscriptionMemberSection, SubscriptionMembersResponse, SubscriptionResponse, SystemConfig,
+    TrafficQuota, BUILTIN_DIRECT, BUILTIN_GLOBAL, BUILTIN_PROXY, BUILTIN_REJECT, SUB_DELIMITER,
 };
 use crate::util::{bool_to_i64, display_log_time, i64_to_bool, new_id, normalize_status, now_iso};
 use serde_json::{Map, Value};
@@ -316,6 +316,7 @@ impl Storage {
             topology_mutation: Arc::new(Mutex::new(())),
         };
         storage.migrate().await?;
+        storage.cleanup_connection_history().await?;
         storage.normalize_routing_match_rules().await?;
         storage.cleanup_pending_subscriptions().await?;
         storage.cleanup_pending_rule_sets().await?;
@@ -379,6 +380,7 @@ impl Storage {
                 "global_filter_rules",
                 "traffic_snapshots",
                 "log_entries",
+                "connection_history",
                 "app_settings",
             ];
             const INSERT_ORDER: &[&str] = &[
@@ -393,6 +395,7 @@ impl Storage {
                 "rule_sets",
                 "traffic_snapshots",
                 "log_entries",
+                "connection_history",
             ];
 
             for table in INSERT_ORDER {
@@ -402,7 +405,7 @@ impl Storage {
                 .bind(table)
                 .fetch_one(&mut *connection)
                 .await?;
-                if !exists {
+                if !exists && *table != "connection_history" {
                     return Err(AppError::bad_request(
                         "backup_incompatible",
                         format!("backup database is missing table {table}"),
@@ -420,6 +423,15 @@ impl Storage {
                         .await?;
                 }
                 for table in INSERT_ORDER {
+                    let exists = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM backup.sqlite_master WHERE type = 'table' AND name = ?)",
+                    )
+                    .bind(table)
+                    .fetch_one(&mut *connection)
+                    .await?;
+                    if !exists {
+                        continue;
+                    }
                     let main_columns = attached_table_columns(&mut connection, "main", table).await?;
                     let backup_columns =
                         attached_table_columns(&mut connection, "backup", table).await?;
@@ -688,6 +700,25 @@ CREATE TABLE IF NOT EXISTS log_entries (
             "CREATE INDEX IF NOT EXISTS idx_log_entries_time ON log_entries(time)",
             "CREATE INDEX IF NOT EXISTS idx_log_entries_level_time ON log_entries(level, time)",
             "CREATE INDEX IF NOT EXISTS idx_log_entries_parsed_host ON log_entries(parsed_host)",
+            r#"
+CREATE TABLE IF NOT EXISTS connection_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  protocol TEXT NOT NULL,
+  endpoint_key TEXT NOT NULL,
+  domain TEXT,
+  destination_ip TEXT,
+  port TEXT NOT NULL,
+  network TEXT,
+  policy TEXT,
+  process TEXT,
+  rule TEXT,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  seen_count INTEGER NOT NULL DEFAULT 1,
+  UNIQUE(protocol, endpoint_key, port)
+)
+"#,
+            "CREATE INDEX IF NOT EXISTS idx_connection_history_last_seen ON connection_history(last_seen_at)",
         ];
 
         for statement in migrations {
@@ -3673,6 +3704,126 @@ WHERE id = ?
         Ok(())
     }
 
+    pub async fn record_connection_history(
+        &self,
+        connections: &[ConnectionResponse],
+    ) -> Result<(), AppError> {
+        let now = now_iso();
+        let mut transaction = self.pool.begin().await?;
+        for connection in connections {
+            let domain = connection
+                .domain
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let destination_ip = connection
+                .destination_ip
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let endpoint = domain.or(destination_ip);
+            let Some(endpoint) = endpoint else {
+                continue;
+            };
+            let Some(port) = connection
+                .destination_port
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let protocol = connection
+                .connection_type
+                .as_deref()
+                .or(connection.network.as_deref())
+                .unwrap_or("unknown")
+                .trim()
+                .to_ascii_lowercase();
+            let endpoint_key = endpoint.trim_end_matches('.').to_ascii_lowercase();
+
+            sqlx::query(
+                r#"
+INSERT INTO connection_history(
+  protocol, endpoint_key, domain, destination_ip, port, network, policy, process, rule,
+  first_seen_at, last_seen_at, seen_count
+)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+ON CONFLICT(protocol, endpoint_key, port) DO UPDATE SET
+  domain = COALESCE(excluded.domain, connection_history.domain),
+  destination_ip = COALESCE(excluded.destination_ip, connection_history.destination_ip),
+  network = excluded.network,
+  policy = excluded.policy,
+  process = excluded.process,
+  rule = excluded.rule,
+  last_seen_at = excluded.last_seen_at,
+  seen_count = connection_history.seen_count + 1
+"#,
+            )
+            .bind(protocol)
+            .bind(endpoint_key)
+            .bind(domain)
+            .bind(destination_ip)
+            .bind(port)
+            .bind(connection.network.as_deref())
+            .bind(connection.policy.as_deref())
+            .bind(connection.process.as_deref())
+            .bind(connection.rule.as_deref())
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        sqlx::query(
+            "DELETE FROM connection_history WHERE julianday(last_seen_at) < julianday('now', '-7 days')",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_connection_history(
+        &self,
+    ) -> Result<Vec<ConnectionHistoryResponse>, AppError> {
+        let rows = sqlx::query(
+            r#"
+SELECT protocol, domain, destination_ip, port, network, policy, process, rule,
+       first_seen_at, last_seen_at, seen_count
+FROM connection_history
+ORDER BY last_seen_at DESC
+"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ConnectionHistoryResponse {
+                    protocol: row.try_get("protocol")?,
+                    domain: row.try_get("domain")?,
+                    destination_ip: row.try_get("destination_ip")?,
+                    port: row.try_get("port")?,
+                    network: row.try_get("network")?,
+                    policy: row.try_get("policy")?,
+                    process: row.try_get("process")?,
+                    rule: row.try_get("rule")?,
+                    first_seen_at: row.try_get("first_seen_at")?,
+                    last_seen_at: row.try_get("last_seen_at")?,
+                    seen_count: row.try_get("seen_count")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn cleanup_connection_history(&self) -> Result<(), AppError> {
+        sqlx::query(
+            "DELETE FROM connection_history WHERE julianday(last_seen_at) < julianday('now', '-7 days')",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn append_log(
         &self,
         level: &str,
@@ -4788,6 +4939,65 @@ mod tests {
         }
 
         storage.pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn connection_history_prefers_domain_and_removes_stale_rows() {
+        let temp = TestDir::new("connection-history");
+        let storage = Storage::connect(&AppPaths::from_root(temp.path()))
+            .await
+            .expect("connect test storage");
+        let connection = |domain: Option<&str>, connection_type: &str| ConnectionResponse {
+            id: "live-1".into(),
+            domain: domain.map(str::to_string),
+            rule: Some("MATCH".into()),
+            policy: Some("PROXY".into()),
+            speed: "实时".into(),
+            network: Some("tcp".into()),
+            connection_type: Some(connection_type.into()),
+            source_ip: Some("127.0.0.1".into()),
+            source_port: Some("50000".into()),
+            destination_ip: Some("203.0.113.10".into()),
+            destination_port: Some("443".into()),
+            process: Some("browser".into()),
+            start: None,
+            upload: 0,
+            download: 0,
+            chains: vec!["PROXY".into()],
+            rule_payload: None,
+        };
+
+        storage
+            .record_connection_history(&[connection(Some("Example.COM."), "HTTP")])
+            .await
+            .expect("record first connection");
+        storage
+            .record_connection_history(&[connection(Some("example.com"), "http")])
+            .await
+            .expect("record repeated connection");
+
+        let history = storage
+            .list_connection_history()
+            .await
+            .expect("list connection history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].protocol, "http");
+        assert_eq!(history[0].seen_count, 2);
+        assert_eq!(history[0].domain.as_deref(), Some("example.com"));
+
+        sqlx::query("UPDATE connection_history SET last_seen_at = '2000-01-01T00:00:00Z'")
+            .execute(&storage.pool)
+            .await
+            .expect("age connection history");
+        storage
+            .cleanup_connection_history()
+            .await
+            .expect("clean stale connection history");
+        assert!(storage
+            .list_connection_history()
+            .await
+            .expect("list cleaned history")
+            .is_empty());
     }
 
     #[tokio::test]

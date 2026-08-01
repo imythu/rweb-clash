@@ -83,6 +83,20 @@ export type Connection = {
   rulePayload: string | null;
 };
 
+export type ConnectionHistory = {
+  protocol: string;
+  domain: string | null;
+  destinationIp: string | null;
+  port: string;
+  network: string | null;
+  policy: string | null;
+  process: string | null;
+  rule: string | null;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  seenCount: number;
+};
+
 export type DownloadRoute = 'direct' | 'core' | 'system' | 'auto';
 
 export type FilterRule = {
@@ -550,6 +564,7 @@ export const api = {
 
   traffic: () => request<Traffic>('/traffic'),
   connections: () => request<Connection[]>('/connections'),
+  connectionHistory: () => request<ConnectionHistory[]>('/connections/history'),
   closeConnection: (id: string) => request<void>(`/connections/${encodePathPart(id)}`, { method: 'DELETE' }),
   closeAllConnections: () => request<void>('/connections', { method: 'DELETE' }),
   flushDns: () => request<void>('/dns/flush', { method: 'POST' }),

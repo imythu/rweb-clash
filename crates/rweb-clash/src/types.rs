@@ -744,6 +744,25 @@ pub struct ConnectionResponse {
     pub rule_payload: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionHistoryResponse {
+    pub protocol: String,
+    pub domain: Option<String>,
+    #[serde(rename = "destinationIp")]
+    pub destination_ip: Option<String>,
+    pub port: String,
+    pub network: Option<String>,
+    pub policy: Option<String>,
+    pub process: Option<String>,
+    pub rule: Option<String>,
+    #[serde(rename = "firstSeenAt")]
+    pub first_seen_at: String,
+    #[serde(rename = "lastSeenAt")]
+    pub last_seen_at: String,
+    #[serde(rename = "seenCount")]
+    pub seen_count: i64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManualNodeInput {
     pub name: String,

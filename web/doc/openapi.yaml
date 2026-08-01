@@ -383,6 +383,19 @@ paths:
                 items:
                   $ref: '#/components/schemas/Connection'
 
+  /connections/history:
+    get:
+      summary: 获取最近 7 天连接历史
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ConnectionHistory'
+
   /nodes/test:
     post:
       summary: 对特定节点执行延迟测试
@@ -679,3 +692,18 @@ components:
         rule: { type: string }
         policy: { type: string }
         speed: { type: string }
+
+    ConnectionHistory:
+      type: object
+      properties:
+        protocol: { type: string }
+        domain: { type: string, nullable: true }
+        destinationIp: { type: string, nullable: true }
+        port: { type: string }
+        network: { type: string, nullable: true }
+        policy: { type: string, nullable: true }
+        process: { type: string, nullable: true }
+        rule: { type: string, nullable: true }
+        firstSeenAt: { type: string, format: date-time }
+        lastSeenAt: { type: string, format: date-time }
+        seenCount: { type: integer }

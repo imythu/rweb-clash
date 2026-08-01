@@ -109,7 +109,8 @@ Content-Type: application/json
 | --- | --- | --- |
 | `GET /api/core/status` | `/version`、进程状态 | 查询内核状态 |
 | `GET /api/traffic` | `/traffic` | 轮询查询实时流量（不落库） |
-| `GET /api/connections` | `/connections` | 轮询查询活跃连接（不落库） |
+| `GET /api/connections` | `/connections` | 查询活跃连接，并由后台采集连接历史 |
+| `GET /api/connections/history` | SQLite `connection_history` | 查询最近 7 天内更新的连接历史 |
 | `DELETE /api/connections/{id}` | `/connections/{id}` | 关闭连接 |
 | `PUT /api/proxies/{group}` | `/proxies/{group}` | 劫持代理组切换，**直接通过 API 通知内核换节点** |
 | `POST /api/nodes/test` | `/proxies/{name}/delay` | 单节点测速 |
