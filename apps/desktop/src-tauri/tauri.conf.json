@@ -43,7 +43,8 @@
     "resources": [
       "resources/core/*",
       "resources/rule-sets/*",
-      "resources/runtime/*"
+      "resources/runtime/*",
+      "resources/windows/*"
     ]
   }
 }

@@ -103,6 +103,7 @@ Invoke-Step "Check release version synchronization" {
     foreach ($lockPackage in @(
       @{ Content = $workspaceCargoLock; Name = "rweb-clash" },
       @{ Content = $workspaceCargoLock; Name = "rweb-clash-bin" },
+      @{ Content = $workspaceCargoLock; Name = "rweb-clash-windows-helper" },
       @{ Content = $desktopCargoLock; Name = "rweb-clash" },
       @{ Content = $desktopCargoLock; Name = "rweb-clash-desktop" }
     )) {

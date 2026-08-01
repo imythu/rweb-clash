@@ -237,7 +237,7 @@ $desktopCargo = Set-TomlSectionVersion `
   -ReleaseVersion $candidate
 $workspaceCargoLock = Set-CargoLockPackageVersions `
   -Content ([System.IO.File]::ReadAllText($workspaceCargoLockPath)) `
-  -PackageNames @("rweb-clash", "rweb-clash-bin", "rweb-clash-macos-helper") `
+  -PackageNames @("rweb-clash", "rweb-clash-bin", "rweb-clash-macos-helper", "rweb-clash-windows-helper") `
   -ReleaseVersion $candidate
 $desktopCargoLock = Set-CargoLockPackageVersions `
   -Content ([System.IO.File]::ReadAllText($desktopCargoLockPath)) `

@@ -5,6 +5,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Invoke-Native {
+  param(
+    [Parameter(Mandatory = $true)]
+    [scriptblock]$Command
+  )
+  & $Command
+  if ($LASTEXITCODE -ne 0) {
+    throw "Command failed with exit code $LASTEXITCODE."
+  }
+}
+
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $resourceRoot = Join-Path $repoRoot "apps/desktop/src-tauri/resources"
 $coreSource = Join-Path $repoRoot "packaging/cache/cores/$Target"
@@ -13,6 +24,7 @@ $runtimeSource = Join-Path $repoRoot "packaging/cache/runtime"
 $coreDest = Join-Path $resourceRoot "core"
 $ruleSetDest = Join-Path $resourceRoot "rule-sets"
 $runtimeDest = Join-Path $resourceRoot "runtime"
+$windowsHelperDest = Join-Path $resourceRoot "windows"
 
 if (-not (Test-Path -LiteralPath $coreSource)) {
   throw "Core cache not found: $coreSource"
@@ -50,5 +62,19 @@ $ruleFiles | Copy-Item -Destination $ruleSetDest -Force
 
 Copy-Item -LiteralPath $ruleManifest -Destination $ruleSetDest -Force
 Copy-Item -LiteralPath $runtimeAsset, $runtimeManifest -Destination $runtimeDest -Force
+
+if ($Target.StartsWith("windows-", [System.StringComparison]::Ordinal)) {
+  $helperTarget = "x86_64-pc-windows-msvc"
+  $helperManifest = Join-Path $repoRoot "crates/rweb-clash-windows-helper/Cargo.toml"
+  Invoke-Native {
+    cargo build --manifest-path $helperManifest --release --locked --target $helperTarget
+  }
+  $helperPath = Join-Path $repoRoot "target/$helperTarget/release/rweb-clash-windows-helper.exe"
+  if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
+    throw "Windows TUN helper binary not found: $helperPath"
+  }
+  New-Item -ItemType Directory -Force -Path $windowsHelperDest | Out-Null
+  Copy-Item -LiteralPath $helperPath -Destination $windowsHelperDest -Force
+}
 
 Write-Host "Prepared Tauri resources for $Target at $resourceRoot"

@@ -2,7 +2,7 @@ use crate::error::AppError;
 use crate::paths::AppPaths;
 use crate::storage::Storage;
 use crate::types::CoreStatusResponse;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 use crate::util::content_hash;
 use crate::util::{now_iso, parse_host_from_log};
 use axum::http::StatusCode;
@@ -30,12 +30,24 @@ const MACOS_HELPER_BINARY: &str = "/Library/PrivilegedHelperTools/dev.rweb-clash
 #[cfg(any(target_os = "macos", test))]
 const MACOS_HELPER_PLIST: &str = "/Library/LaunchDaemons/com.rweb-clash.tun-helper.plist";
 
+#[cfg(target_os = "windows")]
+const WINDOWS_HELPER_PIPE: &str = r"\\.\pipe\rweb-clash-tun";
+
 #[cfg(any(target_os = "macos", test))]
 #[derive(serde::Deserialize)]
 struct MacosHelperResponse {
     ok: bool,
     error: Option<String>,
     pid: Option<u32>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, serde::Deserialize)]
+struct WindowsHelperResponse {
+    ok: bool,
+    error: Option<String>,
+    pid: Option<u32>,
+    running: Option<bool>,
 }
 
 const DEFAULT_MIHOMO_VALIDATION_TIMEOUT_SECS: u64 = 120;
@@ -98,6 +110,226 @@ async fn macos_helper_request(request: serde_json::Value) -> Result<MacosHelperR
                 .unwrap_or_else(|| "macOS privileged helper rejected the request".into()),
         ))
     }
+}
+
+#[cfg(target_os = "windows")]
+async fn windows_helper_request(
+    request: serde_json::Value,
+) -> Result<WindowsHelperResponse, AppError> {
+    let payload = serde_json::to_vec(&request).map_err(AppError::internal)?;
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            use std::fs::OpenOptions;
+            use std::io::{BufRead, BufReader, Write};
+
+            let mut stream = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(WINDOWS_HELPER_PIPE)
+                .map_err(|error| {
+                    AppError::service_unavailable(
+                        "tun_helper_unavailable",
+                        format!("Windows privileged TUN helper is unavailable: {error}"),
+                    )
+                })?;
+            stream.write_all(&payload).map_err(AppError::from)?;
+            stream.write_all(b"\n").map_err(AppError::from)?;
+            stream.flush().map_err(AppError::from)?;
+            let mut response = String::new();
+            BufReader::new(stream)
+                .read_line(&mut response)
+                .map_err(AppError::from)?;
+            serde_json::from_str::<WindowsHelperResponse>(&response).map_err(AppError::internal)
+        }),
+    )
+    .await
+    .map_err(|_| {
+        AppError::service_unavailable(
+            "tun_helper_timeout",
+            "Windows privileged TUN helper did not respond",
+        )
+    })?
+    .map_err(|error| AppError::service_unavailable("tun_helper_failed", error.to_string()))??;
+    if response.ok {
+        Ok(response)
+    } else {
+        Err(AppError::service_unavailable(
+            "tun_helper_failed",
+            response
+                .error
+                .unwrap_or_else(|| "Windows privileged TUN helper rejected the request".into()),
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn windows_helper_available() -> bool {
+    windows_helper_request(serde_json::json!({"op":"ping"}))
+        .await
+        .is_ok()
+}
+
+#[cfg(target_os = "windows")]
+async fn windows_helper_status() -> Result<bool, AppError> {
+    Ok(windows_helper_request(serde_json::json!({"op":"status"}))
+        .await?
+        .running
+        .unwrap_or(false))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_helper_resource_paths() -> Result<(std::path::PathBuf, std::path::PathBuf), AppError> {
+    let executable = std::env::current_exe().map_err(AppError::from)?;
+    let install_root = executable.parent().ok_or_else(|| {
+        AppError::service_unavailable(
+            "tun_helper_unavailable",
+            "cannot locate the Windows application installation directory",
+        )
+    })?;
+    Ok((
+        install_root
+            .join("resources")
+            .join("windows")
+            .join("rweb-clash-windows-helper.exe"),
+        install_root
+            .join("resources")
+            .join("core")
+            .join("mihomo.exe"),
+    ))
+}
+
+#[cfg(target_os = "windows")]
+async fn install_windows_privileged_helper(runtime_dir: &std::path::Path) -> Result<(), AppError> {
+    let (helper, core) = windows_helper_resource_paths()?;
+    for (path, label) in [(&helper, "helper"), (&core, "Mihomo core")] {
+        let metadata = tokio::fs::metadata(path).await.map_err(|error| {
+            AppError::service_unavailable(
+                "tun_helper_unavailable",
+                format!(
+                    "packaged Windows TUN {label} is unavailable at {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(AppError::service_unavailable(
+                "tun_helper_unavailable",
+                format!(
+                    "packaged Windows TUN {label} is not a regular file: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    let helper = helper.to_str().ok_or_else(|| {
+        AppError::service_unavailable(
+            "tun_authorization_failed",
+            "Windows helper path is not UTF-8",
+        )
+    })?;
+    let core = core.to_str().ok_or_else(|| {
+        AppError::service_unavailable("tun_authorization_failed", "Mihomo core path is not UTF-8")
+    })?;
+    let root = runtime_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| {
+            AppError::service_unavailable(
+                "tun_authorization_failed",
+                "cannot locate the application data directory for the Windows TUN helper",
+            )
+        })?;
+    let root = root.to_str().ok_or_else(|| {
+        AppError::service_unavailable(
+            "tun_authorization_failed",
+            "application data path is not UTF-8",
+        )
+    })?;
+    let user_sid = windows_current_user_sid().await?;
+    let script = format!(
+        "$p = Start-Process -FilePath {} -ArgumentList @('--install','--root',{},'--core',{},'--user-sid',{}) -Verb RunAs -Wait -PassThru; exit $p.ExitCode",
+        powershell_quote(helper),
+        powershell_quote(root),
+        powershell_quote(core),
+        powershell_quote(&user_sid),
+    );
+    let mut command = Command::new("powershell");
+    command.creation_flags(0x0800_0000);
+    let output = command
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .output()
+        .await
+        .map_err(|error| {
+            AppError::service_unavailable(
+                "tun_authorization_failed",
+                format!("failed to request Windows administrator authorization for TUN: {error}"),
+            )
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = [output.stderr, output.stdout]
+            .into_iter()
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(AppError::service_unavailable(
+            "tun_authorization_failed",
+            if detail.is_empty() {
+                format!(
+                    "Windows administrator authorization for TUN exited with {}",
+                    output.status
+                )
+            } else {
+                format!("Windows TUN helper installation failed: {detail}")
+            },
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn windows_current_user_sid() -> Result<String, AppError> {
+    let script = r#"$identity = [Security.Principal.WindowsIdentity]::GetCurrent(); [Console]::Write($identity.User.Value)"#;
+    let mut command = Command::new("powershell");
+    command.creation_flags(0x0800_0000);
+    let output = command
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .output()
+        .await
+        .map_err(|error| {
+            AppError::service_unavailable(
+                "tun_authorization_failed",
+                format!("failed to identify the Windows desktop user: {error}"),
+            )
+        })?;
+    let sid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if output.status.success() && sid.starts_with("S-") {
+        Ok(sid)
+    } else {
+        Err(AppError::service_unavailable(
+            "tun_authorization_failed",
+            "could not identify the Windows desktop user for the TUN helper ACL",
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -224,6 +456,8 @@ struct CoreInner {
     child: Mutex<Option<Child>>,
     #[cfg(any(target_os = "macos", test))]
     macos_tun: Mutex<Option<MacosTunSession>>,
+    #[cfg(target_os = "windows")]
+    windows_tun: Mutex<Option<WindowsTunSession>>,
     status: RwLock<CoreStatus>,
 }
 
@@ -233,6 +467,10 @@ struct MacosTunSession {
     stop_path: std::path::PathBuf,
     _bridge: OwnedWriteHalf,
 }
+
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+struct WindowsTunSession {}
 
 #[derive(Debug, Clone)]
 struct CoreStatus {
@@ -278,6 +516,8 @@ impl CoreManager {
                 child: Mutex::new(None),
                 #[cfg(any(target_os = "macos", test))]
                 macos_tun: Mutex::new(None),
+                #[cfg(target_os = "windows")]
+                windows_tun: Mutex::new(None),
                 status: RwLock::new(CoreStatus::default()),
             }),
         }
@@ -385,6 +625,10 @@ impl CoreManager {
     }
 
     async fn spawn_core_process(&self, config: &CoreStartConfig) -> Result<Option<u32>, AppError> {
+        #[cfg(target_os = "windows")]
+        if config.tun {
+            return self.spawn_windows_tun_process(config).await;
+        }
         #[cfg(target_os = "macos")]
         if config.tun {
             return self.spawn_macos_tun_process(config).await;
@@ -423,6 +667,47 @@ impl CoreManager {
         let mut guard = self.inner.child.lock().await;
         *guard = Some(child);
         Ok(pid)
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn spawn_windows_tun_process(
+        &self,
+        config: &CoreStartConfig,
+    ) -> Result<Option<u32>, AppError> {
+        if !windows_helper_available().await {
+            install_windows_privileged_helper(&config.runtime_dir).await?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !windows_helper_available().await {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(AppError::service_unavailable(
+                        "tun_helper_unavailable",
+                        "Windows privileged TUN helper did not become available after installation",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        let (_, protected_binary) = windows_helper_resource_paths()?;
+        let binary_hash = content_hash(tokio::fs::read(&protected_binary).await?);
+        let response = windows_helper_request(serde_json::json!({
+            "op": "start",
+            "binary": protected_binary,
+            "config": config.runtime_yaml,
+            "state_dir": config.runtime_dir,
+            "binary_sha256": binary_hash,
+        }))
+        .await?;
+        if let Ok(log) = tokio::fs::File::open(config.runtime_dir.join("mihomo.log")).await {
+            self.spawn_log_reader(
+                log,
+                "info".into(),
+                "mihomo-helper".into(),
+                config.log_level.clone(),
+            );
+        }
+        let mut guard = self.inner.windows_tun.lock().await;
+        *guard = Some(WindowsTunSession {});
+        Ok(response.pid)
     }
 
     #[cfg(any(target_os = "macos", test))]
@@ -728,6 +1013,10 @@ impl CoreManager {
                 self.stop_macos_helper_process().await?;
                 self.clear_macos_tun_session().await;
             }
+            #[cfg(target_os = "windows")]
+            {
+                self.stop_windows_tun_process().await?;
+            }
         }
 
         self.set_status(CoreStatus {
@@ -883,6 +1172,12 @@ impl CoreManager {
                 }
                 self.clear_macos_tun_session().await;
             }
+            #[cfg(target_os = "windows")]
+            {
+                if let Err(error) = self.stop_windows_tun_process().await {
+                    warn!(%error, "failed stopping Windows TUN helper after startup failure");
+                }
+            }
         }
     }
 
@@ -890,6 +1185,15 @@ impl CoreManager {
     async fn stop_macos_helper_process(&self) -> Result<(), AppError> {
         if macos_helper_available().await {
             macos_helper_request(serde_json::json!({"op":"stop"})).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn stop_windows_tun_process(&self) -> Result<(), AppError> {
+        let session = self.inner.windows_tun.lock().await.take();
+        if session.is_some() && windows_helper_available().await {
+            windows_helper_request(serde_json::json!({"op":"stop"})).await?;
         }
         Ok(())
     }
@@ -928,6 +1232,17 @@ impl CoreManager {
                 None
             }
         };
+        #[cfg(target_os = "windows")]
+        if self.inner.windows_tun.lock().await.is_some()
+            && !windows_helper_status().await.unwrap_or(false)
+        {
+            self.inner.windows_tun.lock().await.take();
+            self.mark_error(
+                controller_addr.clone(),
+                "Windows privileged TUN helper stopped Mihomo unexpectedly",
+            )
+            .await;
+        }
         if let Some(status) = exited {
             #[cfg(target_os = "macos")]
             self.clear_macos_tun_session().await;

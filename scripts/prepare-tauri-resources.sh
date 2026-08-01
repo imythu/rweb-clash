@@ -29,6 +29,7 @@ core_dest="$resource_root/core"
 rule_set_dest="$resource_root/rule-sets"
 runtime_dest="$resource_root/runtime"
 macos_helper_dest="$resource_root/macos"
+windows_helper_dest="$resource_root/windows"
 
 if [[ ! -d "$core_source" ]]; then
   echo "core cache not found: $core_source" >&2
@@ -66,23 +67,37 @@ cp "$rule_set_source/manifest.json" "$rule_set_dest/"
 cp "$runtime_source/geoip.metadb" "$runtime_source/manifest.json" "$runtime_dest/"
 
 case "$target" in
+  windows-amd64|windows-x86_64)
+    helper_manifest="$repo_root/crates/rweb-clash-windows-helper/Cargo.toml"
+    helper_rust_target="x86_64-pc-windows-gnu"
+    helper_binary="rweb-clash-windows-helper.exe"
+    helper_dest="$windows_helper_dest"
+    ;;
   macos-arm64|macos-aarch64)
+    helper_manifest="$repo_root/crates/rweb-clash-macos-helper/Cargo.toml"
     helper_rust_target="aarch64-apple-darwin"
+    helper_binary="rweb-clash-macos-helper"
+    helper_dest="$macos_helper_dest"
     ;;
   macos-x86_64)
+    helper_manifest="$repo_root/crates/rweb-clash-macos-helper/Cargo.toml"
     helper_rust_target="x86_64-apple-darwin"
+    helper_binary="rweb-clash-macos-helper"
+    helper_dest="$macos_helper_dest"
     ;;
 esac
 
 if [[ -n "${helper_rust_target:-}" ]]; then
   cargo build \
-    --manifest-path "$repo_root/crates/rweb-clash-macos-helper/Cargo.toml" \
+    --manifest-path "$helper_manifest" \
     --release --locked --target "$helper_rust_target"
-  mkdir -p "$macos_helper_dest"
-  cp "$repo_root/target/$helper_rust_target/release/rweb-clash-macos-helper" \
-    "$macos_helper_dest/rweb-clash-macos-helper"
-  cp "$repo_root/packaging/macos/com.rweb-clash.tun-helper.plist" "$macos_helper_dest/"
-  chmod 755 "$macos_helper_dest/rweb-clash-macos-helper"
+  mkdir -p "$helper_dest"
+  cp "$repo_root/target/$helper_rust_target/release/$helper_binary" \
+    "$helper_dest/$helper_binary"
+  if [[ "$target" == macos-* ]]; then
+    cp "$repo_root/packaging/macos/com.rweb-clash.tun-helper.plist" "$helper_dest/"
+    chmod 755 "$helper_dest/$helper_binary"
+  fi
 fi
 
 echo "Prepared Tauri resources for $target at $resource_root"

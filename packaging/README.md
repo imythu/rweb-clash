@@ -119,21 +119,23 @@ packaging/cache/runtime/manifest.json
 
 ## Tauri 打包
 
-Tauri 覆盖 macOS arm64 和 Windows amd64。Linux 不使用 Tauri。resources 包含 Mihomo core、默认规则集与 GeoIP 运行时资源。
+Tauri 覆盖 macOS arm64 和 Windows amd64。Linux 不使用 Tauri。resources 包含 Mihomo core、默认规则集与 GeoIP 运行时资源；Windows 还包含 `resources/windows/rweb-clash-windows-helper.exe`。Windows 首次开启 TUN 时通过 UAC 安装特权服务，主桌面进程之后以普通权限运行。
 
 构建步骤：
 
 1. 构建 `web/dist`。
 2. 将当前 target 的 Mihomo core 放入 Tauri resources：
    - `resources/core/mihomo` 或 `resources/core/mihomo.exe`
-3. 将默认规则集放入 Tauri resources：
+3. Windows 额外构建并放入 TUN helper：
+   - `resources/windows/rweb-clash-windows-helper.exe`
+4. 将默认规则集放入 Tauri resources：
    - `resources/rule-sets/*.list`
    - `resources/rule-sets/manifest.json`
-4. 将已校验的 GeoIP 数据放入 Tauri resources：
+5. 将已校验的 GeoIP 数据放入 Tauri resources：
    - `resources/runtime/geoip.metadb`
    - `resources/runtime/manifest.json`
-5. Tauri 启动时解析 resource dir，初始化 `AppOptions.root_dir` 到平台 app data dir。
-6. 首次启动复制 core、规则集和 GeoIP 数据到 app data dir。
+6. Tauri 启动时解析 resource dir，初始化 `AppOptions.root_dir` 到平台 app data dir。
+7. 首次启动复制 core、规则集和 GeoIP 数据到 app data dir。
 
 ## Linux 单二进制
 

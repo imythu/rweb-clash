@@ -49,7 +49,7 @@ Use this checklist for every automatic snapshot and semantic stable release run.
   - Generates checksums with macOS-compatible `shasum -a 256`.
   - Uses Apple signing and notarization secrets only when an opted-in manual release requests signing.
 - `Tauri windows-amd64`
-  - Verifies Tauri resources contain the Windows Mihomo core, verified GeoIP, and exactly 13 verified rule sets.
+  - Verifies Tauri resources contain the Windows Mihomo core, the privileged TUN helper, verified GeoIP, and exactly 13 verified rule sets.
   - Builds the desktop app for `x86_64-pc-windows-msvc`.
   - Uploads both an `.msi` and an NSIS `.exe`.
   - Uploads `rweb-clash-windows-amd64.sha256`.

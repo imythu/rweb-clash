@@ -53,6 +53,16 @@ core_dir="$resource_root/core"
 rule_set_dir="$resource_root/rule-sets"
 runtime_dir="$resource_root/runtime"
 
+case "$target" in
+  windows-amd64|windows-x86_64)
+    windows_helper="$resource_root/windows/rweb-clash-windows-helper.exe"
+    if [[ ! -s "$windows_helper" ]]; then
+      echo "Windows privileged TUN helper resource is missing or empty: $windows_helper" >&2
+      exit 1
+    fi
+    ;;
+esac
+
 if [[ ! -d "$core_dir" ]]; then
   echo "Tauri core resource directory not found: $core_dir" >&2
   exit 1

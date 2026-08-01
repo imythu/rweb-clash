@@ -33,6 +33,14 @@ if ((Get-Item -LiteralPath $corePath).Length -le 0) {
   throw "Tauri Mihomo resource is empty: $corePath"
 }
 
+if ($isWindowsTarget) {
+  $windowsHelper = Join-Path $resourceRoot "windows/rweb-clash-windows-helper.exe"
+  if (-not (Test-Path -LiteralPath $windowsHelper -PathType Leaf) -or
+      (Get-Item -LiteralPath $windowsHelper).Length -le 0) {
+    throw "Windows privileged TUN helper resource is missing or empty: $windowsHelper"
+  }
+}
+
 $unexpectedCore = if ($isWindowsTarget) { "mihomo" } else { "mihomo.exe" }
 $unexpectedPath = Join-Path $coreDir $unexpectedCore
 if (Test-Path -LiteralPath $unexpectedPath -PathType Leaf) {

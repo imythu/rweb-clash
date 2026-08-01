@@ -17,6 +17,8 @@ macOS 和 Windows 使用 Mihomo sidecar 模式。移动端暂不纳入当前打�
 
 macOS 首次启用 TUN 时会通过一次系统授权安装 launchd 特权 helper；后续由 helper 启动和停止 Mihomo，不会反复请求密码。helper 会校验客户端签名、内核哈希和运行配置，不会提升 Tauri 主进程。未签名开发包无法使用 helper，会保留 `osascript` 兜底流程。
 
+Windows 首次启用 TUN 时通过一次 UAC 安装自动启动的 `rweb-clash-tun` 服务；桌面进程保持普通权限，通过仅允许当前桌面用户 SID 的 named pipe 控制服务。服务只启动安装目录中的 Mihomo，并校验 core 路径、运行配置路径和 SHA-256。
+
 桌面构建会把目标平台的 Mihomo 编译进主可执行文件，启动时从主程序重新物化内核。升级时会刷新旧内核；macOS 检测到内核带有 quarantine 属性时也会重新创建文件，避免用户在允许主应用后还要单独放行 Mihomo。
 
 正式签名构建会在 Tauri 打包前单独签名 Mihomo 和 TUN helper，再将资源嵌入并签名主应用。未签名构建仍需按 macOS 提示手动允许主应用，并使用临时提权兜底流程。

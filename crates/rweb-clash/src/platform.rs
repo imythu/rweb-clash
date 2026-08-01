@@ -633,28 +633,9 @@ pub async fn validate_tun_permissions() -> Result<(), AppError> {
 
 #[cfg(target_os = "windows")]
 async fn validate_tun_permissions_inner() -> Result<(), String> {
-    let script = r#"
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = [Security.Principal.WindowsPrincipal]::new($identity)
-if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 }
-exit 1
-"#;
-    let output = platform_command("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .output()
-        .await
-        .map_err(|err| format!("TUN mode requires administrator privileges on Windows: {err}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err("TUN mode requires administrator privileges on Windows. Restart rweb-clash as administrator or disable TUN mode.".into())
-    }
+    // Windows TUN setup is delegated to the ACL-protected helper service. The
+    // desktop process itself deliberately remains unelevated.
+    Ok(())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
